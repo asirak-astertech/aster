@@ -65,7 +65,7 @@
         ],
         [
           "total_len",
-          "u64-canonical-abx1-wire<=8679596592"
+          "u64-native-pack-wire<=8591032320"
         ],
         [
           "attempt_nonce",
@@ -85,7 +85,7 @@
         ],
         [
           "source_len",
-          "u32:1..16777216"
+          "u32:1..401902"
         ],
         [
           "source_digest",
@@ -107,7 +107,7 @@
         ],
         [
           "source_total_len",
-          "u32:1..16777216"
+          "u32:1..401902"
         ],
         [
           "source_chunk_len",
@@ -141,7 +141,7 @@
         ],
         [
           "max_extent_bytes",
-          "u32:1..1048576"
+          "u32:1..1048710"
         ],
         [
           "checkpoint_batch_bytes",
@@ -163,11 +163,11 @@
         ],
         [
           "extent_len",
-          "u32:1..1048576"
+          "u32:1..1048710"
         ],
         [
-          "abx1_extent",
-          "bytes[extent_len]"
+          "astrbs02_record",
+          "bytes[extent_len],length-prefixed-ASTRBS02"
         ]
       ]
     },
@@ -252,35 +252,44 @@
       ]
     }
   ],
-  "abx1": {
-    "magic": "41425831",
-    "max_encoded_bytes": 1048576,
+  "source_object": {
+    "magic": "4153545250533032",
+    "format_version": 2,
+    "max_encoded_bytes": 401902,
+    "semantic_publication": {
+      "magic": "4153545242503032",
+      "format_version": 2,
+      "authenticated": true,
+      "owns": "publisher-operation-causality-policy-priority-ttl-metadata-blob-id-physical-lineage"
+    },
+    "physical_source": {
+      "magic": "4153545250503032",
+      "format_version": 2,
+      "owns": "authenticated-physical-open-and-final-commitment"
+    },
+    "identity": {
+      "transfer_id": "sha256(ASTRPS02)",
+      "publication_id": "sha256(authenticated-ASTRBP02)",
+      "finish": "byte-equal-authenticated-physical-commitment"
+    }
+  },
+  "native_pack_record": {
+    "magic": "4153545242533032",
+    "max_encoded_bytes": 1048710,
     "fields": [
       [
-        "first_chunk_index",
-        "u64"
+        "record_len",
+        "u32:1..1048706"
       ],
       [
-        "carrier_count",
-        "u32:1..131072"
-      ],
-      [
-        "carriers",
-        "repeat carrier_count"
-      ],
-      [
-        "carrier_len",
-        "u32:1..66215"
-      ],
-      [
-        "carrier",
-        "bytes[carrier_len],valid-ASTRBT01"
+        "record",
+        "bytes[record_len],valid-ASTRBS02"
       ]
     ]
   },
   "composite": {
     "magic": "41534431",
-    "max_encoded_bytes": 1050632,
+    "max_encoded_bytes": 1050766,
     "fields": [
       [
         "protected_header_len",
@@ -291,8 +300,8 @@
         "bytes[protected_header_len],protected-ASTRFR01-DATA-header"
       ],
       [
-        "abx1_extent",
-        "bytes[extent_len]"
+        "length_prefixed_astrbs02_record",
+        "bytes[record_len+4]"
       ]
     ]
   },

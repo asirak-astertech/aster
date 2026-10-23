@@ -751,13 +751,6 @@ pub struct AuthenticatedBlobReadDepot<'a> {
     depot: BlobDepot<'a>,
 }
 
-/// Nonconstructible attempt-scoped deletion exclusion for concurrent
-/// profile-5 sender carrier readers.
-pub struct Profile5SenderReadSession {
-    completion: BlobDepotCompletion,
-    lease: Arc<super::lease::BlobLeaseHandle>,
-}
-
 impl AuthenticatedBlobReadDepot<'_> {
     pub(super) fn owned_lease_guard(
         &self,
@@ -895,279 +888,6 @@ impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
 }
 
 impl<'a> BlobDepot<'a> {
-    fn activate_verified_plan(
-        &mut self,
-        plan: &VerifiedBlobTransferPlan,
-    ) -> Result<ActiveImport, StoreError> {
-        let variant_id = blob_variant_id(
-            plan.manifest().id(),
-            plan.manifest().content_group(),
-            plan.manifest().content_epoch(),
-        );
-        let existing = {
-            let read = self.store.database.begin_read()?;
-            load_import_read(&read, variant_id)?
-        };
-        if let Some(existing) = existing {
-            if !existing.matches_manifest(plan.manifest())
-                || existing.physical_lineage != Some(*plan.physical_lineage().binding())
-            {
-                return Err(blob_error(BlobStoreError::DepotIntegrity(
-                    "profile-5 batch import differs from authenticated plan",
-                )));
-            }
-            let active = active_from_import(&existing);
-            self.active = Some(active);
-            Ok(active)
-        } else {
-            self.begin_blob_internal_observed(
-                plan.manifest(),
-                Some(plan.physical_lineage()),
-                true,
-            )?;
-            self.require_active(plan.manifest().id())
-        }
-    }
-
-    pub(super) fn commit_verified_profile5_extent_batch(
-        &mut self,
-        policy: &ControlPolicySnapshot,
-        receipt: &BlobProfile5Receipt,
-        expected: BlobStreamResume,
-        durable: BlobStreamResume,
-        plan: &VerifiedBlobTransferPlan,
-        carriers: &[(VerifiedBlobTransferObject, u64)],
-    ) -> Result<BlobStreamResume, StoreError> {
-        self.store.require_live()?;
-        let authority = self.store.require_bound_mission()?;
-        let active = self.activate_verified_plan(plan)?;
-        let variant = self.root.open_child_directory_profile5(
-            &hex32(active.variant_id.as_bytes()),
-            true,
-            self.store,
-        )?;
-
-        let read = self.store.database.begin_read()?;
-        super::deletion::require_variant_available_read(&read, active.variant_id)?;
-        let admission = depot_admission_usage_read(&read)?;
-        let mut incoming_chunks = 0u64;
-        let mut incoming_reserved = 0u64;
-        let mut prepared = Vec::with_capacity(carriers.len());
-        for (verified, _) in carriers {
-            let index = verified.index();
-            let record = verified.record();
-            self.ensure_chunk_record(active, index, record)?;
-            if usize::try_from(record.ciphertext_len()).ok() != Some(verified.ciphertext().len())
-                || <[u8; 32]>::from(Sha256::digest(verified.ciphertext()))
-                    != *record.ciphertext_sha256()
-            {
-                return Err(blob_error(BlobStoreError::DepotIntegrity(
-                    "verified profile-5 carrier differs from its record",
-                )));
-            }
-            let existing = load_chunk_read(&read, active.variant_id, index)?;
-            if let Some(existing) = existing {
-                if existing.committed == Some(record) {
-                    verify_chunk_file(
-                        &variant,
-                        &chunk_file_name(index),
-                        active,
-                        index,
-                        record,
-                        existing.committed_file_bytes,
-                    )?;
-                    prepared.push((index, record, existing.committed_file_bytes, false));
-                    continue;
-                }
-                if existing.expected.is_some_and(|value| value != record)
-                    || existing.committed.is_some()
-                {
-                    return Err(blob_error(BlobStoreError::DepotIntegrity(
-                        "profile-5 carrier conflicts with durable chunk state",
-                    )));
-                }
-            } else {
-                incoming_chunks = incoming_chunks
-                    .checked_add(1)
-                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            }
-            let file_len = chunk_file_len(record)?;
-            if existing.and_then(|state| state.expected).is_none() {
-                incoming_reserved = incoming_reserved
-                    .checked_add(file_len)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            }
-            prepared.push((index, record, file_len, true));
-        }
-        if admission
-            .chunks
-            .checked_add(incoming_chunks)
-            .ok_or(StoreError::ItemCountAccountingOverflow)?
-            > self.store.blob_depot_limits.max_chunks
-        {
-            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
-                current: admission.chunks,
-                limit: self.store.blob_depot_limits.max_chunks,
-            }));
-        }
-        if admission
-            .reserved_bytes
-            .checked_add(incoming_reserved)
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?
-            > self.store.blob_depot_limits.max_bytes
-        {
-            return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
-                current: admission.reserved_bytes,
-                incoming: incoming_reserved,
-                limit: self.store.blob_depot_limits.max_bytes,
-            }));
-        }
-        drop(read);
-
-        for ((verified, _), (index, record, _, write_file)) in
-            carriers.iter().zip(prepared.iter().copied())
-        {
-            if write_file {
-                let name = chunk_file_name(index);
-                variant.remove_if_exists(&name, false)?;
-                let encoded = encode_chunk_file(active, index, record, verified.ciphertext())?;
-                variant.write_atomic_profile5(&name, &encoded, self.store)?;
-            }
-        }
-
-        #[cfg(any(test, feature = "test-utils"))]
-        if let Some((entered, release)) = self
-            .store
-            .profile5_batch_precommit_gate
-            .lock()
-            .expect("profile-5 precommit gate lock")
-            .take()
-        {
-            entered.send(()).expect("profile-5 precommit gate observer");
-            if !release.recv().expect("profile-5 precommit gate release") {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "injected profile-5 extent sink failure",
-                )));
-            }
-        }
-
-        let mut write = self.store.database.begin_write()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        self.store
-            .profile5_batch_test_counters
-            .extent_write_begins
-            .fetch_add(1, Ordering::Relaxed);
-        write.set_durability(redb::Durability::Immediate)?;
-        enforce_live_write(&write)?;
-        super::deletion::require_variant_available_write(&write, active.variant_id)?;
-        let mut import = load_import_write(&write, active.variant_id)?
-            .ok_or_else(|| blob_error(BlobStoreError::DepotIntegrity("Blob import disappeared")))?;
-        if !import.matches_manifest(plan.manifest())
-            || import.physical_lineage != Some(*plan.physical_lineage().binding())
-        {
-            return Err(blob_error(BlobStoreError::DepotIntegrity(
-                "profile-5 batch import changed",
-            )));
-        }
-
-        let mut reserved_delta = 0u64;
-        let mut committed_delta = 0u64;
-        let mut committed_bytes_delta = 0u64;
-        for (index, record, file_len, write_file) in prepared {
-            if !write_file {
-                continue;
-            }
-            let key = chunk_key(active.variant_id, index);
-            let previous = write
-                .open_table(BLOB_CHUNKS)?
-                .get(key.as_slice())?
-                .map(|value| decode_chunk_state(value.value()))
-                .transpose()?
-                .unwrap_or_default();
-            if previous.expected.is_some_and(|value| value != record)
-                || previous.committed.is_some_and(|value| value != record)
-            {
-                return Err(blob_error(BlobStoreError::DepotIntegrity(
-                    "profile-5 batch chunk state changed",
-                )));
-            }
-            if previous.expected.is_none() {
-                reserved_delta = reserved_delta
-                    .checked_add(file_len)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            }
-            if previous.committed.is_none() {
-                committed_delta = committed_delta
-                    .checked_add(1)
-                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
-                committed_bytes_delta = committed_bytes_delta
-                    .checked_add(file_len)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            }
-            let state = ChunkState {
-                plaintext_digest: Some(*record.plaintext_sha256()),
-                expected: Some(record),
-                committed: Some(record),
-                committed_file_bytes: file_len,
-            };
-            write
-                .open_table(BLOB_CHUNKS)?
-                .insert(key.as_slice(), encode_chunk_state(state).as_slice())?;
-        }
-        let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
-        let reserved = metadata
-            .get(DEPOT_RESERVED_FILE_BYTES)?
-            .map_or(0, |value| value.value());
-        let committed = metadata
-            .get(DEPOT_COMMITTED_CHUNK_COUNT)?
-            .map_or(0, |value| value.value());
-        let committed_bytes = metadata
-            .get(DEPOT_COMMITTED_FILE_BYTES)?
-            .map_or(0, |value| value.value());
-        metadata.insert(
-            DEPOT_RESERVED_FILE_BYTES,
-            reserved
-                .checked_add(reserved_delta)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-        )?;
-        metadata.insert(
-            DEPOT_COMMITTED_CHUNK_COUNT,
-            committed
-                .checked_add(committed_delta)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        )?;
-        metadata.insert(
-            DEPOT_COMMITTED_FILE_BYTES,
-            committed_bytes
-                .checked_add(committed_bytes_delta)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-        )?;
-        drop(metadata);
-        if durable.next_segment_index() == plan.manifest().chunk_count() {
-            import.finalized_manifest_digest = Some(*plan.manifest_digest());
-            write.open_table(BLOB_IMPORTS)?.insert(
-                active.variant_id.as_bytes().as_slice(),
-                encode_import(&import)?.as_slice(),
-            )?;
-        }
-        super::pressure::reconcile_variant_write(&write, active.variant_id)?;
-        let progress = self.store.checkpoint_profile5_receipt_in_write(
-            &write,
-            authority,
-            receipt,
-            expected,
-            durable,
-            Some((policy, plan)),
-        )?;
-        write.commit()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        self.store
-            .profile5_batch_test_counters
-            .extent_write_commits
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(progress)
-    }
-
     pub(super) fn acquire_local_import_attempt(
         &mut self,
         staging: BlobTransferId,
@@ -1389,34 +1109,6 @@ impl<'a> BlobDepot<'a> {
         completion: &BlobDepotCompletion,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
         Self::open_authenticated_read_internal(store, completion, None, Some(source), None)
-    }
-
-    pub(super) fn open_profile5_sender_session(
-        store: &'a Store,
-        completion: &BlobDepotCompletion,
-    ) -> Result<Profile5SenderReadSession, StoreError> {
-        let depot = Self::open_authenticated_read_with_kind(
-            store,
-            completion,
-            super::lease::BlobLeaseKind::CarrierRange,
-        )?;
-        Ok(Profile5SenderReadSession {
-            completion: completion.clone(),
-            lease: depot.owned_lease_guard()?,
-        })
-    }
-
-    pub(super) fn open_profile5_sender_read(
-        store: &'a Store,
-        session: &Profile5SenderReadSession,
-    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        Self::open_authenticated_read_internal(
-            store,
-            &session.completion,
-            None,
-            None,
-            Some(Arc::clone(&session.lease)),
-        )
     }
 
     fn open_authenticated_read_internal(
@@ -1879,15 +1571,6 @@ impl<'a> BlobDepot<'a> {
         manifest: &BlobManifest,
         physical_lineage: Option<BlobPhysicalLineage>,
     ) -> Result<(), StoreError> {
-        self.begin_blob_internal_observed(manifest, physical_lineage, false)
-    }
-
-    fn begin_blob_internal_observed(
-        &mut self,
-        manifest: &BlobManifest,
-        physical_lineage: Option<BlobPhysicalLineage>,
-        observe_profile5: bool,
-    ) -> Result<(), StoreError> {
         self.store.require_live()?;
         let incoming = ImportRecord::from_manifest(manifest, physical_lineage)?;
         // Explicit publish/chunk entrypoints install bounded leases because
@@ -1908,13 +1591,6 @@ impl<'a> BlobDepot<'a> {
             .begin_write_transactions
             .fetch_add(1, Ordering::Relaxed);
         let write = self.store.database.begin_write()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.store
-                .profile5_batch_test_counters
-                .fallback_activation_write_begins
-                .fetch_add(1, Ordering::Relaxed);
-        }
         enforce_live_write(&write)?;
         super::deletion::require_variant_available_write(&write, incoming.variant_id)?;
         super::lifecycle::require_import_lineage(&write, incoming.physical_lineage)?;
@@ -2025,23 +1701,8 @@ impl<'a> BlobDepot<'a> {
             }
         }
         write.commit()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.store
-                .profile5_batch_test_counters
-                .fallback_activation_write_commits
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if observe_profile5 {
-            self.root.open_child_directory_profile5(
-                &hex32(incoming.variant_id.as_bytes()),
-                true,
-                self.store,
-            )?;
-        } else {
-            self.root
-                .open_child_directory(&hex32(incoming.variant_id.as_bytes()), true)?;
-        }
+        self.root
+            .open_child_directory(&hex32(incoming.variant_id.as_bytes()), true)?;
         self.active = Some(active_from_import(&incoming));
         Ok(())
     }
@@ -3166,9 +2827,18 @@ pub(crate) fn prepare_depot_owner_token_write(
     store_path: &Path,
 ) -> Result<(), StoreError> {
     let blob_tables = blob_table_names();
-    if write
+    let multimap_tables = write
         .list_multimap_tables()?
-        .any(|table| blob_tables.contains(&table.name()))
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
+    if multimap_tables
+        .iter()
+        .any(|table| blob_tables.contains(&table.as_str()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -3178,6 +2848,11 @@ pub(crate) fn prepare_depot_owner_token_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
     if !existing.contains(BLOB_DEPOT_METADATA.name()) {
         if OwnedDirectory::open_root_if_present(store_path)?.is_some() {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -3192,12 +2867,9 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    let network_predecessor = network_present == 4
-        && network[..4].iter().all(|table| existing.contains(*table))
-        && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
     let network_current = network_present == network.len();
     if legacy.iter().any(|table| !existing.contains(*table))
-        || !(network_present == 0 || network_predecessor || network_current)
+        || !(network_present == 0 || network_current)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
@@ -3229,7 +2901,7 @@ pub(crate) fn prepare_depot_owner_token_write(
         || write.open_table(BLOB_OPERATIONS)?.len()? != 0
         || write.open_table(BLOB_IMPORTS)?.len()? != 0
         || write.open_table(BLOB_CHUNKS)?.len()? != 0
-        || ((network_predecessor || network_current)
+        || (network_current
             && (write.open_table(BLOB_PENDING_SOURCES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_PREFIXES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_FETCH_CURSORS)?.len()? != 0));
@@ -3805,122 +3477,6 @@ pub(super) fn audit_publication_import_evidence(
         chunk_count,
         physical_lineage,
     )
-}
-
-pub(super) fn profile5_import_shape_evidence(
-    encoded: &[u8],
-    metadata: &super::BlobMetadata,
-) -> Result<(u64, u64), StoreError> {
-    let import = decode_import(encoded)?;
-    audit_publication_import_record(
-        &import,
-        metadata.variant_id,
-        metadata.blob_id,
-        metadata.header.key_epoch,
-        metadata.manifest_digest,
-        metadata
-            .header
-            .blob_route
-            .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?
-            .chunk_count(),
-        metadata.physical_lineage,
-    )?;
-    Ok((import.total_len, import.chunk_count))
-}
-
-pub(super) fn profile5_pending_import_shape_evidence(
-    encoded: &[u8],
-    metadata: &super::BlobMetadata,
-) -> Result<(u64, u64), StoreError> {
-    let import = decode_import(encoded)?;
-    let route = metadata
-        .header
-        .blob_route
-        .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?;
-    if import.variant_id != metadata.variant_id
-        || import.blob_id != metadata.blob_id
-        || import.epoch != metadata.header.key_epoch
-        || import.chunk_count != route.chunk_count()
-        || import.physical_lineage != metadata.physical_lineage
-        || import
-            .finalized_manifest_digest
-            .is_some_and(|digest| digest != metadata.manifest_digest)
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "pending profile-5 receipt differs from its depot import",
-        )));
-    }
-    Ok((import.total_len, import.chunk_count))
-}
-
-pub(super) fn profile5_import_wire_shape_evidence(
-    encoded: &[u8],
-    chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    metadata: &super::BlobMetadata,
-    require_finalized: bool,
-) -> Result<aster_mesh::Profile5CanonicalWireShape, StoreError> {
-    let import = decode_import(encoded)?;
-    let route = metadata
-        .header
-        .blob_route
-        .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?;
-    if import.variant_id != metadata.variant_id
-        || import.blob_id != metadata.blob_id
-        || import.epoch != metadata.header.key_epoch
-        || import.chunk_count != route.chunk_count()
-        || import.physical_lineage != metadata.physical_lineage
-        || (require_finalized && import.finalized_manifest_digest != Some(metadata.manifest_digest))
-        || import
-            .finalized_manifest_digest
-            .is_some_and(|digest| digest != metadata.manifest_digest)
-    {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "profile-5 receipt differs from its exact depot import",
-        )));
-    }
-    let mut records = Vec::with_capacity(
-        usize::try_from(import.chunk_count).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
-    );
-    for index in 0..import.chunk_count {
-        let state = chunks
-            .get(chunk_key(import.variant_id, index).as_slice())?
-            .map(|value| decode_chunk_state(value.value()))
-            .transpose()?
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "profile-5 receipt is missing an expected depot chunk",
-                ))
-            })?;
-        validate_chunk_state_lengths(&import, index, state)?;
-        records.push(state.expected.ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "profile-5 receipt has an unreserved depot chunk",
-            ))
-        })?);
-    }
-    let levels = exact_pending_route_levels(import.blob_id, &records)?;
-    let mut lengths = Vec::with_capacity(records.len());
-    for (index, record) in records.iter().copied().enumerate() {
-        let proof = exact_pending_route_proof(
-            &levels,
-            u64::try_from(index).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
-        )?;
-        let carrier_len = CANONICAL_TRANSFER_FIXED_LEN
-            .checked_add(
-                u64::try_from(proof.len())
-                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
-                    .checked_mul(32)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-            )
-            .and_then(|value| value.checked_add(u64::from(record.ciphertext_len())))
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        lengths.push((u64::from(record.plaintext_len()), carrier_len));
-    }
-    aster_mesh::profile5_canonical_wire_shape_from_lengths(&lengths).map_err(|_| {
-        blob_error(BlobStoreError::SchemaInvariant(
-            "profile-5 receipt ABX1 shape is invalid",
-        ))
-    })
 }
 
 pub(super) fn audit_publication_import_read(
@@ -6287,30 +5843,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn record_profile5_temp_file_sync(store: Option<&Store>) {
-    #[cfg(any(test, feature = "test-utils"))]
-    if let Some(store) = store {
-        store
-            .profile5_batch_test_counters
-            .temp_file_syncs
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    #[cfg(not(any(test, feature = "test-utils")))]
-    let _ = store;
-}
-
-fn record_profile5_parent_directory_sync(store: Option<&Store>) {
-    #[cfg(any(test, feature = "test-utils"))]
-    if let Some(store) = store {
-        store
-            .profile5_batch_test_counters
-            .parent_directory_syncs
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    #[cfg(not(any(test, feature = "test-utils")))]
-    let _ = store;
-}
-
 pub(super) struct OwnedDirectory {
     path: PathBuf,
     created_by_open: bool,
@@ -7422,21 +6954,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn open_child_directory_profile5(
-        &self,
-        name: &str,
-        create: bool,
-        store: &Store,
-    ) -> Result<Self, StoreError> {
-        self.open_child_directory_observed(name, create, Some(store))
-    }
-
-    #[cfg(unix)]
     fn open_child_directory_observed(
         &self,
         name: &str,
         create: bool,
-        observed_store: Option<&Store>,
+        _observed_store: Option<&Store>,
     ) -> Result<Self, StoreError> {
         let mut created = false;
         let descriptor = match rustix::fs::openat(
@@ -7481,7 +7003,6 @@ impl OwnedDirectory {
         validate_directory(&file)?;
         if created {
             self.sync()?;
-            record_profile5_parent_directory_sync(observed_store);
         }
         Ok(Self {
             path: self.path.join(name),
@@ -7515,16 +7036,6 @@ impl OwnedDirectory {
         })
     }
 
-    #[cfg(not(unix))]
-    fn open_child_directory_profile5(
-        &self,
-        name: &str,
-        create: bool,
-        _store: &Store,
-    ) -> Result<Self, StoreError> {
-        self.open_child_directory(name, create)
-    }
-
     pub(super) fn open_child_directory_if_present(
         &self,
         name: &str,
@@ -7546,21 +7057,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn write_atomic_profile5(
-        &self,
-        final_name: &str,
-        bytes: &[u8],
-        store: &Store,
-    ) -> Result<(), StoreError> {
-        self.write_atomic_observed(final_name, bytes, Some(store))
-    }
-
-    #[cfg(unix)]
     fn write_atomic_observed(
         &self,
         final_name: &str,
         bytes: &[u8],
-        observed_store: Option<&Store>,
+        _observed_store: Option<&Store>,
     ) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
@@ -7583,7 +7084,6 @@ impl OwnedDirectory {
             let _ = rustix::fs::unlinkat(&self.file, &temp_name, rustix::fs::AtFlags::empty());
             return Err(blob_error(BlobStoreError::Io(error)));
         }
-        record_profile5_temp_file_sync(observed_store);
         // Fault exits intentionally retain the exact artifact a process crash
         // would leave; writable reopen treats it as non-authoritative and
         // reclaims it before a retry.
@@ -7596,7 +7096,6 @@ impl OwnedDirectory {
         self.file
             .sync_all()
             .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
-        record_profile5_parent_directory_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
@@ -7607,21 +7106,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn write_atomic_profile5(
-        &self,
-        final_name: &str,
-        bytes: &[u8],
-        store: &Store,
-    ) -> Result<(), StoreError> {
-        self.write_atomic_observed(final_name, bytes, Some(store))
-    }
-
-    #[cfg(not(unix))]
     fn write_atomic_observed(
         &self,
         final_name: &str,
         bytes: &[u8],
-        observed_store: Option<&Store>,
+        _observed_store: Option<&Store>,
     ) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
@@ -7635,12 +7124,10 @@ impl OwnedDirectory {
             .open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        record_profile5_temp_file_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::TempSynced)?;
         std::fs::rename(&temp, &final_path)?;
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
         File::open(&self.path)?.sync_all()?;
-        record_profile5_parent_directory_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }

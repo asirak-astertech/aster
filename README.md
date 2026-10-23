@@ -161,19 +161,26 @@ provisioning remain open work.
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; client-owned durable consume/carry selectors and at-least-once delivery fenced by recovered sessions; numbered-only crash-safe publication with durable application journals and sparse result compaction | Physical performance/resource validation of v7 pages and receiver batching, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
 | **State** | Live or stopped publication/query, causal latest-value projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and local delivery-ledger status | Peer/contact/convergence status, synthetic withdrawals, dynamic network interests, selected-node bindings, finite TTL, relay support, expiry, and garbage collection |
 | **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, selected-node bindings, automatic merge execution, finite TTL, relay support, expiry, and garbage collection |
-| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, node durable transfer progress, local ConnectRPC and `asterctl` publish/read through 8 GiB, semantic-v9/profile-5 bounded checkpointed streaming with receiver-authoritative resume, semantic-v7/v8 profile-4 compatibility, authenticated finite-TTL custody, bounded pressure recovery, crash-resumable reclamation, and bounded maintenance | Network-wide visibility, route-only relay/custody, cross-transport failover, public GC controls, and Blob lifetime fields in the FFI surface |
+| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, node durable transfer progress, local ConnectRPC and `asterctl` publish/read through 8 GiB, semantic-v9/profile-5 bounded checkpointed streaming with lifecycle-owned provisional state and a native pack checkpoint journal, semantic-v7/v8 profile-4 compatibility, authenticated finite-TTL custody, bounded pressure recovery, crash-resumable reclamation, and bounded maintenance | Network-wide visibility, route-only relay/custody, cross-transport failover, public GC controls, and Blob lifetime fields in the FFI surface |
 | **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, topic/priority narrowing, route-only nested wrappers, durable candidates, and semantic-v6 runtime integration | Supported bridge administration, live join/leave, complete quotas, dynamic policy, revocation/rekey lifecycle, and cross-class bridge custody |
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
 
 Blob has one canonical publication authority. Provisional local uploads,
-pending network receipts, and completed canonical variants share the configured
-Blob depot limits; profile 5 does not create a separate capacity pool or
-publication representation. Existing canonical Blobs remain eligible after an
-upgrade: v9-to-v9 contacts select profile 5, while v7/v8 contacts select the
-compatible profile 4 when the publication fits its historical bounds. The
-machine-checked capability block above is authoritative for publication,
-status, and download behavior.
+lifecycle-owned provisional network sources, and completed native packs share
+the configured Blob depot limits; profile 5 does not create a separate capacity pool or
+publication representation. Semantic-v9 publication creates the native
+`ASTRBS02` pack used directly by both storage and transfer. This unreleased
+format has no migration promise: a depot containing an incompatible
+experimental Profile-5 pack fails on open with instructions to reset the
+development depot or reimport its Blob data. Semantic-v7/v8 contacts retain
+profile 4 only for their historical wire protocol. The machine-checked
+capability block above is authoritative for publication, status, and download
+behavior.
+
+The provisional source or upload state plus the native pack checkpoint journal
+own durable Profile-5 resume. Atomic promotion precedes RESULT; RESULT_ACK or
+EOF settles only the transport attempt and owns no durable resume state.
 
 Semantic v7 changes the network mechanics for Event synchronization,
 not publication semantics: a successful publish remains a local durable commit
@@ -182,8 +189,7 @@ existing mechanics through mandatory `LegacyV6`. Semantic v9 Blob contacts use
 `BlobStreamV1`; semantic v7/v8 compatibility contacts require
 `BlobRangesStreamV1`. Blob has no legacy fallback, and an active profile-5
 attempt is not downgraded in place to profile 4. Incompatible peers are
-rejected rather than sent another Blob grammar. Stored source and partial-prefix
-formats remain unchanged. Exact differences and bounded blind ReceiveOnly traffic
+rejected rather than sent another Blob grammar. Exact differences and bounded blind ReceiveOnly traffic
 use pages; finite-TTL entries carry authenticated cumulative age without
 creating peer receipt, lease, suppression, or retry state. Page attempts and
 contact completion are not remote delivery evidence. The sender uses distinct

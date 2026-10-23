@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use super::blob::{
     BlobPublishFinalization, BlobPublishOptions, BlobPublishRequest, BlobPublishResult,
-    SelectedBlobCommand,
+    BlobStreamPublicationId, SelectedBlobCommand,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -217,6 +217,11 @@ impl SelectedBlobPublishStream {
 
     pub const fn durable_offset(&self) -> u64 {
         self.durable_offset
+    }
+
+    pub fn publication_id(&self) -> BlobStreamPublicationId {
+        BlobStreamPublicationId::from_bytes(self.token)
+            .expect("selected Blob stream token is a validated publication identity")
     }
 
     pub async fn write(

@@ -1,8 +1,5 @@
 use crate::{
-    blob::{
-        BlobError, BlobId, BlobMetadata, MAX_BLOB_CHUNKS, MAX_BLOB_TRANSFER_OBJECT_BYTES,
-        VerifiedBlobTransferPlan,
-    },
+    blob::{BlobError, BlobId, BlobMetadata},
     custody::CustodySample,
     model::{Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic, VersionVector},
 };
@@ -15,175 +12,6 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const BLOB_STREAM_SEGMENT_BYTES: usize = 1024 * 1024;
-/// Maximum encoded size of one semantic-v9 ABX1 canonical carrier extent.
-pub const PROFILE5_CANONICAL_EXTENT_BYTES: u64 = 1024 * 1024;
-/// ABX1 fixed header: magic, first canonical index, and carrier count.
-pub const PROFILE5_CANONICAL_EXTENT_HEADER_BYTES: u64 = 4 + 8 + 4;
-/// ABX1 length prefix preceding each byte-identical ASTRBT01 carrier.
-pub const PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES: u64 = 4;
-/// Maximum number of maximum-sized canonical carriers fitting one ABX1 extent.
-pub const PROFILE5_MAX_CARRIERS_PER_EXTENT: u64 = (PROFILE5_CANONICAL_EXTENT_BYTES
-    - PROFILE5_CANONICAL_EXTENT_HEADER_BYTES)
-    / (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64);
-/// Maximum ABX1 wire length for the maximum 8-GiB/131,072-chunk manifest.
-#[allow(
-    clippy::manual_div_ceil,
-    reason = "the protocol contract checker requires a portable arithmetic constant expression"
-)]
-pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = MAX_BLOB_CHUNKS
-    * (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64)
-    + ((MAX_BLOB_CHUNKS + PROFILE5_MAX_CARRIERS_PER_EXTENT - 1) / PROFILE5_MAX_CARRIERS_PER_EXTENT)
-        * PROFILE5_CANONICAL_EXTENT_HEADER_BYTES;
-
-/// One exact resumable boundary in the canonical semantic-v9 ABX1 stream.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Profile5CanonicalCheckpoint {
-    pub next_chunk_index: u64,
-    pub plaintext_offset: u64,
-    pub carrier_offset: u64,
-    pub wire_offset: u64,
-}
-
-/// Deterministic ABX1 batching result derived only from an authenticated plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Profile5CanonicalWireShape {
-    checkpoints: Vec<Profile5CanonicalCheckpoint>,
-}
-
-impl Profile5CanonicalWireShape {
-    pub fn checkpoints(&self) -> &[Profile5CanonicalCheckpoint] {
-        &self.checkpoints
-    }
-
-    pub fn terminal(&self) -> Profile5CanonicalCheckpoint {
-        *self.checkpoints.last().expect("wire shape includes origin")
-    }
-
-    pub fn checkpoint_for_wire_offset(&self, offset: u64) -> Option<Profile5CanonicalCheckpoint> {
-        self.checkpoints
-            .binary_search_by_key(&offset, |checkpoint| checkpoint.wire_offset)
-            .ok()
-            .map(|index| self.checkpoints[index])
-    }
-
-    pub fn contains(&self, checkpoint: Profile5CanonicalCheckpoint) -> bool {
-        self.checkpoints.contains(&checkpoint)
-    }
-}
-
-/// Computes the sole canonical semantic-v9 ABX1 extent partition and every
-/// resumable prefix. Empty input has exactly the origin/terminal checkpoint.
-pub fn profile5_canonical_wire_shape(
-    plan: &VerifiedBlobTransferPlan,
-) -> Result<Profile5CanonicalWireShape, BlobError> {
-    let lengths = (0..plan.manifest().chunk_count())
-        .map(|index| {
-            let carrier = plan.carrier_id(index)?;
-            Ok((
-                u64::from(plan.chunk_records()[index as usize].plaintext_len()),
-                plan.carrier_total_len(&carrier.wire_bytes())?,
-            ))
-        })
-        .collect::<Result<Vec<_>, BlobError>>()?;
-    profile5_canonical_wire_shape_from_lengths(&lengths)
-}
-
-/// Reconstructs ABX1 boundaries from authenticated manifest/carrier lengths.
-/// Store audit uses this form after independently validating those records.
-pub fn profile5_canonical_wire_shape_from_lengths(
-    lengths: &[(u64, u64)],
-) -> Result<Profile5CanonicalWireShape, BlobError> {
-    let mut checkpoints = vec![Profile5CanonicalCheckpoint::default()];
-    let mut next = 0u64;
-    let mut plaintext = 0u64;
-    let mut carriers = 0u64;
-    let mut wire = 0u64;
-    while next < lengths.len() as u64 {
-        let first = next;
-        let mut extent = PROFILE5_CANONICAL_EXTENT_HEADER_BYTES;
-        while next < lengths.len() as u64 {
-            let (plaintext_len, carrier_len) = lengths[next as usize];
-            if plaintext_len == 0 || carrier_len == 0 {
-                return Err(BlobError::InvalidManifest);
-            }
-            let candidate = extent
-                .checked_add(PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES)
-                .and_then(|value| value.checked_add(carrier_len))
-                .ok_or(BlobError::LengthOverflow)?;
-            if candidate > PROFILE5_CANONICAL_EXTENT_BYTES {
-                if next == first {
-                    return Err(BlobError::InvalidManifest);
-                }
-                break;
-            }
-            extent = candidate;
-            plaintext = plaintext
-                .checked_add(plaintext_len)
-                .ok_or(BlobError::LengthOverflow)?;
-            carriers = carriers
-                .checked_add(carrier_len)
-                .ok_or(BlobError::LengthOverflow)?;
-            next += 1;
-        }
-        wire = wire.checked_add(extent).ok_or(BlobError::LengthOverflow)?;
-        checkpoints.push(Profile5CanonicalCheckpoint {
-            next_chunk_index: next,
-            plaintext_offset: plaintext,
-            carrier_offset: carriers,
-            wire_offset: wire,
-        });
-    }
-    Ok(Profile5CanonicalWireShape { checkpoints })
-}
-
-#[cfg(test)]
-mod profile5_wire_shape_tests {
-    use super::*;
-
-    #[test]
-    fn canonical_shape_batches_carriers_and_exposes_only_extent_boundaries() {
-        let lengths = vec![(64 * 1024, 100_000); 12];
-        let shape = profile5_canonical_wire_shape_from_lengths(&lengths).expect("ABX1 shape");
-        assert_eq!(shape.checkpoints().len(), 3);
-        assert_eq!(shape.checkpoints()[1].next_chunk_index, 10);
-        assert_eq!(shape.checkpoints()[1].plaintext_offset, 10 * 64 * 1024);
-        assert_eq!(shape.checkpoints()[1].carrier_offset, 1_000_000);
-        assert_eq!(shape.checkpoints()[1].wire_offset, 1_000_056);
-        assert_eq!(shape.terminal().next_chunk_index, 12);
-        assert_eq!(shape.terminal().wire_offset, 1_200_080);
-        assert!(shape.checkpoint_for_wire_offset(1_000_000).is_none());
-    }
-
-    #[test]
-    fn canonical_empty_shape_has_exact_zero_terminal() {
-        let shape = profile5_canonical_wire_shape_from_lengths(&[]).expect("empty ABX1 shape");
-        assert_eq!(
-            shape.checkpoints(),
-            &[Profile5CanonicalCheckpoint::default()]
-        );
-        assert_eq!(shape.terminal(), Profile5CanonicalCheckpoint::default());
-    }
-
-    #[test]
-    fn maximum_wire_bound_is_derived_from_executable_carrier_partitioning() {
-        assert_eq!(PROFILE5_MAX_CARRIERS_PER_EXTENT, 15);
-        assert_eq!(PROFILE5_MAX_CANONICAL_WIRE_BYTES, 8_679_596_592);
-        let lengths = vec![
-            (
-                crate::blob::MAX_BLOB_CHUNK_SIZE as u64,
-                MAX_BLOB_TRANSFER_OBJECT_BYTES as u64,
-            );
-            MAX_BLOB_CHUNKS as usize
-        ];
-        assert_eq!(
-            profile5_canonical_wire_shape_from_lengths(&lengths)
-                .expect("maximum shape")
-                .terminal()
-                .wire_offset,
-            PROFILE5_MAX_CANONICAL_WIRE_BYTES,
-        );
-    }
-}
 /// Maximum plaintext length of one independently segmented Blob stream (8 GiB).
 ///
 /// This is intentionally distinct from the legacy profile-4 network Blob
@@ -197,10 +25,42 @@ const FRONTIER_LEVELS: usize = 64;
 const BLOB_STREAM_FORMAT_VERSION: u16 = 2;
 const BLOB_STREAM_PACK_FORMAT_VERSION: u16 = 2;
 const BLOB_STREAM_OPEN_MAGIC: &[u8; 8] = b"ASTRBO02";
+const BLOB_STREAM_PUBLICATION_MAGIC: &[u8; 8] = b"ASTRBP02";
+const BLOB_STREAM_PHYSICAL_SOURCE_MAGIC: &[u8; 8] = b"ASTRPP02";
+const BLOB_STREAM_PUBLICATION_SOURCE_MAGIC: &[u8; 8] = b"ASTRPS02";
 const BLOB_STREAM_COMMITMENT_MAGIC: &[u8; 8] = b"ASTRBF02";
 const BLOB_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ASTRBS02";
 const MAX_BLOB_STREAM_OPERATION_KEY_BYTES: usize = 256;
-const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048 + 40 * MAX_CAUSAL_CONTEXT_ENTRIES;
+pub(crate) const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048 + 40 * MAX_CAUSAL_CONTEXT_ENTRIES;
+pub(crate) const MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES: usize = 512;
+pub(crate) const MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES: usize = MAX_BLOB_STREAM_OPEN_BYTES + 128;
+const MAX_SOURCE_PROTOCOL_CREDENTIAL_BODY_BYTES: usize = 16 * 1024;
+const SOURCE_PROTOCOL_SIGNATURE_BYTES: usize = crate::bridge::HYBRID_SIGNATURE_BYTES;
+const SOURCE_PROTOCOL_OBJECT_OVERHEAD_BYTES: usize = 4
+    + MAX_SOURCE_PROTOCOL_CREDENTIAL_BODY_BYTES
+    + SOURCE_PROTOCOL_SIGNATURE_BYTES
+    + 4
+    + SOURCE_PROTOCOL_SIGNATURE_BYTES;
+const MAX_AUTHENTICATED_BLOB_STREAM_OPEN_BYTES: usize =
+    SOURCE_PROTOCOL_OBJECT_OVERHEAD_BYTES + MAX_BLOB_STREAM_OPEN_BYTES;
+const MAX_AUTHENTICATED_BLOB_STREAM_COMMITMENT_BYTES: usize =
+    SOURCE_PROTOCOL_OBJECT_OVERHEAD_BYTES + MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES;
+const MAX_AUTHENTICATED_BLOB_STREAM_PUBLICATION_BYTES: usize =
+    SOURCE_PROTOCOL_OBJECT_OVERHEAD_BYTES + MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES;
+/// Maximum canonical ASTRPS02 SOURCE derived from the exact authenticated
+/// semantic-publication, physical-OPEN, and physical-commitment envelope
+/// bounds accepted by the reference verifier.
+pub const MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES: usize = 8
+    + 2
+    + 4
+    + MAX_AUTHENTICATED_BLOB_STREAM_PUBLICATION_BYTES
+    + 4
+    + 8
+    + 2
+    + 4
+    + MAX_AUTHENTICATED_BLOB_STREAM_OPEN_BYTES
+    + 4
+    + MAX_AUTHENTICATED_BLOB_STREAM_COMMITMENT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobPublicationStreamId([u8; 32]);
@@ -524,6 +384,302 @@ pub struct VerifiedBlobStreamOpen {
     open: BlobStreamOpen,
     mission_authority_id: NodeId,
     authenticated_bytes: Vec<u8>,
+}
+
+/// Signed semantic authority for one publication which references a canonical
+/// physical Profile-5 pack.
+///
+/// The embedded open owns publisher, operation, causal, policy, priority, TTL,
+/// and metadata semantics. Blob identity, content group, epoch, metadata, and
+/// physical lineage identify the logical pack variant; the enclosing source
+/// record independently authenticates the exact physical OPEN and commitment
+/// used on one transfer. Keeping these authorities separate lets a new
+/// operation publish the same Blob without rereading plaintext or
+/// manufacturing another physical variant, including when a receiver already
+/// owns an equivalent canonical physical encoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPublication {
+    open: BlobStreamOpen,
+    blob_id: BlobId,
+    final_custody: Option<CustodySample>,
+    physical_lineage: [u8; 32],
+}
+
+impl BlobStreamPublication {
+    pub fn new(
+        open: BlobStreamOpen,
+        blob_id: BlobId,
+        final_custody: Option<CustodySample>,
+        physical_lineage: [u8; 32],
+    ) -> Result<Self, BlobError> {
+        let custody_valid = match (open.ttl_ms(), open.initial_custody(), final_custody) {
+            (None, None, None) => true,
+            (Some(_), Some(initial), Some(final_sample)) => {
+                initial.clock_id == final_sample.clock_id && final_sample.tick_ms >= initial.tick_ms
+            }
+            _ => false,
+        };
+        if physical_lineage == [0; 32] || !custody_valid {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(Self {
+            open,
+            blob_id,
+            final_custody,
+            physical_lineage,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let open = self.open.encode();
+        let mut out = Vec::with_capacity(open.len() + 128);
+        out.extend_from_slice(BLOB_STREAM_PUBLICATION_MAGIC);
+        out.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&(open.len() as u32).to_be_bytes());
+        out.extend_from_slice(&open);
+        out.extend_from_slice(self.blob_id.as_bytes());
+        encode_optional_custody(&mut out, self.final_custody);
+        out.extend_from_slice(&self.physical_lineage);
+        out
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        if encoded.len() > MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut reader = StreamReader::new(encoded);
+        if reader.take(8)? != BLOB_STREAM_PUBLICATION_MAGIC
+            || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let open_len = reader.u32()? as usize;
+        let open = BlobStreamOpen::decode(reader.take(open_len)?)?;
+        let blob_id = BlobId::from_bytes(reader.array()?);
+        let final_custody = decode_optional_custody(&mut reader)?;
+        let physical_lineage = reader.array()?;
+        reader.finish()?;
+        Self::new(open, blob_id, final_custody, physical_lineage)
+    }
+
+    pub const fn open(&self) -> &BlobStreamOpen {
+        &self.open
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+
+    pub const fn final_custody(&self) -> Option<CustodySample> {
+        self.final_custody
+    }
+
+    pub const fn physical_lineage(&self) -> &[u8; 32] {
+        &self.physical_lineage
+    }
+}
+
+/// Provider-authenticated semantic publication-to-pack binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobStreamPublication {
+    publication: BlobStreamPublication,
+    authenticated_bytes: Vec<u8>,
+}
+
+impl VerifiedBlobStreamPublication {
+    pub const fn publication(&self) -> &BlobStreamPublication {
+        &self.publication
+    }
+
+    pub fn authenticated_bytes(&self) -> &[u8] {
+        &self.authenticated_bytes
+    }
+
+    pub(crate) fn from_provider(
+        publication: BlobStreamPublication,
+        authenticated_bytes: Vec<u8>,
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Self {
+        Self {
+            publication,
+            authenticated_bytes,
+        }
+    }
+}
+
+/// Exact wire SOURCE for one signed semantic publication and the independently
+/// authenticated physical pack used by this transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPublicationSource {
+    authenticated_publication: Vec<u8>,
+    authenticated_open: Vec<u8>,
+    authenticated_commitment: Vec<u8>,
+}
+
+impl BlobStreamPublicationSource {
+    pub fn new(
+        authenticated_publication: Vec<u8>,
+        authenticated_open: Vec<u8>,
+        authenticated_commitment: Vec<u8>,
+    ) -> Result<Self, BlobError> {
+        let source = Self {
+            authenticated_publication,
+            authenticated_open,
+            authenticated_commitment,
+        };
+        if source.authenticated_publication.is_empty()
+            || source.authenticated_open.is_empty()
+            || source.authenticated_commitment.is_empty()
+            || source.encoded_len()? > MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(source)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, BlobError> {
+        let physical = self.physical_source_record()?;
+        let publication_len = u32::try_from(self.authenticated_publication.len())
+            .map_err(|_| BlobError::LengthOverflow)?;
+        let physical_len = u32::try_from(physical.len()).map_err(|_| BlobError::LengthOverflow)?;
+        let mut output = Vec::with_capacity(self.encoded_len()?);
+        output.extend_from_slice(BLOB_STREAM_PUBLICATION_SOURCE_MAGIC);
+        output.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        output.extend_from_slice(&publication_len.to_be_bytes());
+        output.extend_from_slice(&self.authenticated_publication);
+        output.extend_from_slice(&physical_len.to_be_bytes());
+        output.extend_from_slice(&physical);
+        Ok(output)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        if encoded.len() > MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut source = StreamReader::new(encoded);
+        if source.take(8)? != BLOB_STREAM_PUBLICATION_SOURCE_MAGIC
+            || source.u16()? != BLOB_STREAM_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let publication_len =
+            usize::try_from(source.u32()?).map_err(|_| BlobError::LengthOverflow)?;
+        let authenticated_publication = source.take(publication_len)?.to_vec();
+        let physical_len = usize::try_from(source.u32()?).map_err(|_| BlobError::LengthOverflow)?;
+        let physical_bytes = source.take(physical_len)?;
+        source.finish()?;
+        let mut physical = StreamReader::new(physical_bytes);
+        if physical.take(8)? != BLOB_STREAM_PHYSICAL_SOURCE_MAGIC
+            || physical.u16()? != BLOB_STREAM_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let open_len = usize::try_from(physical.u32()?).map_err(|_| BlobError::LengthOverflow)?;
+        let authenticated_open = physical.take(open_len)?.to_vec();
+        let commitment_len =
+            usize::try_from(physical.u32()?).map_err(|_| BlobError::LengthOverflow)?;
+        let authenticated_commitment = physical.take(commitment_len)?.to_vec();
+        physical.finish()?;
+        let decoded = Self::new(
+            authenticated_publication,
+            authenticated_open,
+            authenticated_commitment,
+        )?;
+        if decoded.encode()? != encoded {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(decoded)
+    }
+
+    pub fn authenticated_publication(&self) -> &[u8] {
+        &self.authenticated_publication
+    }
+
+    pub fn authenticated_open(&self) -> &[u8] {
+        &self.authenticated_open
+    }
+
+    pub fn authenticated_commitment(&self) -> &[u8] {
+        &self.authenticated_commitment
+    }
+
+    pub fn physical_source_record(&self) -> Result<Vec<u8>, BlobError> {
+        Self::encode_physical_source(&self.authenticated_open, &self.authenticated_commitment)
+    }
+
+    pub fn encode_physical_source(
+        authenticated_open: &[u8],
+        authenticated_commitment: &[u8],
+    ) -> Result<Vec<u8>, BlobError> {
+        let open_len =
+            u32::try_from(authenticated_open.len()).map_err(|_| BlobError::LengthOverflow)?;
+        let commitment_len =
+            u32::try_from(authenticated_commitment.len()).map_err(|_| BlobError::LengthOverflow)?;
+        let mut output = Vec::with_capacity(
+            8 + 2 + 4 + authenticated_open.len() + 4 + authenticated_commitment.len(),
+        );
+        output.extend_from_slice(BLOB_STREAM_PHYSICAL_SOURCE_MAGIC);
+        output.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        output.extend_from_slice(&open_len.to_be_bytes());
+        output.extend_from_slice(authenticated_open);
+        output.extend_from_slice(&commitment_len.to_be_bytes());
+        output.extend_from_slice(authenticated_commitment);
+        Ok(output)
+    }
+
+    fn encoded_len(&self) -> Result<usize, BlobError> {
+        (8_usize + 2 + 4)
+            .checked_add(self.authenticated_publication.len())
+            .and_then(|len| len.checked_add(4))
+            .and_then(|len| len.checked_add(8 + 2 + 4))
+            .and_then(|len| len.checked_add(self.authenticated_open.len()))
+            .and_then(|len| len.checked_add(4))
+            .and_then(|len| len.checked_add(self.authenticated_commitment.len()))
+            .ok_or(BlobError::LengthOverflow)
+    }
+}
+
+/// Provider-authenticated semantic publication plus exact physical authority
+/// for one Profile-5 transfer source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobStreamPublicationSource {
+    source: BlobStreamPublicationSource,
+    publication: VerifiedBlobStreamPublication,
+    physical_open: VerifiedBlobStreamOpen,
+    physical_commitment: VerifiedBlobStreamFinalCommitment,
+}
+
+impl VerifiedBlobStreamPublicationSource {
+    pub const fn source(&self) -> &BlobStreamPublicationSource {
+        &self.source
+    }
+
+    pub const fn publication(&self) -> &VerifiedBlobStreamPublication {
+        &self.publication
+    }
+
+    pub const fn physical_open(&self) -> &VerifiedBlobStreamOpen {
+        &self.physical_open
+    }
+
+    pub const fn physical_commitment(&self) -> &VerifiedBlobStreamFinalCommitment {
+        &self.physical_commitment
+    }
+
+    pub(crate) fn from_provider(
+        source: BlobStreamPublicationSource,
+        publication: VerifiedBlobStreamPublication,
+        physical_open: VerifiedBlobStreamOpen,
+        physical_commitment: VerifiedBlobStreamFinalCommitment,
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Self {
+        Self {
+            source,
+            publication,
+            physical_open,
+            physical_commitment,
+        }
+    }
 }
 
 impl VerifiedBlobStreamOpen {
@@ -1243,6 +1399,7 @@ impl BlobStreamSegmentSealer {
 }
 
 impl BlobStreamSegmentOpener {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn new(
         stream_id: [u8; 32],
         open_digest: [u8; 32],
@@ -1641,6 +1798,34 @@ impl BlobStreamCheckpoint {
         digest.finalize().into()
     }
 
+    /// Digest of every plaintext-relevant frontier field.
+    ///
+    /// This is suitable for checking a caller-supplied prefix against a
+    /// durable resume checkpoint without retaining plaintext or requiring the
+    /// content-encryption key. It is not a Blob identity; complete content
+    /// uses [`BlobStreamPlaintextFrontier::finish`].
+    pub fn plaintext_commitment(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"ASTER/blob-stream/plain-checkpoint/v1\0");
+        digest.update(self.next_index.to_be_bytes());
+        digest.update(self.plaintext_len.to_be_bytes());
+        digest.update(self.ciphertext_len.to_be_bytes());
+        for subtree in self.levels {
+            match subtree {
+                None => digest.update([0]),
+                Some(subtree) => {
+                    digest.update([1]);
+                    digest.update(subtree.first_index.to_be_bytes());
+                    digest.update(subtree.count.to_be_bytes());
+                    digest.update(subtree.plaintext_len.to_be_bytes());
+                    digest.update(subtree.ciphertext_len.to_be_bytes());
+                    digest.update(subtree.plaintext_root);
+                }
+            }
+        }
+        digest.finalize().into()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::ENCODED_LEN);
         out.extend_from_slice(b"ASTRCK02");
@@ -1880,6 +2065,95 @@ impl BlobStreamFrontier {
 }
 
 impl Default for BlobStreamFrontier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Incremental, key-independent reconstruction of the protocol plaintext
+/// frontier.
+///
+/// One-shot resume adapters use this to authenticate caller bytes which the
+/// encrypted pack has already durably accepted. It follows the same fixed
+/// 1-MiB partition and Merkle reduction as the wire protocol, while never
+/// encrypting, packaging, or retaining more than the caller's current segment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPlaintextFrontier {
+    frontier: BlobStreamFrontier,
+}
+
+impl BlobStreamPlaintextFrontier {
+    pub fn new() -> Self {
+        Self {
+            frontier: BlobStreamFrontier::new(),
+        }
+    }
+
+    pub fn append(
+        &mut self,
+        index: u64,
+        offset: u64,
+        total_len: u64,
+        plaintext: &[u8],
+    ) -> Result<(), BlobError> {
+        let expected_offset = index
+            .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+            .ok_or(BlobError::LengthOverflow)?;
+        let end = offset
+            .checked_add(plaintext.len() as u64)
+            .ok_or(BlobError::LengthOverflow)?;
+        if total_len == 0
+            || offset != expected_offset
+            || plaintext.is_empty()
+            || plaintext.len() > BLOB_STREAM_SEGMENT_BYTES
+            || end > total_len
+            || (end < total_len && plaintext.len() != BLOB_STREAM_SEGMENT_BYTES)
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let position = [
+            index.to_be_bytes(),
+            offset.to_be_bytes(),
+            total_len.to_be_bytes(),
+            (plaintext.len() as u64).to_be_bytes(),
+        ]
+        .concat();
+        let ciphertext_len = plaintext
+            .len()
+            .checked_add(16)
+            .ok_or(BlobError::LengthOverflow)? as u64;
+        self.frontier.append(BlobStreamSubtree::leaf(
+            index,
+            BlobStreamSegmentLeaves {
+                plaintext: hash_parts(
+                    b"ASTER/blob-stream/plain-leaf/v2\0",
+                    &[&position, plaintext],
+                ),
+                // The plaintext projection never consumes this value. Keep a
+                // deterministic nonzero placeholder so the shared frontier
+                // continues to enforce its structural invariants.
+                ciphertext: hash_parts(
+                    b"ASTER/blob-stream/plain-frontier-placeholder/v1\0",
+                    &[&position],
+                ),
+                plaintext_len: plaintext.len() as u64,
+                ciphertext_len,
+            },
+        ))
+    }
+
+    pub fn checkpoint(&self) -> BlobStreamCheckpoint {
+        self.frontier.checkpoint()
+    }
+
+    pub fn finish(self, total_len: u64) -> Result<[u8; 32], BlobError> {
+        self.frontier
+            .finish(total_len)
+            .map(|(plaintext, _)| plaintext)
+    }
+}
+
+impl Default for BlobStreamPlaintextFrontier {
     fn default() -> Self {
         Self::new()
     }
@@ -2228,6 +2502,48 @@ mod tests {
             assert_eq!(&*opened, plaintext.as_slice());
             assert_eq!(leaves, expected_leaves);
         }
+    }
+
+    #[test]
+    fn plaintext_frontier_matches_encrypted_protocol_root_and_prefix() {
+        let (stream_id, open_digest, key, nonce) = identities();
+        let sealer = BlobStreamSegmentSealer::new(stream_id, open_digest, 7, key, nonce);
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64 + 17;
+        let plaintexts = [vec![0x5a; BLOB_STREAM_SEGMENT_BYTES], vec![0xa5; 17]];
+        let mut encrypted = BlobStreamFrontier::new();
+        let mut plaintext = BlobStreamPlaintextFrontier::new();
+
+        for (index, bytes) in plaintexts.iter().enumerate() {
+            let index = index as u64;
+            let offset = index * BLOB_STREAM_SEGMENT_BYTES as u64;
+            let partition = BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                7,
+                index,
+                offset,
+                total_len,
+                bytes.clone(),
+            )
+            .expect("canonical partition");
+            let (_, leaves) = sealer.seal(partition).expect("seal partition");
+            encrypted
+                .append(BlobStreamSubtree::leaf(index, leaves))
+                .expect("append encrypted frontier");
+            plaintext
+                .append(index, offset, total_len, bytes)
+                .expect("append plaintext frontier");
+            assert_eq!(
+                plaintext.checkpoint().plaintext_commitment(),
+                encrypted.checkpoint().plaintext_commitment(),
+                "resume prefix commitment is independent of encryption"
+            );
+        }
+
+        assert_eq!(
+            plaintext.finish(total_len).expect("plaintext root"),
+            encrypted.finish(total_len).expect("protocol roots").0
+        );
     }
 
     #[test]

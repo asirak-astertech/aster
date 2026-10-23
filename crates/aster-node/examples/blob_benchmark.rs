@@ -311,31 +311,43 @@ async fn main() -> Result<(), E> {
     let receiver_events = r.selected_events();
     let mut last = Instant::now();
     let mut content_visible = false;
+    let mut transfer_until_visible_ns = None;
+    let mut publish_to_visible_ns = None;
     let completed=timeout(Duration::from_secs(deadline),async {
   loop {
    if !content_visible { match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
-    Ok(page)=>{assert_eq!(page.total_len,len);assert_eq!(page.id,published.id);content_visible=true;},
+    Ok(page)=>{
+     assert_eq!(page.total_len,len);
+     assert_eq!(page.id,published.id);
+     content_visible=true;
+     transfer_until_visible_ns=Some(transfer.elapsed().as_nanos());
+     publish_to_visible_ns=Some(total.elapsed().as_nanos());
+    },
     Err(e) if transfer_is_pending(e.kind())=>{},
     Err(e)=>break Err(Box::new(e) as E),
    }}
    let (publisher_status, receiver_status) = tokio::join!(publisher_events.status(), receiver_events.status());
    let publisher_status = publisher_status?;
    let receiver_status = receiver_status?;
-   if publisher_status.failed_contact_attempts > 0 || receiver_status.failed_contact_attempts > 0 {
-    break Err(format!("contact failed before settlement: publisher={} receiver={}", publisher_status.failed_contact_attempts, receiver_status.failed_contact_attempts).into());
-   }
+   // Offline peers and slow durable-store reopen can outlive one carrier
+   // attempt. The runtime retries them; keep the cumulative failures visible
+   // in progress/final receipts and let authenticated settlement or the
+   // overall deadline decide the benchmark outcome.
    if content_visible && publisher_status.authenticated_contacts > 0 && receiver_status.authenticated_contacts > 0 { break Ok::<(),E>(()); }
   if last.elapsed()>=Duration::from_secs(10){println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"content_visible\":{},\"publisher_authenticated_contacts\":{},\"receiver_authenticated_contacts\":{},\"publisher_failed_contacts\":{},\"receiver_failed_contacts\":{}}}",transfer.elapsed().as_nanos(),content_visible,publisher_status.authenticated_contacts,receiver_status.authenticated_contacts,publisher_status.failed_contact_attempts,receiver_status.failed_contact_attempts);last=Instant::now();}
   sleep(Duration::from_millis(20)).await;
  }
  }).await;
-    let ready_ns = transfer.elapsed().as_nanos();
+    let settled_ns = transfer.elapsed().as_nanos();
+    let publish_to_settled_ns = total.elapsed().as_nanos();
     if let Ok(outcome) = &completed {
         assert!(outcome.is_ok(), "transfer failed: {outcome:?}");
     }
     // The readiness loop includes terminal contact accounting, so shutdown
     // cannot truncate profile-5 settlement after content becomes visible.
+    let connected_shutdown = Instant::now();
     let (pr, rr) = tokio::join!(p.shutdown(), r.shutdown());
+    let connected_shutdown_ns = connected_shutdown.elapsed().as_nanos();
     let pr = pr?;
     let rr = rr?;
     drop(h);
@@ -346,8 +358,8 @@ async fn main() -> Result<(), E> {
         assert_eq!(rec.direct_contacts, rec.contacts);
         assert_eq!(rec.relay_contacts, 0);
         assert_eq!(rec.unknown_path_contacts, 0);
-        assert_eq!(rec.contact_errors, 0);
     }
+    let durable_inspection = Instant::now();
     let store = Store::open_for_mission(
         receiver.state.join("mesh.redb"),
         receiver.mission.mission_authority_id(),
@@ -364,7 +376,7 @@ async fn main() -> Result<(), E> {
     if completed.is_err() {
         drop(store);
         println!(
-            "BENCH_RESULT {{\"status\":\"transfer_timeout\",\"bytes\":{len},\"source_sha256\":\"{expected}\",\"publication_ns\":{publication_ns},\"transfer_ns\":null,\"transfer_observed_ns\":{ready_ns},\"verification_ns\":null,\"total_ns\":{},\"fetched_carrier_bytes\":{},\"pending_sources\":{}}}",
+            "BENCH_RESULT {{\"status\":\"transfer_timeout\",\"bytes\":{len},\"source_sha256\":\"{expected}\",\"publication_ns\":{publication_ns},\"transfer_ns\":null,\"transfer_observed_ns\":{settled_ns},\"verification_ns\":null,\"total_ns\":{},\"fetched_carrier_bytes\":{},\"pending_sources\":{}}}",
             total.elapsed().as_nanos(),
             rr.blob_bytes_fetched,
             stats.pending_sources
@@ -376,14 +388,18 @@ async fn main() -> Result<(), E> {
     assert_eq!(stats.carrier_prefixes, 0);
     assert_eq!(stats.network_staging_bytes, 0);
     drop(store);
+    let durable_inspection_ns = durable_inspection.elapsed().as_nanos();
     let transfer_ns = transfer.elapsed().as_nanos();
     let verification = Instant::now();
+    let restart = Instant::now();
     let reopened = start_node_with_forwarding(
         config(&receiver, local, None, &topic, &scope),
         forwarding(len)?,
     )
     .await?;
+    let restart_ns = restart.elapsed().as_nanos();
     let handle = reopened.selected_blobs();
+    let download_verification = Instant::now();
     let mut offset = 0;
     let mut digest = Sha256::new();
     let mut pages = 0;
@@ -415,6 +431,7 @@ async fn main() -> Result<(), E> {
         .collect();
     assert_eq!(offset, len);
     assert_eq!(actual, expected);
+    let download_verification_ns = download_verification.elapsed().as_nanos();
     let verification_ns = verification.elapsed().as_nanos();
     let total_ns = total.elapsed().as_nanos();
     let final_receipt = reopened.shutdown().await?;
@@ -422,7 +439,9 @@ async fn main() -> Result<(), E> {
     assert_eq!(final_receipt.blobs, 1);
     assert_eq!(final_receipt.contacts, 0);
     println!(
-        "BENCH_RESULT {{\"status\":\"complete\",\"bytes\":{len},\"verified_bytes\":{offset},\"pages\":{pages},\"source_sha256\":\"{expected}\",\"receiver_sha256\":\"{actual}\",\"publication_ns\":{publication_ns},\"transfer_until_ready_ns\":{ready_ns},\"transfer_ns\":{transfer_ns},\"verification_ns\":{verification_ns},\"total_ns\":{total_ns}}}"
+        "BENCH_RESULT {{\"status\":\"complete\",\"bytes\":{len},\"verified_bytes\":{offset},\"pages\":{pages},\"source_sha256\":\"{expected}\",\"receiver_sha256\":\"{actual}\",\"publication_ns\":{publication_ns},\"transfer_until_visible_ns\":{},\"transfer_until_ready_ns\":{settled_ns},\"publish_to_visible_ns\":{},\"publish_to_settled_ns\":{publish_to_settled_ns},\"connected_shutdown_ns\":{connected_shutdown_ns},\"durable_inspection_ns\":{durable_inspection_ns},\"transfer_ns\":{transfer_ns},\"restart_ns\":{restart_ns},\"download_verification_ns\":{download_verification_ns},\"verification_ns\":{verification_ns},\"total_ns\":{total_ns}}}",
+        transfer_until_visible_ns.expect("complete transfer became visible"),
+        publish_to_visible_ns.expect("complete transfer became visible"),
     );
     Ok(())
 }

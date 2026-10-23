@@ -87,8 +87,13 @@ pub fn blob_profile_for_canonical_shape(
     chunk_size: u32,
     chunk_count: u64,
 ) -> Option<TransferProfileId> {
-    if chunk_size != crate::MAX_BLOB_CHUNK_SIZE
-        || chunk_count != total_len.div_ceil(u64::from(chunk_size))
+    let selected_unit_bytes = match semantic_version {
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => crate::MAX_BLOB_CHUNK_SIZE,
+        SEMANTIC_PROTOCOL_V9 => crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+        _ => return None,
+    };
+    if chunk_size != selected_unit_bytes
+        || chunk_count != total_len.div_ceil(u64::from(selected_unit_bytes))
         || chunk_count > crate::MAX_BLOB_CHUNKS
     {
         return None;
@@ -544,28 +549,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pre_profile5_blob_is_profile5_sender_eligible() {
-        // Mutation caught: tying profile-5 inventory to the removed stream
-        // publication table would exclude an ordinary canonical publication.
+    fn native_profile5_blob_is_sender_eligible() {
+        // Mutation caught: reusing profile-4's 64-KiB chunk shape would reject
+        // the native one-MiB profile-5 pack selected by semantic v9.
         assert_eq!(
-            blob_profile_for_canonical_shape(9, 64 * 1024, 64 * 1024, 1),
+            blob_profile_for_canonical_shape(
+                9,
+                1024 * 1024,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                1,
+            ),
             Some(TransferProfileId::BlobStreamV1)
         );
     }
 
     #[test]
-    fn stream_published_blob_remains_profile4_eligible_for_v8() {
-        // Mutation caught: treating canonical publication as profile-5-only
-        // would break byte-compatible v8/profile-4 delivery for small Blobs.
+    fn profile4_and_native_profile5_shapes_are_version_scoped() {
         let total_len = 64 * 1024 * 1024;
-        let chunk_count = total_len / (64 * 1024);
+        let profile4_chunks = total_len / (64 * 1024);
+        let profile5_segments = total_len / crate::BLOB_STREAM_SEGMENT_BYTES as u64;
         assert_eq!(
-            blob_profile_for_canonical_shape(8, total_len, 64 * 1024, chunk_count),
+            blob_profile_for_canonical_shape(8, total_len, 64 * 1024, profile4_chunks),
             Some(TransferProfileId::BlobRangesStreamV1)
         );
         assert_eq!(
-            blob_profile_for_canonical_shape(9, total_len, 64 * 1024, chunk_count),
+            blob_profile_for_canonical_shape(
+                9,
+                total_len,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                profile5_segments,
+            ),
             Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, total_len, 64 * 1024, profile4_chunks),
+            None
         );
     }
 
@@ -586,13 +604,18 @@ mod tests {
             blob_profile_for_canonical_shape(
                 9,
                 profile4_max + 1,
-                64 * 1024,
-                (profile4_max + 1).div_ceil(64 * 1024),
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                (profile4_max + 1).div_ceil(crate::BLOB_STREAM_SEGMENT_BYTES as u64),
             ),
             Some(TransferProfileId::BlobStreamV1)
         );
         assert_eq!(
-            blob_profile_for_canonical_shape(9, profile5_max, 64 * 1024, 131_072),
+            blob_profile_for_canonical_shape(
+                9,
+                profile5_max,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                profile5_max / crate::BLOB_STREAM_SEGMENT_BYTES as u64,
+            ),
             Some(TransferProfileId::BlobStreamV1)
         );
         assert_eq!(
@@ -600,7 +623,12 @@ mod tests {
             None
         );
         assert_eq!(
-            blob_profile_for_canonical_shape(9, profile5_max + 1, 64 * 1024, 131_073,),
+            blob_profile_for_canonical_shape(
+                9,
+                profile5_max + 1,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                (profile5_max + 1).div_ceil(crate::BLOB_STREAM_SEGMENT_BYTES as u64),
+            ),
             None
         );
     }
@@ -611,7 +639,7 @@ mod tests {
             blob_profile_for_canonical_shape(
                 SEMANTIC_PROTOCOL_V9,
                 0,
-                crate::MAX_BLOB_CHUNK_SIZE,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
                 0,
             ),
             Some(TransferProfileId::BlobStreamV1)
@@ -620,7 +648,7 @@ mod tests {
             blob_profile_for_canonical_shape(
                 SEMANTIC_PROTOCOL_V8,
                 0,
-                crate::MAX_BLOB_CHUNK_SIZE,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
                 0,
             ),
             None

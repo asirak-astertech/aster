@@ -41,43 +41,19 @@ use aster_mesh::{
     MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
     MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
     VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobCustodyClaimV2,
-    VerifiedBlobStreamOpen, VerifiedBlobTransferObject, VerifiedBlobTransferPlan,
+    VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource, VerifiedBlobTransferPlan,
     local_blob_publication_stream_id,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
 use super::*;
 
-pub use depot::{
-    AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion, Profile5SenderReadSession,
-};
+pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
-pub use stream::{BlobProfile5Receipt, BlobStreamResume};
-pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
-
-#[cfg(any(test, feature = "test-utils"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Profile5BatchTestCounts {
-    pub sender_carrier_reads: u64,
-    pub durable_batches: u64,
-    pub installed_carriers: u64,
-    pub total_write_begins: u64,
-    pub total_write_commits: u64,
-    pub source_stage_write_begins: u64,
-    pub source_stage_write_commits: u64,
-    pub receipt_reservation_write_begins: u64,
-    pub receipt_reservation_write_commits: u64,
-    pub extent_write_begins: u64,
-    pub extent_write_commits: u64,
-    pub promotion_write_begins: u64,
-    pub promotion_write_commits: u64,
-    pub receipt_cleanup_write_begins: u64,
-    pub receipt_cleanup_write_commits: u64,
-    pub fallback_activation_write_begins: u64,
-    pub fallback_activation_write_commits: u64,
-    pub temp_file_syncs: u64,
-    pub parent_directory_syncs: u64,
-}
+pub use stream::BlobStreamResume;
+pub use upload::{
+    BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation, ReceivedProfile5FinitePromotion,
+};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");
@@ -115,8 +91,7 @@ pub(crate) const BLOB_NETWORK_METADATA: TableDefinition<&str, u64> =
 // both ordinary semantic quotas and the network byte/row staging partition.
 pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
-pub(crate) const BLOB_PROFILE5_RECEIPTS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("aster.blob-profile5-receipts.v1");
+const OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME: &str = "aster.blob-profile5-receipts.v1";
 pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-reservations.v2");
 pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
@@ -614,6 +589,8 @@ pub enum BlobStoreError {
     #[doc(hidden)]
     VariantDeleting,
     UnsupportedExperimentalBlobStreamSchema,
+    UnsupportedLegacyProfile5ReceiptSchema,
+    UnsupportedProfile5PackSchema,
     SchemaInvariant(&'static str),
     DepotIntegrity(&'static str),
     CompletionMismatch,
@@ -659,7 +636,13 @@ impl fmt::Display for BlobStoreError {
             }
             Self::ReadPlanChanged => formatter.write_str("Blob read plan changed before use"),
             Self::UnsupportedExperimentalBlobStreamSchema => formatter.write_str(
-                "unsupported experimental Blob stream schema contains durable authority",
+                "unsupported experimental Blob stream schema contains durable authority; reset the development depot or reimport Blob data",
+            ),
+            Self::UnsupportedLegacyProfile5ReceiptSchema => formatter.write_str(
+                "unsupported legacy Profile-5 receipt schema; reset the development depot or reimport Blob data",
+            ),
+            Self::UnsupportedProfile5PackSchema => formatter.write_str(
+                "unsupported Profile-5 pack schema; reset the development depot or reimport Blob data",
             ),
             Self::PublicationLimitExceeded { current, limit } => write!(
                 formatter,
@@ -1114,50 +1097,77 @@ impl BlobVariantId {
     }
 }
 
-/// Derives the publication identities bound by an authenticated native
-/// Profile-5 open and final commitment. Receivers use this before promotion so
-/// transport OPEN identity mismatches cannot mutate durable state.
-pub fn profile5_pack_identities(
-    open: &aster_mesh::BlobStreamOpen,
+/// Derives publication identities from a signed semantic publication binding
+/// and the independently authenticated canonical physical pack it references.
+pub(crate) fn profile5_publication_identities(
+    publication: &VerifiedBlobStreamPublication,
+    pack: &pack_lifecycle::BlobPackVariant,
+) -> Result<(BlobTransferId, BlobSemanticId, BlobVariantId, Vec<u8>), StoreError> {
+    if publication.publication().physical_lineage() != pack.physical_lineage() {
+        return Err(blob_error(BlobStoreError::CompletionMismatch));
+    }
+    profile5_publication_source_identities(
+        publication,
+        pack.open(),
+        pack.authenticated_open(),
+        pack.commitment(),
+        pack.authenticated_commitment(),
+    )
+}
+
+fn profile5_publication_source_identities(
+    publication: &VerifiedBlobStreamPublication,
+    physical_open: &aster_mesh::BlobStreamOpen,
     authenticated_open: &[u8],
     commitment: &aster_mesh::BlobStreamFinalCommitment,
     authenticated_commitment: &[u8],
-) -> Result<(BlobTransferId, BlobSemanticId, BlobVariantId), StoreError> {
-    if commitment.open_digest() != &open.digest()
-        || commitment.stream_id() != open.stream_id()
-        || commitment.total_len() != open.total_len()
-        || commitment.content_epoch() != open.content_epoch()
-        || commitment.ttl_ms() != open.ttl_ms()
+) -> Result<(BlobTransferId, BlobSemanticId, BlobVariantId, Vec<u8>), StoreError> {
+    let semantic = publication.publication();
+    let open = semantic.open();
+    if semantic.blob_id() != commitment.blob_id()
+        || open.total_len() != physical_open.total_len()
+        || open.content_epoch() != physical_open.content_epoch()
+        || open.metadata() != physical_open.metadata()
+        || open.content_group() != physical_open.content_group()
+        || commitment.open_digest() != &physical_open.digest()
+        || commitment.stream_id() != physical_open.stream_id()
+        || commitment.total_len() != physical_open.total_len()
+        || commitment.content_epoch() != physical_open.content_epoch()
+        || commitment.ttl_ms() != physical_open.ttl_ms()
     {
         return Err(blob_error(BlobStoreError::CompletionMismatch));
     }
-    let source =
-        pack_lifecycle::profile5_source_record(authenticated_open, authenticated_commitment)?;
+    let source = pack_lifecycle::profile5_publication_source_record(
+        publication.authenticated_bytes(),
+        authenticated_open,
+        authenticated_commitment,
+    )?;
     Ok((
-        BlobTransferId::new(Sha256::digest(source).into()),
-        BlobSemanticId::new(pack_lifecycle::profile5_semantic_digest(open, commitment)),
+        BlobTransferId::new(Sha256::digest(&source).into()),
+        BlobSemanticId::new(Sha256::digest(publication.authenticated_bytes()).into()),
         BlobVariantId::for_content(
-            commitment.blob_id(),
+            semantic.blob_id(),
             &open.content_group(),
             open.content_epoch(),
         ),
+        source,
     ))
 }
 
-/// Exact authenticated source-record length bound by the native Profile-5
-/// transfer identity and custody claim.
-pub fn profile5_pack_source_record_len(
-    authenticated_open_len: usize,
-    authenticated_commitment_len: usize,
-) -> Result<u64, StoreError> {
-    let len = 8_usize
-        .checked_add(2)
-        .and_then(|len| len.checked_add(4))
-        .and_then(|len| len.checked_add(authenticated_open_len))
-        .and_then(|len| len.checked_add(4))
-        .and_then(|len| len.checked_add(authenticated_commitment_len))
-        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    u64::try_from(len).map_err(|_| StoreError::PayloadByteAccountingOverflow)
+fn profile5_publication_session_identities(
+    publication: &VerifiedBlobStreamPublication,
+    pack: &Profile5PackReadSession,
+) -> Result<(BlobTransferId, BlobSemanticId, BlobVariantId, Vec<u8>), StoreError> {
+    if publication.publication().physical_lineage() != pack.physical_lineage() {
+        return Err(blob_error(BlobStoreError::CompletionMismatch));
+    }
+    profile5_publication_source_identities(
+        publication,
+        pack.open(),
+        pack.authenticated_open(),
+        pack.commitment(),
+        pack.authenticated_commitment(),
+    )
 }
 
 pub(crate) fn blob_variant_id(
@@ -3432,60 +3442,6 @@ impl Store {
         BlobDepot::open_authenticated_read(self, completion)
     }
 
-    /// Loads and verifies one complete canonical carrier for the profile-5
-    /// sender. Keeping this as a Store seam makes each map operation explicit
-    /// and measurable while retaining the nonconstructible completion gate.
-    #[doc(hidden)]
-    pub fn begin_profile5_sender_read(
-        &self,
-        completion: &BlobDepotCompletion,
-    ) -> Result<Profile5SenderReadSession, StoreError> {
-        self.require_live()?;
-        self.require_bound_mission()?;
-        BlobDepot::open_profile5_sender_session(self, completion)
-    }
-
-    /// Loads one carrier under an already-authorized attempt session.
-    #[doc(hidden)]
-    pub fn read_profile5_sender_carrier(
-        &self,
-        session: &Profile5SenderReadSession,
-        plan: &VerifiedBlobTransferPlan,
-        index: u64,
-    ) -> Result<Vec<u8>, StoreError> {
-        #[cfg(any(test, feature = "test-utils"))]
-        if self
-            .profile5_batch_test_counters
-            .sender_carrier_read_fail_at
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == index.saturating_add(1)
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "injected profile-5 sender carrier read failure",
-            )));
-        }
-        let mut depot = BlobDepot::open_profile5_sender_read(self, session)?;
-        let carrier = plan
-            .build_carrier(&mut depot, index)
-            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        #[cfg(any(test, feature = "test-utils"))]
-        self.profile5_batch_test_counters
-            .sender_carrier_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(carrier.into_bytes())
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn fail_profile5_sender_carrier_read_at_for_test(&self, index: u64) {
-        self.profile5_batch_test_counters
-            .sender_carrier_read_fail_at
-            .store(
-                index.saturating_add(1),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-    }
-
     /// Node-internal full-content verification seam for a still-pending source.
     ///
     /// The returned adapter denies mutation but intentionally consumes no
@@ -4768,17 +4724,7 @@ impl Store {
         // redb import becomes durable, while retaining the single-owner lock.
         let _depot_guard = BlobDepot::open_network_mutation(self, true)?;
         self.require_live()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        let observe_profile5 = limits.total_len == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.total_len
-            && limits.source_len == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.source_len
-            && limits.chunks == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.chunks;
         let write = self.database.begin_write()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.profile5_batch_test_counters
-                .source_stage_write_begins
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         enforce_live_write(&write)?;
         let admission_continuity = if let Some(verified) = finite.as_ref() {
             let continuity = custody::observe_continuity_write(&write, verified.receiver_sample)?;
@@ -4951,12 +4897,6 @@ impl Store {
                 )?;
             }
             write.commit()?;
-            #[cfg(any(test, feature = "test-utils"))]
-            if observe_profile5 {
-                self.profile5_batch_test_counters
-                    .source_stage_write_commits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             return Ok(BlobSourceStageOutcome::Duplicate);
         }
         if lifecycle::check_replay_fence(&write, replay_fence)?
@@ -5140,12 +5080,6 @@ impl Store {
             )?;
         }
         write.commit()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.profile5_batch_test_counters
-                .source_stage_write_commits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         Ok(if existing.is_some() {
             BlobSourceStageOutcome::Duplicate
         } else {
@@ -5503,34 +5437,30 @@ impl Store {
         stored: &StoredBlob,
         projection: &BlobSourceProjection,
         retention: BlobSourceRetention,
-        open: &VerifiedBlobStreamOpen,
+        publication: &VerifiedBlobStreamPublication,
         pack: &Profile5PackReadSession,
         context: AuthenticatedBlobCustodySendContextV2,
         sender_sample: aster_mesh::CustodySample,
     ) -> Result<Option<VerifiedBlobCustodySendV2>, StoreError> {
-        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
-            open.open(),
-            open.authenticated_bytes(),
-            pack.commitment(),
-            pack.authenticated_commitment(),
-        )?;
+        let (transfer_id, semantic_id, variant_id, source) =
+            profile5_publication_session_identities(publication, pack)?;
+        let open = publication.publication().open();
         let sealed_len = u64::try_from(stored.sealed.len())
             .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-        if pack.open() != open.open()
-            || pack.authenticated_open() != open.authenticated_bytes()
+        if stored.sealed != source
             || stored.transfer_id != transfer_id
             || stored.semantic_id != semantic_id
             || stored.variant_id != variant_id
             || projection.transfer_id != transfer_id
             || projection.semantic_id != semantic_id
-            || projection.publisher != open.open().publisher()
-            || projection.topic != *open.open().topic()
-            || projection.scope != *open.open().scope()
-            || projection.epoch != open.open().content_epoch()
-            || projection.route_lineage != *pack.route_lineage()
+            || projection.publisher != open.publisher()
+            || projection.topic != *open.topic()
+            || projection.scope != *open.scope()
+            || projection.epoch != open.content_epoch()
+            || projection.route_lineage != *open.authorization_digest()
             || projection.physical_lineage != *pack.physical_lineage()
             || projection.blob_id != pack.commitment().blob_id()
-            || projection.total_len != open.open().total_len()
+            || projection.total_len != open.total_len()
             || projection.chunk_size != aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32
             || projection.chunk_count != pack.commitment().segment_count()
             || sealed_len != projection.sealed_len
@@ -5565,7 +5495,7 @@ impl Store {
         &self,
         policy: &ControlPolicySnapshot,
         stored: &StoredBlob,
-        open: &VerifiedBlobStreamOpen,
+        inbound: &VerifiedBlobStreamPublicationSource,
         pack: &Profile5PackReadSession,
         verified: VerifiedBlobCustodyClaimV2,
         received_sample: aster_mesh::CustodySample,
@@ -5578,27 +5508,32 @@ impl Store {
             received_sample,
             promotion_sample,
         )?;
-        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
-            open.open(),
-            open.authenticated_bytes(),
-            pack.commitment(),
-            pack.authenticated_commitment(),
-        )?;
-        let source_len = profile5_pack_source_record_len(
-            pack.authenticated_open().len(),
-            pack.authenticated_commitment().len(),
-        )?;
-        if pack.open() != open.open()
-            || pack.authenticated_open() != open.authenticated_bytes()
+        let publication = inbound.publication();
+        let (transfer_id, semantic_id, variant_id, source) =
+            profile5_publication_session_identities(publication, pack)?;
+        let (inbound_transfer_id, inbound_semantic_id, inbound_variant_id, inbound_source) =
+            profile5_publication_source_identities(
+                publication,
+                inbound.physical_open().open(),
+                inbound.physical_open().authenticated_bytes(),
+                inbound.physical_commitment().commitment(),
+                inbound.physical_commitment().authenticated_bytes(),
+            )?;
+        let open = publication.publication().open();
+        let inbound_source_len = u64::try_from(inbound_source.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        if stored.sealed != source
             || stored.transfer_id != transfer_id
             || stored.semantic_id != semantic_id
             || stored.variant_id != variant_id
-            || admission.source_transfer_id != *transfer_id.as_bytes()
-            || admission.source_len != source_len
-            || admission.publication_id != *semantic_id.as_bytes()
-            || admission.blob_id != pack.commitment().blob_id()
-            || admission.priority != open.open().priority()
-            || open.open().ttl_ms() != Some(admission.ttl_ms)
+            || semantic_id != inbound_semantic_id
+            || variant_id != inbound_variant_id
+            || admission.source_transfer_id != *inbound_transfer_id.as_bytes()
+            || admission.source_len != inbound_source_len
+            || admission.publication_id != *inbound_semantic_id.as_bytes()
+            || admission.blob_id != inbound.physical_commitment().commitment().blob_id()
+            || admission.priority != open.priority()
+            || open.ttl_ms() != Some(admission.ttl_ms)
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
@@ -5630,7 +5565,7 @@ impl Store {
             || metadata.blob_id != admission.blob_id
             || metadata.header.priority != admission.priority
             || metadata.header.ttl_ms != Some(admission.ttl_ms)
-            || metadata.route_lineage != Some(*pack.route_lineage())
+            || metadata.route_lineage != Some(*open.authorization_digest())
             || metadata.physical_lineage != Some(*pack.physical_lineage())
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
@@ -5970,7 +5905,7 @@ impl Store {
         policy: &ControlPolicySnapshot,
         prepared: PreparedBlobCustodySend,
         stored: &StoredBlob,
-        open: &VerifiedBlobStreamOpen,
+        publication: &VerifiedBlobStreamPublication,
         pack: &Profile5PackReadSession,
         final_sample: aster_mesh::CustodySample,
     ) -> Result<bool, StoreError> {
@@ -5986,14 +5921,9 @@ impl Store {
         {
             return Ok(false);
         }
-        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
-            open.open(),
-            open.authenticated_bytes(),
-            pack.commitment(),
-            pack.authenticated_commitment(),
-        )?;
-        if pack.open() != open.open()
-            || pack.authenticated_open() != open.authenticated_bytes()
+        let (transfer_id, semantic_id, variant_id, source) =
+            profile5_publication_session_identities(publication, pack)?;
+        if stored.sealed != source
             || stored.transfer_id != transfer_id
             || stored.semantic_id != semantic_id
             || stored.variant_id != variant_id
@@ -7224,211 +7154,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Installs one ordered, already-authenticated profile-5 carrier batch and
-    /// advances its exact durable receipt only after the depot has synchronized
-    /// every carrier. Replay after a crash is idempotent because the receipt is
-    /// the sole resume authority and verified chunk installation is exact.
-    pub fn commit_verified_profile5_batch_with_policy(
-        &self,
-        policy: &ControlPolicySnapshot,
-        receipt: &BlobProfile5Receipt,
-        expected: BlobStreamResume,
-        durable: BlobStreamResume,
-        plan: &VerifiedBlobTransferPlan,
-        carriers: &[(VerifiedBlobTransferObject, u64)],
-    ) -> Result<BlobStreamResume, StoreError> {
-        self.require_live()?;
-        let authority = self.require_bound_mission()?;
-        let source = receipt.source();
-        if carriers.is_empty()
-            || expected.next_segment_index() >= durable.next_segment_index()
-            || durable
-                .next_segment_index()
-                .saturating_sub(expected.next_segment_index())
-                != u64::try_from(carriers.len())
-                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?
-        {
-            return Err(blob_error(BlobStoreError::ReservationChanged));
-        }
-        let mut next = expected.next_segment_index();
-        let mut plaintext = expected.durable_plaintext_offset();
-        let mut carrier_bytes = expected.durable_pack_len();
-        for (verified, encoded_len) in carriers {
-            if verified.index() != next {
-                return Err(blob_error(BlobStoreError::ReservationChanged));
-            }
-            plaintext = plaintext
-                .checked_add(u64::from(verified.record().plaintext_len()))
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            carrier_bytes = carrier_bytes
-                .checked_add(*encoded_len)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            next = next
-                .checked_add(1)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-        }
-        if next != durable.next_segment_index()
-            || plaintext != durable.durable_plaintext_offset()
-            || carrier_bytes != durable.durable_pack_len()
-        {
-            return Err(blob_error(BlobStoreError::ReservationChanged));
-        }
-
-        let pending = {
-            let read = self.database.begin_read()?;
-            let pending = read
-                .open_table(BLOB_PENDING_SOURCES)?
-                .get(source.as_bytes().as_slice())?
-                .map(|value| decode_pending_blob_source(value.value()))
-                .transpose()?
-                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
-            require_blob_contact_eligibility(
-                pending.metadata.lifetime,
-                BlobContactEligibility::CustodyV1,
-            )?;
-            require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
-            if pending.metadata.transfer_id != source
-                || read
-                    .open_table(BLOB_PUBLICATIONS)?
-                    .get(source.as_bytes().as_slice())?
-                    .is_some()
-            {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "pending Blob source identity or visibility is inconsistent",
-                )));
-            }
-            enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
-            require_pending_blob_plan(&pending, plan)?;
-            pending
-        };
-
-        let mut depot = BlobDepot::open_network_mutation(self, false)?;
-        depot.acquire_internal_chunk_work_lease(pending.metadata.variant_id)?;
-        let progress = depot.commit_verified_profile5_extent_batch(
-            policy, receipt, expected, durable, plan, carriers,
-        )?;
-        #[cfg(any(test, feature = "test-utils"))]
-        {
-            self.profile5_batch_test_counters
-                .installed_carriers
-                .fetch_add(
-                    u64::try_from(carriers.len())
-                        .expect("profile-5 batch length is bounded by the manifest"),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            self.profile5_batch_test_counters
-                .durable_batches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(progress)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn profile5_batch_test_counts(&self) -> Profile5BatchTestCounts {
-        let mut counts = Profile5BatchTestCounts {
-            sender_carrier_reads: self
-                .profile5_batch_test_counters
-                .sender_carrier_reads
-                .load(std::sync::atomic::Ordering::Relaxed),
-            durable_batches: self
-                .profile5_batch_test_counters
-                .durable_batches
-                .load(std::sync::atomic::Ordering::Relaxed),
-            installed_carriers: self
-                .profile5_batch_test_counters
-                .installed_carriers
-                .load(std::sync::atomic::Ordering::Relaxed),
-            source_stage_write_begins: self
-                .profile5_batch_test_counters
-                .source_stage_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            source_stage_write_commits: self
-                .profile5_batch_test_counters
-                .source_stage_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            receipt_reservation_write_begins: self
-                .profile5_batch_test_counters
-                .receipt_reservation_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            receipt_reservation_write_commits: self
-                .profile5_batch_test_counters
-                .receipt_reservation_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            extent_write_begins: self
-                .profile5_batch_test_counters
-                .extent_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            extent_write_commits: self
-                .profile5_batch_test_counters
-                .extent_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            promotion_write_begins: self
-                .profile5_batch_test_counters
-                .promotion_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            promotion_write_commits: self
-                .profile5_batch_test_counters
-                .promotion_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            receipt_cleanup_write_begins: self
-                .profile5_batch_test_counters
-                .receipt_cleanup_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            receipt_cleanup_write_commits: self
-                .profile5_batch_test_counters
-                .receipt_cleanup_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            fallback_activation_write_begins: self
-                .profile5_batch_test_counters
-                .fallback_activation_write_begins
-                .load(std::sync::atomic::Ordering::Relaxed),
-            fallback_activation_write_commits: self
-                .profile5_batch_test_counters
-                .fallback_activation_write_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            temp_file_syncs: self
-                .profile5_batch_test_counters
-                .temp_file_syncs
-                .load(std::sync::atomic::Ordering::Relaxed),
-            parent_directory_syncs: self
-                .profile5_batch_test_counters
-                .parent_directory_syncs
-                .load(std::sync::atomic::Ordering::Relaxed),
-            ..Profile5BatchTestCounts::default()
-        };
-        counts.total_write_begins = counts.source_stage_write_begins
-            + counts.receipt_reservation_write_begins
-            + counts.extent_write_begins
-            + counts.promotion_write_begins
-            + counts.receipt_cleanup_write_begins
-            + counts.fallback_activation_write_begins;
-        counts.total_write_commits = counts.source_stage_write_commits
-            + counts.receipt_reservation_write_commits
-            + counts.extent_write_commits
-            + counts.promotion_write_commits
-            + counts.receipt_cleanup_write_commits
-            + counts.fallback_activation_write_commits;
-        counts
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn install_profile5_batch_precommit_gate(
-        &self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<bool>,
-    ) {
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        *self
-            .profile5_batch_precommit_gate
-            .lock()
-            .expect("profile-5 precommit gate lock") = Some((entered_tx, release_rx));
-        (entered_rx, release_tx)
-    }
-
     /// Authenticates and installs one complete exact carrier, then retires only
     /// that source/object prefix. A crash after the depot commit but before the
     /// redb retirement is safe: replay observes the exact committed chunk and
@@ -7959,27 +7684,6 @@ impl Store {
             depot_completion,
             content_completion,
             BlobContactEligibility::CustodyV1,
-            false,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn apply_verified_profile5_blob_with_policy(
-        &self,
-        policy: &ControlPolicySnapshot,
-        plan: &VerifiedBlobTransferPlan,
-        lineage: &CurrentBlobLineage,
-        depot_completion: &BlobDepotCompletion,
-        content_completion: &VerifiedBlobContentCompletion,
-    ) -> Result<ApplyOutcome, StoreError> {
-        self.apply_verified_blob_with_eligibility(
-            policy,
-            plan,
-            lineage,
-            depot_completion,
-            content_completion,
-            BlobContactEligibility::CustodyV1,
-            true,
         )
     }
 
@@ -7999,7 +7703,6 @@ impl Store {
             depot_completion,
             content_completion,
             BlobContactEligibility::DurableOnly,
-            false,
         )
     }
 
@@ -8012,10 +7715,7 @@ impl Store {
         depot_completion: &BlobDepotCompletion,
         content_completion: &VerifiedBlobContentCompletion,
         eligibility: BlobContactEligibility,
-        observe_profile5: bool,
     ) -> Result<ApplyOutcome, StoreError> {
-        #[cfg(not(any(test, feature = "test-utils")))]
-        let _ = observe_profile5;
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let source = BlobTransferId::new(plan.source_envelope().into_bytes());
@@ -8100,12 +7800,6 @@ impl Store {
         depot::verify_completion(self, depot_completion)?;
 
         let write = self.database.begin_write()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.profile5_batch_test_counters
-                .promotion_write_begins
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         enforce_live_write(&write)?;
         let staging = blob_network_staging_usage_write(&write, authority)?;
         let owner_binding = depot::require_depot_owner_binding_write(
@@ -8280,12 +7974,6 @@ impl Store {
             )?;
             pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
             write.commit()?;
-            #[cfg(any(test, feature = "test-utils"))]
-            if observe_profile5 {
-                self.profile5_batch_test_counters
-                    .promotion_write_commits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             return Ok(ApplyOutcome::Duplicate {
                 acceptance_marker: accepted.acceptance_marker,
             });
@@ -8470,12 +8158,6 @@ impl Store {
         )?;
         pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
         write.commit()?;
-        #[cfg(any(test, feature = "test-utils"))]
-        if observe_profile5 {
-            self.profile5_batch_test_counters
-                .promotion_write_commits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         Ok(ApplyOutcome::Inserted {
             acceptance_marker: marker,
         })
@@ -9228,25 +8910,21 @@ struct PreparedBlobPublication {
 }
 
 impl PreparedBlobPublication {
-    fn from_profile5_pack(
+    fn from_profile5_publication(
         pack: &pack_lifecycle::BlobPackVariant,
+        publication: &VerifiedBlobStreamPublication,
         lifetime: BlobLifetime,
     ) -> Result<Self, StoreError> {
         validate_blob_lifetime(lifetime)?;
-        let open = pack.open();
-        let commitment = pack.commitment();
-        let sealed = pack.source_record()?;
-        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
-            open,
-            pack.authenticated_open(),
-            commitment,
-            pack.authenticated_commitment(),
-        )?;
-        let blob_id = commitment.blob_id();
+        let semantic = publication.publication();
+        let open = semantic.open();
+        let (transfer_id, semantic_id, variant_id, sealed) =
+            profile5_publication_identities(publication, pack)?;
+        let blob_id = semantic.blob_id();
         let route = BlobRouteCommitment::from_parts(
             blob_id,
-            commitment.segment_count(),
-            *commitment.ciphertext_root(),
+            pack.commitment().segment_count(),
+            *pack.commitment().ciphertext_root(),
         )
         .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
         let header = EnvelopeHeader {
@@ -9275,8 +8953,8 @@ impl PreparedBlobPublication {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
         let manifest_digest = *pack.completion().commitment_digest();
-        let route_lineage = *pack.route_lineage();
-        let physical_lineage = *pack.physical_lineage();
+        let route_lineage = *open.authorization_digest();
+        let physical_lineage = *semantic.physical_lineage();
         let mission_authority = *open.mission_id();
         let encoded_metadata = encode_blob_metadata(BlobMetadata {
             transfer_id,
@@ -10213,12 +9891,9 @@ fn retired_publication_expiry_charge_write(
             transfer,
             publication.semantic_id,
         )?;
-    let (receipt_rows, receipt_bytes) =
-        stream::profile5_receipt_expiry_charge_write(write, transfer)?;
     lifecycle::require_publication_retirement_resolver_write(write, transfer)?;
     Ok((
         6u64.checked_add(delivery_rows)
-            .and_then(|rows| rows.checked_add(receipt_rows))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         maintenance_entry_bytes(transfer.as_bytes(), &encoded)?
             .checked_add(maintenance_entry_bytes(semantic_key, &semantic)?)
@@ -10226,7 +9901,6 @@ fn retired_publication_expiry_charge_write(
                 bytes.checked_add(maintenance_entry_bytes(content_key.as_slice(), &content).ok()?)
             })
             .and_then(|bytes| bytes.checked_add(delivery_bytes))
-            .and_then(|bytes| bytes.checked_add(receipt_bytes))
             .and_then(|bytes| bytes.checked_add(57))
             // Permanent expired-replay causal binding: 40-byte dot key plus
             // one fixed 32-byte frontier-key digest.
@@ -10317,7 +9991,6 @@ fn expire_retired_publication_write(
             transfer,
             publication.semantic_id,
         )?;
-    let (receipt_rows, receipt_bytes) = stream::expire_profile5_receipt_write(write, transfer)?;
     write
         .open_table(BLOB_PUBLICATIONS)?
         .remove(transfer.as_bytes().as_slice())?
@@ -10363,14 +10036,12 @@ fn expire_retired_publication_write(
             bytes.checked_add(maintenance_entry_bytes(content_key.as_slice(), &content).ok()?)
         })
         .and_then(|bytes| bytes.checked_add(delivery_bytes))
-        .and_then(|bytes| bytes.checked_add(receipt_bytes))
         .and_then(|bytes| bytes.checked_add(57))
         .and_then(|bytes| bytes.checked_add(72))
         .and_then(|bytes| bytes.checked_add(33))
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     Ok((
         6u64.checked_add(delivery_rows)
-            .and_then(|rows| rows.checked_add(receipt_rows))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         bytes,
     ))
@@ -14416,7 +14087,6 @@ struct PendingRemovalAuthorityPlan {
     staging_before: BlobNetworkStagingUsage,
     removed_rows: u64,
     removed_bytes: u64,
-    remove_profile5_receipt: bool,
 }
 
 /// One admitted whole-variant mutation. The shared pressure snapshot and
@@ -16541,9 +16211,18 @@ pub(crate) fn blob_schema_present_write(
 ) -> Result<bool, StoreError> {
     let tables = blob_table_names();
     let stream_tables = stream_blob_table_names();
-    if write
+    let multimap_tables = write
         .list_multimap_tables()?
-        .any(|table| tables.contains(&table.name()) || stream_tables.contains(&table.name()))
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
+    if multimap_tables
+        .iter()
+        .any(|table| tables.contains(&table.as_str()) || stream_tables.contains(&table.as_str()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -16553,6 +16232,11 @@ pub(crate) fn blob_schema_present_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
     let legacy = legacy_blob_table_names();
     let legacy_present = legacy
         .iter()
@@ -16563,9 +16247,6 @@ pub(crate) fn blob_schema_present_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    let network_predecessor = network_present == 4
-        && network[..4].iter().all(|table| existing.contains(*table))
-        && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
     let network_current = network_present == network.len();
     let stream_present = stream_tables
         .iter()
@@ -16574,11 +16255,11 @@ pub(crate) fn blob_schema_present_write(
     let upload_present = existing.contains(BLOB_UPLOADS.name());
     let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
     let extension_group_supported = matches!(
-        (network_present, upload_present),
-        (0, false) | (4, false) | (4, true) | (5, true)
+        (network_present, upload_present, pack_present),
+        (0, false, false) | (4, false, false) | (4, true, true)
     );
     #[cfg(test)]
-    let schema_migration_required = stream_present != 0 || network_predecessor || !upload_present;
+    let schema_migration_required = stream_present != 0 || !upload_present;
     let metadata = write.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -16650,7 +16331,7 @@ pub(crate) fn blob_schema_present_write(
         return Ok(false);
     }
     if legacy_present != legacy.len()
-        || !(network_present == 0 || network_predecessor || network_current)
+        || !(network_present == 0 || network_current)
         || !extension_group_supported
         || global_present.iter().any(|present| !present)
     {
@@ -16682,8 +16363,6 @@ pub(crate) fn blob_schema_present_write(
     }
     if network_present == 0 {
         initialize_blob_network_schema(write)?;
-    } else if network_predecessor {
-        let _ = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
     }
     if !upload_present {
         let _ = write.open_table(BLOB_UPLOADS)?;
@@ -17603,9 +17282,18 @@ pub(crate) fn inspect_blob_tables_read(
 ) -> Result<BlobAuditSnapshot, StoreError> {
     let tables = blob_table_names();
     let stream_tables = stream_blob_table_names();
-    if read
+    let multimap_tables = read
         .list_multimap_tables()?
-        .any(|table| tables.contains(&table.name()) || stream_tables.contains(&table.name()))
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
+    if multimap_tables
+        .iter()
+        .any(|table| tables.contains(&table.as_str()) || stream_tables.contains(&table.as_str()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -17615,6 +17303,11 @@ pub(crate) fn inspect_blob_tables_read(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
     let legacy = legacy_blob_table_names();
     let legacy_present = legacy
         .iter()
@@ -17625,15 +17318,12 @@ pub(crate) fn inspect_blob_tables_read(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    let network_predecessor = network_present == 4
-        && network[..4].iter().all(|table| existing.contains(*table))
-        && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
     let network_current = network_present == network.len();
     let upload_present = existing.contains(BLOB_UPLOADS.name());
     let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
     let extension_group_supported = matches!(
-        (network_present, upload_present),
-        (0, false) | (4, false) | (4, true) | (5, true)
+        (network_present, upload_present, pack_present),
+        (0, false, false) | (4, false, false) | (4, true, true)
     );
     let stream_present = stream_tables
         .iter()
@@ -17690,20 +17380,22 @@ pub(crate) fn inspect_blob_tables_read(
         return Ok(BlobAuditSnapshot::default());
     }
     if legacy_present != legacy.len()
-        || !(network_present == 0 || network_predecessor || network_current)
+        || !(network_present == 0 || network_current)
         || !extension_group_supported
-        || !pack_present
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
     }
-    drop(metadata);
-    if upload_present {
-        pack_lifecycle::audit_read(read)?;
-        upload::audit_blob_uploads_read(read)?;
+    if !upload_present {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob predecessor schema requires writable Profile-5 extension",
+        )));
     }
+    drop(metadata);
+    pack_lifecycle::audit_read(read)?;
+    upload::audit_blob_uploads_read(read)?;
     let deletion_owner_binding = depot::depot_owner_binding_if_present_read(read)?;
     let deletion_audit = deletion::inspect_blob_deletion_read(read, deletion_owner_binding)?;
     let publication_encoding = lifecycle::publication_encoding_migration_read(read)?;
@@ -17998,7 +17690,7 @@ pub(crate) fn inspect_blob_tables_read(
         .reserved_file_bytes
         .checked_add(pack_capacity.bytes)
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    if network_predecessor || network_current {
+    if network_current {
         let network = inspect_blob_network_tables_read_with_publications(
             read,
             deletion_owner_binding,
@@ -18397,7 +18089,6 @@ fn initialize_blob_network_schema(write: &redb::WriteTransaction) -> Result<(), 
     let _ = write.open_table(BLOB_PENDING_SOURCES)?;
     let _ = write.open_table(BLOB_CARRIER_PREFIXES)?;
     let _ = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
-    let _ = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
     let mut metadata = write.open_table(BLOB_NETWORK_METADATA)?;
     if metadata.get(BLOB_NETWORK_SCHEMA_VERSION_FIELD)?.is_none() {
         metadata.insert(
@@ -18424,13 +18115,12 @@ fn legacy_blob_table_names() -> [&'static str; 9] {
     ]
 }
 
-fn network_blob_table_names() -> [&'static str; 5] {
+fn network_blob_table_names() -> [&'static str; 4] {
     [
         BLOB_PENDING_SOURCES.name(),
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
-        BLOB_PROFILE5_RECEIPTS.name(),
     ]
 }
 
@@ -18445,7 +18135,7 @@ fn stream_blob_table_names() -> [&'static str; 6] {
     ]
 }
 
-fn blob_table_names() -> [&'static str; 16] {
+fn blob_table_names() -> [&'static str; 15] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
@@ -18462,7 +18152,6 @@ fn blob_table_names() -> [&'static str; 16] {
         network[1],
         network[2],
         network[3],
-        network[4],
         BLOB_UPLOADS.name(),
         pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
     ]
@@ -18655,10 +18344,10 @@ fn audit_blob_network_rows(
 fn audit_blob_network_tables_write_with_publications(
     write: &redb::WriteTransaction,
     mission_authority: Option<NodeId>,
-    owner_binding: Option<[u8; 32]>,
+    _owner_binding: Option<[u8; 32]>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
     pending_encoding: PendingBlobEncodingGeneration,
-    publication_encoding: lifecycle::PublicationEncodingGeneration,
+    _publication_encoding: lifecycle::PublicationEncodingGeneration,
 ) -> Result<BlobNetworkAudit, StoreError> {
     let pending = write.open_table(BLOB_PENDING_SOURCES)?;
     let carriers = write.open_table(BLOB_CARRIER_PREFIXES)?;
@@ -18677,29 +18366,15 @@ fn audit_blob_network_tables_write_with_publications(
         mission_authority,
         pending_encoding,
     )?;
-    let receipts = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
-    stream::audit_profile5_receipts(
-        &receipts,
-        &pending,
-        publications,
-        &imports,
-        &chunks,
-        stream::Profile5ReceiptAuditContext {
-            mission_authority,
-            owner_binding,
-            pending_encoding,
-            publication_encoding,
-        },
-    )?;
     Ok(audit)
 }
 
 fn inspect_blob_network_tables_read_with_publications(
     read: &redb::ReadTransaction,
-    owner_binding: Option<[u8; 32]>,
+    _owner_binding: Option<[u8; 32]>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
     pending_encoding: PendingBlobEncodingGeneration,
-    publication_encoding: lifecycle::PublicationEncodingGeneration,
+    _publication_encoding: lifecycle::PublicationEncodingGeneration,
 ) -> Result<BlobNetworkAudit, StoreError> {
     let pending = read.open_table(BLOB_PENDING_SOURCES)?;
     let carriers = read.open_table(BLOB_CARRIER_PREFIXES)?;
@@ -18718,25 +18393,6 @@ fn inspect_blob_network_tables_read_with_publications(
         read_mission_binding_read(read)?,
         pending_encoding,
     )?;
-    let has_receipts = read
-        .list_tables()?
-        .any(|table| table.name() == BLOB_PROFILE5_RECEIPTS.name());
-    if has_receipts {
-        let receipts = read.open_table(BLOB_PROFILE5_RECEIPTS)?;
-        stream::audit_profile5_receipts(
-            &receipts,
-            &pending,
-            publications,
-            &imports,
-            &chunks,
-            stream::Profile5ReceiptAuditContext {
-                mission_authority: read_mission_binding_read(read)?,
-                owner_binding,
-                pending_encoding,
-                publication_encoding,
-            },
-        )?;
-    }
     Ok(audit)
 }
 
@@ -19648,15 +19304,6 @@ fn plan_pending_removal_authority_write(
     if pending != *expected || pending.metadata.transfer_id != source {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
     }
-    let receipt_row = stream::profile5_receipt_maintenance_row_write(write, source)?;
-    if let Some((key, value_len)) = receipt_row.as_ref()
-        && !charge.charge_row(
-            MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", key),
-            *value_len,
-        )?
-    {
-        return Ok(None);
-    }
     let mut prefixes = Vec::with_capacity(pending.carriers.len());
     let mut removed_rows = 1u64;
     let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
@@ -19697,7 +19344,6 @@ fn plan_pending_removal_authority_write(
         staging_before,
         removed_rows,
         removed_bytes,
-        remove_profile5_receipt: receipt_row.is_some(),
     }))
 }
 
@@ -19745,14 +19391,6 @@ fn apply_pending_removal_authority_write(
     write
         .open_table(BLOB_PENDING_SOURCES)?
         .remove(plan.source.as_bytes().as_slice())?;
-    if plan.remove_profile5_receipt {
-        let removed = stream::expire_profile5_receipt_write(write, plan.source)?;
-        if removed.0 != 1 {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "planned profile-5 receipt disappeared before pending removal",
-            )));
-        }
-    }
     {
         let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
         for (key, _) in &plan.prefixes {
@@ -19851,9 +19489,6 @@ fn remove_pending_source_rows_write_inner(
     write
         .open_table(BLOB_PENDING_SOURCES)?
         .remove(source.as_bytes().as_slice())?;
-    if remove_ttl_deadline {
-        stream::expire_profile5_receipt_write(write, source)?;
-    }
     {
         let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
         for key in &prefix_rows {
@@ -20628,13 +20263,6 @@ fn blob_database_digest_read_for_test(read: &redb::ReadTransaction) -> [u8; 32] 
     bytes_table!(BLOB_PENDING_SOURCES);
     bytes_table!(BLOB_CARRIER_PREFIXES);
     bytes_table!(BLOB_CARRIER_FETCH_CURSORS);
-    if read
-        .list_tables()
-        .expect("Blob digest tables")
-        .any(|table| table.name() == BLOB_PROFILE5_RECEIPTS.name())
-    {
-        bytes_table!(BLOB_PROFILE5_RECEIPTS);
-    }
     bytes_table!(ACCEPTED_DOTS);
     byte_u64_table!(BLOB_ACCEPTANCE_MARKERS);
     byte_u64_table!(PUBLISHER_HIGH_WATER);
@@ -21269,834 +20897,6 @@ mod tests {
             BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
         };
         (blob, sealed)
-    }
-
-    #[test]
-    fn profile5_receipt_restart_is_monotone_and_store_bound() {
-        let root = BlobTestRoot::new("profile5-receipt-restart");
-        let foreign = BlobTestRoot::new("profile5-receipt-foreign");
-        let mut services = blob_services(0xd7);
-        let plaintext = vec![0x5a; 64 * 1024];
-        let prepared = prepared_blob(&plaintext);
-        let store = Store::open_for_mission(&root.database, services.authority)
-            .expect("profile-5 receipt store");
-        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
-        let plan = proof
-            .blob
-            .transfer_plan(&proof.manifest_bytes)
-            .expect("transfer plan");
-        store
-            .stage_verified_blob_source_with_policy(
-                &proof.policy,
-                &proof.blob,
-                &proof.sealed,
-                &plan,
-            )
-            .expect("stage profile-5 source");
-        let (receipt, initial) = store
-            .reserve_profile5_receipt(&proof.policy, &plan)
-            .expect("reserve profile-5 receipt");
-        let carrier = plan.carrier_id(0).expect("carrier id");
-        let wire = plan
-            .carrier_total_len(&carrier.wire_bytes())
-            .expect("carrier length")
-            + 20;
-        let durable = BlobStreamResume::profile5(1, 1, plaintext.len() as u64, wire - 20, wire);
-        assert_eq!(
-            store
-                .checkpoint_profile5_receipt(&receipt, initial, durable)
-                .expect("checkpoint profile-5 receipt"),
-            durable
-        );
-        assert!(
-            store
-                .checkpoint_profile5_receipt(&receipt, initial, durable)
-                .is_err()
-        );
-
-        let foreign_store = Store::open_for_mission(&foreign.database, services.authority)
-            .expect("foreign profile-5 store");
-        assert!(
-            foreign_store
-                .checkpoint_profile5_receipt(&receipt, durable, durable)
-                .is_err()
-        );
-        drop(foreign_store);
-        drop(proof);
-        drop(store);
-
-        let reopened = Store::open_for_mission(&root.database, services.authority)
-            .expect("reopen profile-5 receipt store");
-        assert_eq!(
-            reopened
-                .resume_profile5_receipt(receipt.source())
-                .expect("resume profile-5 receipt"),
-            Some((receipt, durable))
-        );
-    }
-
-    #[test]
-    fn profile5_extent_batch_replays_every_filesystem_commit_boundary_exactly_once() {
-        for (label, point) in [
-            ("temp-synced", depot::DepotFaultPoint::TempSynced),
-            ("renamed", depot::DepotFaultPoint::Renamed),
-            ("directory-synced", depot::DepotFaultPoint::DirectorySynced),
-        ] {
-            let source_root = BlobTestRoot::new(&format!("profile5-batch-source-{label}"));
-            let target_root = BlobTestRoot::new(&format!("profile5-batch-target-{label}"));
-            let mut services = blob_services(0xe8);
-            let plaintext = vec![0x5a; 64 * 1024];
-            let prepared = prepared_blob(&plaintext);
-            let source = Store::open_for_mission(&source_root.database, services.authority)
-                .expect("profile-5 batch source");
-            let target = Store::open_for_mission(&target_root.database, services.authority)
-                .expect("profile-5 batch target");
-            let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
-            let plan = proof
-                .blob
-                .transfer_plan(&proof.manifest_bytes)
-                .expect("profile-5 batch plan");
-            let mut policy = target
-                .control_policy_snapshot()
-                .expect("profile-5 target policy");
-            target
-                .stage_verified_profile5_blob_source_with_policy(
-                    &policy,
-                    &proof.blob,
-                    &proof.sealed,
-                    &plan,
-                )
-                .expect("stage profile-5 batch source");
-            let (receipt, initial) = target
-                .reserve_profile5_receipt(&policy, &plan)
-                .expect("reserve profile-5 batch receipt");
-            let built = {
-                let mut depot = source.blob_depot().expect("source batch depot");
-                CoreBlobStore::begin_blob_with_lineage(
-                    &mut depot,
-                    plan.manifest(),
-                    plan.physical_lineage(),
-                )
-                .expect("activate source batch plan");
-                plan.build_carrier(&mut depot, 0)
-                    .expect("build profile-5 batch carrier")
-            };
-            let verified = plan
-                .verify_carrier(&built.object_id().wire_bytes(), built.bytes())
-                .expect("verify profile-5 batch carrier");
-            let shape = aster_mesh::profile5_canonical_wire_shape(&plan)
-                .expect("profile-5 batch wire shape");
-            let terminal = shape.terminal();
-            let durable = BlobStreamResume::profile5(
-                1,
-                terminal.next_chunk_index,
-                terminal.plaintext_offset,
-                terminal.carrier_offset,
-                terminal.wire_offset,
-            );
-            let encoded_len = u64::try_from(built.bytes().len()).expect("carrier length");
-
-            if label == "temp-synced" {
-                let registry = services
-                    .provisioner
-                    .export_rekey_registry()
-                    .expect("profile-5 policy-race registry");
-                let (control, _) = services
-                    .publisher
-                    .seal_chained_scope_rekey_control_from_registry(
-                        &registry,
-                        0,
-                        blob_scope(),
-                        1,
-                        vec![
-                            ScopeRekeyRecipient::member(
-                                services.publisher.identity(),
-                                vec![blob_topic()],
-                            )
-                            .expect("profile-5 policy-race publisher"),
-                            ScopeRekeyRecipient::member(
-                                services.reader.identity(),
-                                vec![blob_topic()],
-                            )
-                            .expect("profile-5 policy-race reader"),
-                        ],
-                        1,
-                        None,
-                    )
-                    .expect("profile-5 policy-race control");
-                let verified_control = services
-                    .reader
-                    .verify_control(&control)
-                    .expect("verify profile-5 policy-race control");
-                let (entered, release) = target.install_profile5_batch_precommit_gate();
-                let raced = std::thread::scope(|scope| {
-                    let worker = scope.spawn(|| {
-                        target.commit_verified_profile5_batch_with_policy(
-                            &policy,
-                            &receipt,
-                            initial,
-                            durable,
-                            &plan,
-                            &[(verified.clone(), encoded_len)],
-                        )
-                    });
-                    entered
-                        .recv_timeout(std::time::Duration::from_secs(10))
-                        .expect("profile-5 policy race precommit boundary");
-                    target
-                        .ingest_verified_control(&verified_control, &control)
-                        .expect("advance durable policy during profile-5 extent commit");
-                    release.send(true).expect("release policy race");
-                    worker.join().expect("policy race worker")
-                });
-                assert!(
-                    matches!(raced, Err(StoreError::ControlPolicyChanged)),
-                    "a control head advanced after file sync must abort the receipt transaction: {raced:?}"
-                );
-                assert_eq!(
-                    target
-                        .resume_profile5_receipt(receipt.source())
-                        .expect("policy-raced receipt"),
-                    Some((receipt.clone(), initial))
-                );
-                assert_eq!(
-                    target
-                        .blob_stats()
-                        .expect("policy-raced batch stats")
-                        .committed_chunks,
-                    0
-                );
-                assert_eq!(
-                    target.profile5_batch_test_counts(),
-                    Profile5BatchTestCounts {
-                        durable_batches: 0,
-                        installed_carriers: 0,
-                        total_write_begins: 3,
-                        total_write_commits: 2,
-                        source_stage_write_begins: 1,
-                        source_stage_write_commits: 1,
-                        receipt_reservation_write_begins: 1,
-                        receipt_reservation_write_commits: 1,
-                        extent_write_begins: 1,
-                        extent_write_commits: 0,
-                        temp_file_syncs: 1,
-                        parent_directory_syncs: 2,
-                        ..Profile5BatchTestCounts::default()
-                    },
-                    "policy rejection observes activation, file syncs, and the failed extent transaction at their actual sites"
-                );
-
-                policy = target
-                    .control_policy_snapshot()
-                    .expect("advanced profile-5 target policy");
-            }
-
-            depot::inject_test_fault(&target_root.path, point);
-            assert!(
-                target
-                    .commit_verified_profile5_batch_with_policy(
-                        &policy,
-                        &receipt,
-                        initial,
-                        durable,
-                        &plan,
-                        &[(verified.clone(), encoded_len)],
-                    )
-                    .is_err(),
-                "{point:?} must fail before the receipt transaction commits"
-            );
-            assert_eq!(
-                target
-                    .resume_profile5_receipt(receipt.source())
-                    .expect("interrupted profile-5 receipt"),
-                Some((receipt.clone(), initial))
-            );
-            assert_eq!(
-                target
-                    .blob_stats()
-                    .expect("interrupted batch stats")
-                    .committed_chunks,
-                0
-            );
-            let interrupted_counts = target.profile5_batch_test_counts();
-            let policy_prefix = u64::from(label == "temp-synced");
-            assert_eq!(interrupted_counts.durable_batches, 0);
-            assert_eq!(interrupted_counts.installed_carriers, 0);
-            assert_eq!(interrupted_counts.total_write_begins, 2 + policy_prefix);
-            assert_eq!(interrupted_counts.total_write_commits, 2);
-            assert_eq!(interrupted_counts.source_stage_write_begins, 1);
-            assert_eq!(interrupted_counts.source_stage_write_commits, 1);
-            assert_eq!(interrupted_counts.receipt_reservation_write_begins, 1);
-            assert_eq!(interrupted_counts.receipt_reservation_write_commits, 1);
-            assert_eq!(interrupted_counts.extent_write_begins, policy_prefix);
-            assert_eq!(interrupted_counts.extent_write_commits, 0);
-            assert_eq!(interrupted_counts.temp_file_syncs, 1 + policy_prefix);
-            assert_eq!(
-                interrupted_counts.parent_directory_syncs,
-                1 + policy_prefix + u64::from(point == depot::DepotFaultPoint::DirectorySynced),
-                "only directory syncs reached before the injected boundary are counted"
-            );
-            drop(target);
-
-            let reopened = Store::open_for_mission(&target_root.database, services.authority)
-                .expect("reclaim profile-5 batch orphan");
-            assert_eq!(
-                reopened
-                    .commit_verified_profile5_batch_with_policy(
-                        &policy,
-                        &receipt,
-                        initial,
-                        durable,
-                        &plan,
-                        &[(verified, encoded_len)],
-                    )
-                    .expect("replay profile-5 batch"),
-                durable
-            );
-            assert_eq!(
-                reopened
-                    .resume_profile5_receipt(receipt.source())
-                    .expect("replayed profile-5 receipt"),
-                Some((receipt, durable))
-            );
-            assert_eq!(
-                reopened
-                    .blob_stats()
-                    .expect("replayed batch stats")
-                    .committed_chunks,
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn profile5_capacity_rejects_before_receipt_or_physical_write() {
-        let source_root = BlobTestRoot::new("profile5-batch-capacity-source");
-        let target_root = BlobTestRoot::new("profile5-batch-capacity-target");
-        let mut services = blob_services(0xe9);
-        let plaintext = vec![0x5a; 64 * 1024];
-        let prepared = prepared_blob(&plaintext);
-        let source = Store::open_for_mission(&source_root.database, services.authority)
-            .expect("profile-5 capacity source");
-        let target = Store::open_with_all_limits_for_mission(
-            &target_root.database,
-            StoreLimits::default(),
-            BlobDepotLimits::new(1, 1, 1).expect("one-byte profile-5 depot"),
-            EventOperationLimits::DEFAULT,
-            BlobLifecycleLimits::default(),
-            services.authority,
-        )
-        .expect("profile-5 capacity target");
-        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
-        let plan = proof
-            .blob
-            .transfer_plan(&proof.manifest_bytes)
-            .expect("profile-5 capacity plan");
-        let policy = target
-            .control_policy_snapshot()
-            .expect("profile-5 capacity policy");
-        assert!(matches!(
-            target.stage_verified_profile5_blob_source_with_policy(
-                &policy,
-                &proof.blob,
-                &proof.sealed,
-                &plan,
-            ),
-            Err(StoreError::Blob(
-                BlobStoreError::DepotByteLimitExceeded { .. }
-            ))
-        ));
-        assert_eq!(
-            target
-                .resume_profile5_receipt(BlobTransferId::new(proof.blob.envelope_id()))
-                .expect("capacity-rejected receipt lookup"),
-            None,
-            "capacity failure must precede receipt authority"
-        );
-        assert_eq!(
-            target
-                .blob_stats()
-                .expect("capacity-rejected stats")
-                .committed_chunks,
-            0
-        );
-        assert_eq!(
-            target.profile5_batch_test_counts(),
-            Profile5BatchTestCounts {
-                total_write_begins: 1,
-                source_stage_write_begins: 1,
-                ..Profile5BatchTestCounts::default()
-            },
-            "capacity must reject inside source staging before commit, receipt, file sync, or final extent transaction"
-        );
-    }
-
-    #[test]
-    fn profile5_empty_pending_receipt_reopens_and_explicit_abort_reclaims_authority() {
-        let root = BlobTestRoot::new("profile5-empty-pending-reopen");
-        let mut services = blob_services(0xe1);
-        let plaintext = Vec::new();
-        let prepared = prepared_blob(&plaintext);
-        let store = Store::open_for_mission(&root.database, services.authority)
-            .expect("empty profile-5 store");
-        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
-        let plan = proof
-            .blob
-            .transfer_plan(&proof.manifest_bytes)
-            .expect("empty plan");
-        assert_eq!(
-            (plan.manifest().total_len(), plan.manifest().chunk_count()),
-            (0, 0)
-        );
-        store
-            .stage_verified_profile5_blob_source_with_policy(
-                &proof.policy,
-                &proof.blob,
-                &proof.sealed,
-                &plan,
-            )
-            .expect("stage empty profile-5 source");
-        let (receipt, progress) = store
-            .reserve_profile5_receipt(&proof.policy, &plan)
-            .expect("reserve empty profile-5 receipt");
-        assert_eq!(progress, BlobStreamResume::default());
-        drop((proof, store));
-
-        Store::inspect_existing(&root.database).expect("read-only empty pending audit");
-        let reopened = Store::open_for_mission(&root.database, services.authority)
-            .expect("writable empty pending audit");
-        assert_eq!(
-            reopened
-                .resume_profile5_receipt(receipt.source())
-                .expect("resume empty receipt"),
-            Some((receipt.clone(), progress))
-        );
-        assert!(
-            reopened
-                .abort_pending_blob_source(receipt.source())
-                .expect("abort empty pending")
-        );
-        assert_eq!(
-            reopened
-                .resume_profile5_receipt(receipt.source())
-                .expect("receipt reclaimed"),
-            None
-        );
-        drop(reopened);
-        Store::inspect_existing(&root.database).expect("read-only audit after empty reclamation");
-        Store::open_for_mission(&root.database, services.authority)
-            .expect("writable audit after empty reclamation");
-    }
-
-    #[test]
-    fn profile5_already_present_receipt_is_terminal_and_retryable() {
-        let root = BlobTestRoot::new("profile5-already-present");
-        let mut services = blob_services(0xd8);
-        let plaintext = vec![0x6b; 64 * 1024];
-        let prepared = prepared_blob(&plaintext);
-        let store = Store::open_for_mission(&root.database, services.authority)
-            .expect("profile-5 duplicate store");
-        let (stored, _, _) = publish_blob(
-            &store,
-            &mut services,
-            &prepared,
-            &plaintext,
-            1,
-            b"profile5-already-present-operation",
-        );
-        let route = services
-            .reader
-            .verify_blob(&stored.sealed)
-            .expect("verify retained source route");
-        let (blob, manifest_bytes) = match services
-            .reader
-            .verify_blob_content(route, &stored.sealed)
-            .expect("verify retained source content")
-        {
-            BlobContentVerification::ContentVerified {
-                blob,
-                manifest_bytes,
-            } => (blob, manifest_bytes),
-            BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
-        };
-        let plan = blob
-            .transfer_plan(&manifest_bytes)
-            .expect("retained transfer plan");
-        let policy = store.control_policy_snapshot().expect("duplicate policy");
-
-        let (receipt, initial) = store
-            .reserve_profile5_receipt(&policy, &plan)
-            .expect("reserve duplicate receipt");
-        assert_eq!(initial, BlobStreamResume::default());
-        let carrier = plan.carrier_id(0).expect("duplicate carrier ID");
-        let carrier_len = plan
-            .carrier_total_len(&carrier.wire_bytes())
-            .expect("duplicate carrier length");
-        let terminal = BlobStreamResume::profile5(
-            1,
-            plan.manifest().chunk_count(),
-            plaintext.len() as u64,
-            carrier_len,
-            carrier_len + 20,
-        );
-        store
-            .checkpoint_profile5_receipt(&receipt, initial, terminal)
-            .expect("checkpoint terminal duplicate receipt");
-        assert_eq!(terminal.next_segment_index(), plan.manifest().chunk_count());
-        assert_eq!(terminal.durable_plaintext_offset(), plaintext.len() as u64);
-        assert_eq!(terminal.durable_wire_offset(), carrier_len + 20);
-        for _ in 0..64 {
-            assert_eq!(
-                store
-                    .reserve_profile5_receipt(&policy, &plan)
-                    .expect("retry terminal duplicate receipt"),
-                (receipt.clone(), terminal),
-                "repeated interrupted ACK retries reuse one bounded receipt"
-            );
-        }
-        let read = store.database.begin_read().expect("receipt count read");
-        assert_eq!(
-            read.open_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("profile-5 receipt table")
-                .len()
-                .expect("profile-5 receipt count"),
-            1,
-            "repeated interrupted ACK retries cannot grow settlement authority"
-        );
-    }
-
-    #[test]
-    fn profile5_receipt_audit_rejects_malformed_rows_without_mutation() {
-        let root = BlobTestRoot::new("profile5-receipt-malformed-audit");
-        let services = blob_services(0xd9);
-        drop(
-            Store::open_for_mission(&root.database, services.authority)
-                .expect("profile-5 audit base"),
-        );
-        {
-            let database = Database::open(&root.database).expect("raw receipt database");
-            let write = database.begin_write().expect("raw receipt write");
-            write
-                .open_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("receipt table")
-                .insert([0x71; 64].as_slice(), [0x72; 17].as_slice())
-                .expect("malformed receipt");
-            write.commit().expect("commit malformed receipt");
-        }
-        let before = blob_database_digest(&root.database);
-        assert_blob_schema_invariant(
-            &Store::inspect_existing(&root.database)
-                .expect_err("read-only audit must reject malformed receipt"),
-        );
-        assert_blob_schema_invariant(
-            &Store::open_for_mission(&root.database, services.authority)
-                .err()
-                .expect("writable audit must reject malformed receipt"),
-        );
-        assert_eq!(blob_database_digest(&root.database), before);
-    }
-
-    #[test]
-    fn profile5_receipt_audit_rejects_every_noncanonical_progress_field() {
-        for offset in [169usize, 177, 185, 193, 201] {
-            let root = BlobTestRoot::new(&format!("profile5-progress-corruption-{offset}"));
-            let mut services = blob_services(0xe2);
-            let plaintext = vec![0x3c; 2 * aster_mesh::MAX_BLOB_CHUNK_SIZE as usize];
-            let prepared = prepared_blob(&plaintext);
-            let store = Store::open_for_mission(&root.database, services.authority)
-                .expect("progress corruption store");
-            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
-            let plan = proof
-                .blob
-                .transfer_plan(&proof.manifest_bytes)
-                .expect("progress plan");
-            store
-                .stage_verified_profile5_blob_source_with_policy(
-                    &proof.policy,
-                    &proof.blob,
-                    &proof.sealed,
-                    &plan,
-                )
-                .expect("stage progress source");
-            store
-                .reserve_profile5_receipt(&proof.policy, &plan)
-                .expect("reserve progress receipt");
-            drop((proof, store));
-
-            let database = Database::open(&root.database).expect("raw progress database");
-            let write = database.begin_write().expect("raw progress write");
-            let mut table = write
-                .open_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("receipt table");
-            let (key, mut encoded) = {
-                let (key, value) = table
-                    .iter()
-                    .expect("receipt rows")
-                    .next()
-                    .expect("receipt row")
-                    .expect("valid row");
-                (key.value().to_vec(), value.value().to_vec())
-            };
-            encoded[offset + 7] = 1;
-            table
-                .insert(key.as_slice(), encoded.as_slice())
-                .expect("corrupt progress");
-            drop(table);
-            write.commit().expect("commit progress corruption");
-            drop(database);
-
-            let before = blob_database_digest(&root.database);
-            assert_blob_schema_invariant(
-                &Store::inspect_existing(&root.database)
-                    .expect_err("read-only rejects progress corruption"),
-            );
-            assert_blob_schema_invariant(
-                &Store::open_for_mission(&root.database, services.authority)
-                    .err()
-                    .expect("writable rejects progress corruption"),
-            );
-            assert_eq!(blob_database_digest(&root.database), before);
-        }
-    }
-
-    #[test]
-    fn profile5_live_receipt_audit_rejects_every_noncanonical_terminal_field() {
-        for offset in [169usize, 177, 185, 193, 201] {
-            let root = BlobTestRoot::new(&format!("profile5-live-progress-corruption-{offset}"));
-            let mut services = blob_services(0xe3);
-            let plaintext = vec![0x4d; 2 * aster_mesh::MAX_BLOB_CHUNK_SIZE as usize];
-            let prepared = prepared_blob(&plaintext);
-            let store = Store::open_for_mission(&root.database, services.authority)
-                .expect("live progress corruption store");
-            let (stored, _, _) = publish_blob(
-                &store,
-                &mut services,
-                &prepared,
-                &plaintext,
-                1,
-                format!("profile5-live-progress-{offset}").as_bytes(),
-            );
-            let route = services
-                .reader
-                .verify_blob(&stored.sealed)
-                .expect("live route");
-            let BlobContentVerification::ContentVerified {
-                blob,
-                manifest_bytes,
-            } = services
-                .reader
-                .verify_blob_content(route, &stored.sealed)
-                .expect("live content")
-            else {
-                panic!("live source lost content")
-            };
-            let plan = blob.transfer_plan(&manifest_bytes).expect("live plan");
-            let policy = store.control_policy_snapshot().expect("live policy");
-            let (receipt, initial) = store
-                .reserve_profile5_receipt(&policy, &plan)
-                .expect("reserve live receipt");
-            let shape = aster_mesh::profile5_canonical_wire_shape(&plan).expect("live shape");
-            let terminal = shape.terminal();
-            store
-                .checkpoint_profile5_receipt(
-                    &receipt,
-                    initial,
-                    BlobStreamResume::profile5(
-                        shape.checkpoints().len() as u64 - 1,
-                        terminal.next_chunk_index,
-                        terminal.plaintext_offset,
-                        terminal.carrier_offset,
-                        terminal.wire_offset,
-                    ),
-                )
-                .expect("terminal live receipt");
-            drop(store);
-
-            let database = Database::open(&root.database).expect("raw live database");
-            let write = database.begin_write().expect("raw live write");
-            let mut table = write
-                .open_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("live receipts");
-            let (key, mut encoded) = {
-                let (key, value) = table.iter().unwrap().next().unwrap().unwrap();
-                (key.value().to_vec(), value.value().to_vec())
-            };
-            if offset == 169 {
-                // Keep the corrupt generation nonzero so the row decoder
-                // accepts it and the exact shared-shape audit must reject it.
-                encoded[offset..offset + 8].copy_from_slice(&2u64.to_be_bytes());
-                let decoded = super::stream::test_decode_profile5_receipt_progress(&encoded)
-                    .expect("nonzero wrong generation remains decoder-valid");
-                assert_eq!(decoded.generation(), 2);
-                assert_eq!(
-                    (
-                        decoded.next_segment_index(),
-                        decoded.durable_plaintext_offset(),
-                        decoded.durable_pack_len(),
-                        decoded.durable_wire_offset(),
-                    ),
-                    (
-                        terminal.next_chunk_index,
-                        terminal.plaintext_offset,
-                        terminal.carrier_offset,
-                        terminal.wire_offset,
-                    ),
-                    "generation corruption leaves all terminal offsets exact"
-                );
-            } else {
-                encoded[offset + 7] ^= 1;
-            }
-            table.insert(key.as_slice(), encoded.as_slice()).unwrap();
-            drop(table);
-            write.commit().unwrap();
-            drop(database);
-            let before = blob_database_digest(&root.database);
-            assert_blob_schema_invariant(
-                &Store::inspect_existing(&root.database)
-                    .expect_err("read-only rejects live corruption"),
-            );
-            assert_blob_schema_invariant(
-                &Store::open_for_mission(&root.database, services.authority)
-                    .err()
-                    .expect("writable rejects live corruption"),
-            );
-            assert_eq!(blob_database_digest(&root.database), before);
-        }
-    }
-
-    #[test]
-    fn profile5_receipt_audit_rejects_foreign_and_orphan_rows_without_mutation() {
-        for corruption in ["foreign", "orphan"] {
-            let root = BlobTestRoot::new(&format!("profile5-receipt-{corruption}-audit"));
-            let mut services = blob_services(0xdb);
-            let plaintext = b"profile-5 receipt audit linkage".to_vec();
-            let prepared = prepared_blob(&plaintext);
-            let store = Store::open_for_mission(&root.database, services.authority)
-                .expect("profile-5 linkage audit base");
-            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
-            let plan = proof
-                .blob
-                .transfer_plan(&proof.manifest_bytes)
-                .expect("profile-5 linkage plan");
-            store
-                .stage_verified_profile5_blob_source_with_policy(
-                    &proof.policy,
-                    &proof.blob,
-                    &proof.sealed,
-                    &plan,
-                )
-                .expect("stage profile-5 linkage source");
-            let (receipt, _) = store
-                .reserve_profile5_receipt(&proof.policy, &plan)
-                .expect("reserve profile-5 linkage receipt");
-            drop((proof, store));
-
-            let database = Database::open(&root.database).expect("raw linkage database");
-            let write = database.begin_write().expect("raw linkage write");
-            if corruption == "foreign" {
-                let mut receipts = write
-                    .open_table(BLOB_PROFILE5_RECEIPTS)
-                    .expect("profile-5 receipt table");
-                let mut key = [0u8; 64];
-                key[..32].copy_from_slice(&services.authority);
-                key[32..].copy_from_slice(receipt.source().as_bytes());
-                let encoded = receipts
-                    .remove(key.as_slice())
-                    .expect("remove receipt")
-                    .expect("receipt row")
-                    .value()
-                    .to_vec();
-                key[0] ^= 0xff;
-                receipts
-                    .insert(key.as_slice(), encoded.as_slice())
-                    .expect("insert foreign receipt key");
-            } else {
-                write
-                    .open_table(BLOB_PENDING_SOURCES)
-                    .expect("pending source table")
-                    .remove(receipt.source().as_bytes().as_slice())
-                    .expect("remove receipt authority")
-                    .expect("pending receipt authority");
-            }
-            write.commit().expect("commit receipt linkage corruption");
-            drop(database);
-
-            let before = blob_database_digest(&root.database);
-            assert_blob_schema_invariant(
-                &Store::inspect_existing(&root.database)
-                    .expect_err("read-only audit rejects receipt linkage corruption"),
-            );
-            assert_blob_schema_invariant(
-                &Store::open_for_mission(&root.database, services.authority)
-                    .err()
-                    .expect("writable audit rejects receipt linkage corruption"),
-            );
-            assert_eq!(
-                blob_database_digest(&root.database),
-                before,
-                "failed receipt audit must not repair or otherwise mutate state"
-            );
-        }
-    }
-
-    #[test]
-    fn profile5_network_schema_accepts_only_exact_predecessor_or_current_group() {
-        let services = blob_services(0xda);
-        let table_names = |path: &Path| {
-            redb::Builder::new()
-                .open_read_only(path)
-                .expect("read network database")
-                .begin_read()
-                .expect("read network transaction")
-                .list_tables()
-                .expect("list network tables")
-                .map(|table| table.name().to_owned())
-                .collect::<BTreeSet<_>>()
-        };
-        for missing in 0..5 {
-            let root = BlobTestRoot::new(&format!("profile5-network-missing-{missing}"));
-            drop(
-                Store::open_for_mission(&root.database, services.authority)
-                    .expect("network schema base"),
-            );
-            {
-                let database = Database::open(&root.database).expect("raw network database");
-                let write = database.begin_write().expect("raw network write");
-                match missing {
-                    0 => assert!(write.delete_table(BLOB_PENDING_SOURCES).unwrap()),
-                    1 => assert!(write.delete_table(BLOB_CARRIER_PREFIXES).unwrap()),
-                    2 => assert!(write.delete_table(BLOB_NETWORK_METADATA).unwrap()),
-                    3 => assert!(write.delete_table(BLOB_CARRIER_FETCH_CURSORS).unwrap()),
-                    4 => assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap()),
-                    _ => unreachable!(),
-                }
-                write.commit().expect("commit missing network table");
-            }
-            let before = table_names(&root.database);
-            if missing == 4 {
-                Store::inspect_existing(&root.database)
-                    .expect("exact four-table predecessor is readable");
-                drop(
-                    Store::open_for_mission(&root.database, services.authority)
-                        .expect("exact predecessor migrates"),
-                );
-                let database = redb::Builder::new()
-                    .open_read_only(&root.database)
-                    .expect("read migrated schema");
-                assert!(
-                    database
-                        .begin_read()
-                        .unwrap()
-                        .list_tables()
-                        .unwrap()
-                        .any(|table| table.name() == BLOB_PROFILE5_RECEIPTS.name())
-                );
-            } else {
-                assert!(Store::inspect_existing(&root.database).is_err());
-                assert!(Store::open_for_mission(&root.database, services.authority).is_err());
-                assert_eq!(table_names(&root.database), before);
-            }
-        }
     }
 
     #[test]
@@ -27513,10 +26313,10 @@ mod tests {
     }
 
     fn assert_blob_schema_invariant(error: &StoreError) {
-        assert!(matches!(
-            error,
-            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
-        ));
+        assert!(
+            matches!(error, StoreError::Blob(BlobStoreError::SchemaInvariant(_))),
+            "expected Blob schema invariant, got {error:?}"
+        );
     }
 
     fn directory_entry_count(path: &Path) -> usize {
@@ -32222,6 +31022,9 @@ mod tests {
                 .expect("markers");
             write.delete_table(BLOB_OPERATIONS).expect("operations");
             write.delete_table(BLOB_UPLOADS).expect("uploads");
+            write
+                .delete_table(pack_lifecycle::BLOB_PROFILE5_PACKS)
+                .expect("profile5 packs");
             write.delete_table(BLOB_IMPORTS).expect("imports");
             write.delete_table(BLOB_CHUNKS).expect("chunks");
             write
@@ -32239,9 +31042,6 @@ mod tests {
             write
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("carrier cursors");
-            write
-                .delete_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("profile-5 receipts");
             for table in [
                 BLOB_STREAM_RESERVATIONS,
                 BLOB_STREAM_OPERATIONS,
@@ -32542,7 +31342,90 @@ mod tests {
     }
 
     #[test]
-    fn pre_pr110_blob_database_opens_without_content_migration() {
+    fn legacy_profile5_receipt_schema_fails_closed_with_reset_guidance() {
+        for populated in [false, true] {
+            let root = BlobTestRoot::new(if populated {
+                "legacy-profile5-receipt-populated"
+            } else {
+                "legacy-profile5-receipt-empty"
+            });
+            let services = blob_services(0x70 + u8::from(populated));
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("current schema fixture"),
+            );
+            {
+                let database = Database::open(&root.database).expect("legacy receipt fixture");
+                let write = database.begin_write().expect("legacy receipt schema write");
+                let definition = redb::TableDefinition::<&[u8], &[u8]>::new(
+                    OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME,
+                );
+                let mut receipts = write.open_table(definition).expect("legacy receipt table");
+                if populated {
+                    receipts
+                        .insert([0x41; 64].as_slice(), [0x52; 209].as_slice())
+                        .expect("legacy receipt row");
+                }
+                drop(receipts);
+                write.commit().expect("commit legacy receipt schema");
+            }
+            let before = blob_database_digest(&root.database);
+            for error in [
+                Store::inspect_existing(&root.database)
+                    .expect_err("read-only open rejects legacy receipt schema"),
+                Store::open_for_mission(&root.database, services.authority)
+                    .err()
+                    .expect("writable open rejects legacy receipt schema"),
+            ] {
+                assert!(matches!(
+                    error,
+                    StoreError::Blob(BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema)
+                ));
+                let guidance = error.to_string();
+                assert!(guidance.contains("reset"));
+                assert!(guidance.contains("reimport"));
+            }
+            assert_eq!(blob_database_digest(&root.database), before);
+        }
+
+        let root = BlobTestRoot::new("legacy-profile5-receipt-wrong-kind");
+        let services = blob_services(0x72);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("current schema fixture"),
+        );
+        {
+            let database = Database::open(&root.database).expect("legacy receipt fixture");
+            let write = database.begin_write().expect("legacy receipt schema write");
+            let definition = redb::MultimapTableDefinition::<&[u8], &[u8]>::new(
+                OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME,
+            );
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind legacy receipt table")
+                .insert(b"receipt".as_slice(), b"row".as_slice())
+                .expect("wrong-kind legacy receipt row");
+            write.commit().expect("commit legacy receipt schema");
+        }
+        for error in [
+            Store::inspect_existing(&root.database)
+                .expect_err("read-only open rejects wrong-kind legacy receipt schema"),
+            Store::open_for_mission(&root.database, services.authority)
+                .err()
+                .expect("writable open rejects wrong-kind legacy receipt schema"),
+        ] {
+            assert!(matches!(
+                error,
+                StoreError::Blob(BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema)
+            ));
+            let guidance = error.to_string();
+            assert!(guidance.contains("reset"));
+            assert!(guidance.contains("reimport"));
+        }
+    }
+
+    #[test]
+    fn pre_pr110_blob_database_requires_writable_extension_without_content_migration() {
         let root = BlobTestRoot::new("pre-pr110-canonical");
         let mut services = blob_services(0x71);
         let plaintext = b"pre-PR110 canonical Blob content remains byte-identical".to_vec();
@@ -32562,7 +31445,11 @@ mod tests {
             let database = Database::open(&root.database).expect("raw predecessor database");
             let write = database.begin_write().expect("predecessor schema write");
             assert!(write.delete_table(BLOB_UPLOADS).unwrap());
-            assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
+            assert!(
+                write
+                    .delete_table(pack_lifecycle::BLOB_PROFILE5_PACKS)
+                    .unwrap()
+            );
             for table in [
                 BLOB_STREAM_RESERVATIONS,
                 BLOB_STREAM_OPERATIONS,
@@ -32576,7 +31463,11 @@ mod tests {
             write.commit().expect("commit pre-PR110 schema");
         }
         let canonical_before = blob_database_digest(&root.database);
-        Store::inspect_existing(&root.database).expect("read-only predecessor audit");
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only predecessor requires writable extension"),
+        );
+        assert_eq!(blob_database_digest(&root.database), canonical_before);
         drop(
             Store::open_for_mission(&root.database, services.authority)
                 .expect("writable predecessor migration"),
@@ -32630,7 +31521,7 @@ mod tests {
                 .all(|name| !after.contains(*name))
         );
         assert!(after.contains(BLOB_UPLOADS.name()));
-        assert!(after.contains(BLOB_PROFILE5_RECEIPTS.name()));
+        assert!(!after.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME));
     }
 
     #[test]
@@ -32861,7 +31752,11 @@ mod tests {
                 let database = Database::open(&root.database).expect("raw migration database");
                 let write = database.begin_write().expect("predecessor write");
                 assert!(write.delete_table(BLOB_UPLOADS).unwrap());
-                assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
+                assert!(
+                    write
+                        .delete_table(pack_lifecycle::BLOB_PROFILE5_PACKS)
+                        .unwrap()
+                );
                 let _ = write.open_table(BLOB_STREAM_RESERVATIONS).unwrap();
                 let _ = write.open_table(BLOB_STREAM_OPERATIONS).unwrap();
                 let _ = write.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
@@ -32886,7 +31781,8 @@ mod tests {
             );
             let migrated = blob_table_name_set(&root.database);
             assert!(migrated.contains(BLOB_UPLOADS.name()));
-            assert!(migrated.contains(BLOB_PROFILE5_RECEIPTS.name()));
+            assert!(migrated.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name()));
+            assert!(!migrated.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME));
             assert!(
                 stream_blob_table_names()
                     .iter()
@@ -32962,7 +31858,6 @@ mod tests {
                     assert!(write.delete_table(BLOB_CARRIER_PREFIXES).unwrap());
                     assert!(write.delete_table(BLOB_NETWORK_METADATA).unwrap());
                     assert!(write.delete_table(BLOB_CARRIER_FETCH_CURSORS).unwrap());
-                    assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
                 } else {
                     assert!(write.delete_table(BLOB_UPLOADS).unwrap());
                 }
@@ -33002,11 +31897,11 @@ mod tests {
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("delete predecessor cursor table");
             write
-                .delete_table(BLOB_PROFILE5_RECEIPTS)
-                .expect("delete predecessor receipt table");
-            write
                 .delete_table(BLOB_UPLOADS)
                 .expect("delete predecessor upload table");
+            write
+                .delete_table(pack_lifecycle::BLOB_PROFILE5_PACKS)
+                .expect("delete predecessor Profile-5 pack table");
             write
                 .delete_table(pressure::BLOB_PRESSURE_METADATA)
                 .expect("delete predecessor pressure metadata");
@@ -33056,7 +31951,9 @@ mod tests {
         assert!(
             network_blob_table_names()
                 .iter()
-                .all(|table| !inspected_names.contains(*table)),
+                .all(|table| !inspected_names.contains(*table))
+                && !inspected_names.contains(BLOB_UPLOADS.name())
+                && !inspected_names.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name()),
             "read-only inspection must not migrate the additive network group"
         );
         drop(
@@ -33067,8 +31964,10 @@ mod tests {
         assert!(
             network_blob_table_names()
                 .iter()
-                .all(|table| migrated_names.contains(*table)),
-            "writable migration must install all five additive network tables"
+                .all(|table| migrated_names.contains(*table))
+                && migrated_names.contains(BLOB_UPLOADS.name())
+                && migrated_names.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name()),
+            "writable migration must install the complete additive network and Profile-5 group"
         );
 
         let populated = BlobTestRoot::new("predecessor-populated-owner-token");
@@ -38146,49 +37045,6 @@ mod tests {
         let policy = store
             .control_policy_snapshot()
             .expect("retirement delivery policy");
-        let route = services
-            .reader
-            .verify_blob(&stored.sealed)
-            .expect("verify retirement receipt route");
-        let BlobContentVerification::ContentVerified {
-            blob: receipt_blob,
-            manifest_bytes: receipt_manifest,
-        } = services
-            .reader
-            .verify_blob_content(route, &stored.sealed)
-            .expect("verify retirement receipt content")
-        else {
-            panic!("retirement receipt reader unexpectedly route-only")
-        };
-        let receipt_plan = receipt_blob
-            .transfer_plan(&receipt_manifest)
-            .expect("retirement receipt plan");
-        let (profile5_receipt, initial_receipt) = store
-            .reserve_profile5_receipt(&policy, &receipt_plan)
-            .expect("reserve interrupted settlement receipt");
-        let mut carrier_len = 0u64;
-        for index in 0..receipt_plan.manifest().chunk_count() {
-            let carrier = receipt_plan.carrier_id(index).expect("receipt carrier ID");
-            carrier_len = carrier_len
-                .checked_add(
-                    receipt_plan
-                        .carrier_total_len(&carrier.wire_bytes())
-                        .expect("receipt carrier length"),
-                )
-                .expect("receipt carrier total");
-        }
-        let terminal_receipt = BlobStreamResume::profile5(
-            1,
-            receipt_plan.manifest().chunk_count(),
-            receipt_plan.manifest().total_len(),
-            carrier_len,
-            carrier_len
-                .checked_add(20 * receipt_plan.manifest().chunk_count())
-                .expect("receipt wire length"),
-        );
-        store
-            .checkpoint_profile5_receipt(&profile5_receipt, initial_receipt, terminal_receipt)
-            .expect("checkpoint interrupted terminal settlement");
         let spec = BlobSubscriptionSpec {
             topic: blob_topic(),
             scope: blob_scope(),
@@ -38343,20 +37199,13 @@ mod tests {
             )
             .expect("expire retired publication");
         assert_eq!(
-            expiry.rows_examined, 14,
-            "publication expiry charges bounded subscription examination, its causal-fence insertion, its terminal settlement receipt, and every removed row"
+            expiry.rows_examined, 13,
+            "publication expiry charges bounded subscription examination, its causal-fence insertion, and every removed row"
         );
 
         assert_eq!(
             store.get_blob(stored.transfer_id).expect("expired lookup"),
             None
-        );
-        assert_eq!(
-            store
-                .resume_profile5_receipt(stored.transfer_id)
-                .expect("expired settlement receipt lookup"),
-            None,
-            "canonical reclamation removes terminal settlement authority"
         );
         // Expiry removes the bounded publication and delivery state, never its
         // permanent replay/causal authority.  These direct durable checks make
@@ -50551,9 +49400,6 @@ mod tests {
                 .expect("stage finite pending root"),
             BlobSourceStageOutcome::Inserted
         );
-        target
-            .reserve_profile5_receipt(&policy, &plan)
-            .expect("reserve finite pending receipt");
         let deadline = CustodySample {
             clock_id: checkpoint.clock_id,
             tick_ms: 150,
@@ -50597,7 +49443,6 @@ mod tests {
         assert_eq!(recovery.recovered_units(), 1);
         assert!(recovery.deficit_met());
         assert!(target.pending_blob_source(transfer).unwrap().is_none());
-        assert!(target.resume_profile5_receipt(transfer).unwrap().is_none());
         {
             let read = target.database.begin_read().unwrap();
             assert!(
@@ -50612,12 +49457,6 @@ mod tests {
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen finite pending retirement");
         assert!(reopened.pending_blob_source(transfer).unwrap().is_none());
-        assert!(
-            reopened
-                .resume_profile5_receipt(transfer)
-                .unwrap()
-                .is_none()
-        );
         {
             let read = reopened.database.begin_read().unwrap();
             assert!(
@@ -50793,9 +49632,6 @@ mod tests {
         target
             .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
             .expect("stage pressure pending source");
-        target
-            .reserve_profile5_receipt(&policy, &plan)
-            .expect("reserve pressure pending receipt");
         let carrier = {
             let mut depot = source.blob_depot().expect("pressure source depot");
             CoreBlobStore::begin_blob_with_lineage(
@@ -50858,42 +49694,6 @@ mod tests {
         };
         let (exact_rows, exact_bytes) = {
             let write = target.database.begin_write().unwrap();
-            let (receipt_key, receipt_value_len) =
-                stream::profile5_receipt_maintenance_row_write(&write, transfer)
-                    .unwrap()
-                    .expect("pressure receipt row");
-            assert_eq!(receipt_key.len(), 64);
-            assert_eq!(receipt_value_len, 209);
-            let receipt_identity =
-                MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", receipt_key);
-            let exact_receipt_bytes = 64 + 209;
-            let mut exact_receipt = MaintenanceCharge::new(
-                lifecycle::BlobMaintenanceBudget::new(1, 1, exact_receipt_bytes).unwrap(),
-                0,
-                0,
-            );
-            assert!(
-                exact_receipt
-                    .charge_row(receipt_identity.clone(), receipt_value_len)
-                    .unwrap()
-            );
-            assert!(
-                exact_receipt
-                    .charge_row(receipt_identity.clone(), receipt_value_len)
-                    .unwrap()
-            );
-            assert_eq!((exact_receipt.rows, exact_receipt.bytes), (1, 273));
-            let mut one_byte_short = MaintenanceCharge::new(
-                lifecycle::BlobMaintenanceBudget::new(1, 1, exact_receipt_bytes - 1).unwrap(),
-                0,
-                0,
-            );
-            assert!(
-                !one_byte_short
-                    .charge_row(receipt_identity, receipt_value_len)
-                    .unwrap()
-            );
-            assert_eq!((one_byte_short.rows, one_byte_short.bytes), (0, 0));
             let mut charge = MaintenanceCharge::new(
                 lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
                 0,
@@ -50916,8 +49716,8 @@ mod tests {
             (charge.rows, charge.bytes)
         };
         assert_eq!(
-            exact_rows, 6,
-            "pending row, receipt, retained prefix, and three staging metadata rows"
+            exact_rows, 5,
+            "pending row, retained prefix, and three staging metadata rows"
         );
         let before_short = blob_complete_logical_digest(&target);
         for budget in [
@@ -50963,7 +49763,6 @@ mod tests {
         assert_eq!(recovered.recovered_units(), 2);
         assert!(recovered.deficit_met());
         assert!(target.pending_blob_source(transfer).unwrap().is_none());
-        assert!(target.resume_profile5_receipt(transfer).unwrap().is_none());
         let after = target.blob_stats().expect("after staging pressure stats");
         assert_eq!(after.pending_sources, 0);
         assert_eq!(after.carrier_prefixes, 0);

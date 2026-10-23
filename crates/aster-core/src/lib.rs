@@ -148,24 +148,12 @@ pub use blob::ReferenceBlobReader;
 pub use blob::{
     BlobCarrierId, BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata,
     BlobPhysicalLineage, BlobRangeReadStats, BlobReadStats, BlobReader, BlobRouteCommitment,
-    BlobStore, BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject,
-    CanonicalBlobChunkSealer, FinishedBlob, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS,
-    MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob, ReferenceBlobService,
-    SELECTED_BLOB_CHUNK_SIZE, SealedCanonicalBlobChunk, VerifiedBlobContentCompletion,
+    BlobStore, BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject, FinishedBlob,
+    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
+    ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
 };
-/// Fuzz-harness bridge to the production canonical carrier inspector.
-#[doc(hidden)]
-#[cfg(feature = "fuzzing")]
-#[doc(hidden)]
-pub fn fuzz_verify_profile5_carrier(
-    bytes: &[u8],
-    expected_index: u64,
-    expected_ciphertext_lengths: &[u32],
-) -> bool {
-    blob::fuzz_verify_profile5_carrier(bytes, expected_index, expected_ciphertext_lengths).is_ok()
-}
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_custody::{
     AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodySendContextV1,
@@ -182,15 +170,14 @@ pub use blob_custody_v2::{
 pub use blob_stream::{
     BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
     BlobStreamCheckpoint, BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen,
-    BlobStreamPlainPartition, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
+    BlobStreamPlainPartition, BlobStreamPlaintextFrontier, BlobStreamPublication,
+    BlobStreamPublicationSource, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
     BlobStreamSegmentSealer, BlobStreamSubtree, BlobUploadDescriptor, BlobUploadPlainPartition,
     BlobUploadSegmentOpener, BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
     EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES,
-    PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
-    PROFILE5_CANONICAL_EXTENT_HEADER_BYTES, PROFILE5_MAX_CANONICAL_WIRE_BYTES,
-    PROFILE5_MAX_CARRIERS_PER_EXTENT, Profile5CanonicalCheckpoint, Profile5CanonicalWireShape,
-    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, local_blob_publication_stream_id,
-    profile5_canonical_wire_shape, profile5_canonical_wire_shape_from_lengths,
+    MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen, VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource,
+    local_blob_publication_stream_id,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

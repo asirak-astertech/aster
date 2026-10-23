@@ -490,9 +490,11 @@ fn blob_inspection_is_valid(
         && response.total_units == 0
         && response.durable_units == 0
         && response.blob_id.is_none();
-    let totals_present = response.plaintext_total_bytes != 0
-        && response.transfer_total_bytes != 0
-        && response.total_units != 0;
+    let totals_consistent = if response.plaintext_total_bytes == 0 {
+        response.transfer_total_bytes == 0 && response.total_units == 0
+    } else {
+        response.transfer_total_bytes != 0 && response.total_units != 0
+    };
     let complete = response.durable_plaintext_bytes == response.plaintext_total_bytes
         && response.durable_transfer_bytes == response.transfer_total_bytes
         && response.durable_units == response.total_units;
@@ -500,14 +502,15 @@ fn blob_inspection_is_valid(
         api::BlobPublicationPhase::Unspecified => false,
         api::BlobPublicationPhase::Missing | api::BlobPublicationPhase::ExpiredOrRetired => empty,
         api::BlobPublicationPhase::AwaitingData => {
-            totals_present
+            totals_consistent
                 && response.durable_plaintext_bytes == 0
                 && response.durable_transfer_bytes == 0
                 && response.durable_units == 0
                 && response.blob_id.is_none()
         }
         api::BlobPublicationPhase::Receiving => {
-            totals_present
+            totals_consistent
+                && response.plaintext_total_bytes != 0
                 && !complete
                 && (response.durable_plaintext_bytes != 0
                     || response.durable_transfer_bytes != 0
@@ -515,10 +518,10 @@ fn blob_inspection_is_valid(
                 && response.blob_id.is_none()
         }
         api::BlobPublicationPhase::ReadyToFinalize => {
-            totals_present && complete && response.blob_id.is_none()
+            totals_consistent && complete && response.blob_id.is_none()
         }
         api::BlobPublicationPhase::Available => {
-            totals_present && complete && response.blob_id.is_some()
+            totals_consistent && complete && response.blob_id.is_some()
         }
     }
 }
@@ -618,6 +621,8 @@ async fn publish_blob_with_progress_and_chunk_bytes<P: ProgressSink>(
         };
         if accepted.accepted_offset != accepted.durable_offset
             || accepted.canonical_frame_bytes != chunk_bytes as u32
+            || accepted.publication_id.len() != 32
+            || !accepted.publication_id.iter().any(|byte| *byte != 0)
             || accepted.durable_offset > total_len
             || (accepted.durable_offset != total_len
                 && !accepted.durable_offset.is_multiple_of(chunk_bytes as u64))
@@ -626,6 +631,7 @@ async fn publish_blob_with_progress_and_chunk_bytes<P: ProgressSink>(
                 "agent returned an invalid Blob resume offset",
             ));
         }
+        let publication_id = accepted.publication_id.clone();
         let resume_offset = accepted.durable_offset;
         progress_state.sent.store(resume_offset, Ordering::Release);
         progress_state
@@ -717,7 +723,9 @@ async fn publish_blob_with_progress_and_chunk_bytes<P: ProgressSink>(
             receipt.ok_or_else(|| MutationError::unknown("agent omitted Blob completion"))
         };
         let ((), response) = tokio::try_join!(sender, receiver)?;
-        if !blob_publish::receipt_matches(&requested, &response) {
+        if response.publication_id != publication_id
+            || !blob_publish::receipt_matches(&requested, &response)
+        {
             return Err(MutationError::unknown("invalid publication receipt"));
         }
         progress_state.sent.store(total_len, Ordering::Release);
@@ -992,6 +1000,20 @@ mod tests {
         ] {
             assert!(!blob_inspection_is_valid(&publication_id, &invalid));
         }
+    }
+
+    #[test]
+    fn blob_status_accepts_available_empty_publication() {
+        let publication_id = vec![7; 32];
+        assert!(blob_inspection_is_valid(
+            &publication_id,
+            &api::InspectBlobPublicationResponse {
+                publication_id: publication_id.clone(),
+                phase: api::BlobPublicationPhase::Available.into(),
+                blob_id: Some(vec![9; 32]),
+                ..Default::default()
+            }
+        ));
     }
     use std::{
         future::poll_fn,
@@ -1338,6 +1360,7 @@ mod tests {
                                                         Box::new(api::PublishBlobAccepted {
                                                             canonical_frame_bytes: TEST_FRAME_BYTES
                                                                 as u32,
+                                                            publication_id: vec![3; 32],
                                                             ..Default::default()
                                                         }),
                                                     ),
@@ -1610,6 +1633,7 @@ mod tests {
                                     frame: Some(api::publish_blob_response::Frame::Accepted(
                                         Box::new(api::PublishBlobAccepted {
                                             canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                            publication_id: vec![3; 32],
                                             ..Default::default()
                                         }),
                                     )),
@@ -1666,6 +1690,7 @@ mod tests {
                             frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
                                 api::PublishBlobAccepted {
                                     canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                    publication_id: vec![3; 32],
                                     ..Default::default()
                                 },
                             ))),

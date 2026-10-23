@@ -55,18 +55,19 @@ PROTOCOL_DEFAULT_OFFER_PATTERNS = (
 PROFILE4_LIMITS = (67_108_864, 1_024, 1_048_576)
 PROFILE5_LIMIT_NAMES = (
     "MAX_SELECTED_BLOB_STREAM_BYTES",
-    "MAX_BLOB_CHUNKS",
     "MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
-    "MAX_BLOB_CHUNK_SIZE",
-    "MAX_BLOB_TRANSFER_OBJECT_BYTES",
-    "PROFILE5_CANONICAL_EXTENT_BYTES",
-    "PROFILE5_MAX_CARRIERS_PER_EXTENT",
-    "PROFILE5_MAX_CANONICAL_WIRE_BYTES",
+    "BLOB_STREAM_SEGMENT_BYTES",
+    "BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES",
+    "PROFILE5_PACK_RECORD_PREFIX_BYTES",
+    "PROFILE5_PACK_SEGMENT_RECORD_BYTES",
+    "PROFILE5_PACK_TRANSPORT_FRAME_BYTES",
+    "PROFILE5_MAX_PACK_SEGMENTS",
+    "PROFILE5_MAX_PACK_WIRE_BYTES",
     "MAX_STREAM_CHECKPOINT_BATCH_BYTES",
     "DEFAULT_MAX_EXCHANGE_BYTES",
 )
 PROFILE5_PIPELINE = (
-    "PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK"
+    "PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK"
 )
 PROFILE5_EMPTY_PIPELINE = (
     "OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, "
@@ -76,17 +77,17 @@ PROFILE5_RECORDS = {
     "OPEN": (0xD6, ["class", "direction", "semantic_version", "profile_id", "session_transcript", "exchange_id", "transfer_id", "source_transfer_id", "publication_id", "variant_id", "total_len", "attempt_nonce", "checkpoint_generation", "custody_present", "custody_digest", "source_len", "source_digest"]),
     "SOURCE": (0xDD, ["attempt", "source_offset", "source_total_len", "source_chunk_len", "source_chunk"]),
     "ACCEPT": (0xD7, ["attempt", "durable_offset", "checkpoint_generation", "absolute_receive_limit", "max_extent_bytes", "checkpoint_batch_bytes"]),
-    "DATA": (0xD8, ["attempt", "offset", "extent_len", "abx1_extent"]),
+    "DATA": (0xD8, ["attempt", "offset", "extent_len", "astrbs02_record"]),
     "CHECKPOINT": (0xD9, ["attempt", "durable_offset", "checkpoint_generation", "absolute_receive_limit"]),
     "FINISH": (0xDA, ["attempt", "final_offset", "commitment_len", "semantic_commitment"]),
     "RESULT": (0xDB, ["attempt", "final_offset", "result_code", "result_digest"]),
     "ACK": (0xDC, ["attempt", "result_digest"]),
 }
 PROFILE5_FIELDS = {
-    "OPEN": [["class", "u8-enum:1"], ["direction", "u8-enum:1,2"], ["semantic_version", "u16=9"], ["profile_id", "u16=5"], ["session_transcript", "bytes32"], ["exchange_id", "u64"], ["transfer_id", "bytes32"], ["source_transfer_id", "bytes32"], ["publication_id", "bytes32"], ["variant_id", "bytes32"], ["total_len", "u64-canonical-abx1-wire<=8679596592"], ["attempt_nonce", "bytes32-nonzero"], ["checkpoint_generation", "u64"], ["custody_present", "u8-enum:0,1"], ["custody_digest", "bytes32-if-present"], ["source_len", "u32:1..16777216"], ["source_digest", "bytes32"]],
-    "SOURCE": [["attempt", "attempt_fields"], ["source_offset", "u32"], ["source_total_len", "u32:1..16777216"], ["source_chunk_len", "u32:1..1048576"], ["source_chunk", "bytes[source_chunk_len]"]],
-    "ACCEPT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"], ["max_extent_bytes", "u32:1..1048576"], ["checkpoint_batch_bytes", "u32:1..134217728"]],
-    "DATA": [["attempt", "attempt_fields"], ["offset", "u64"], ["extent_len", "u32:1..1048576"], ["abx1_extent", "bytes[extent_len]"]],
+    "OPEN": [["class", "u8-enum:1"], ["direction", "u8-enum:1,2"], ["semantic_version", "u16=9"], ["profile_id", "u16=5"], ["session_transcript", "bytes32"], ["exchange_id", "u64"], ["transfer_id", "bytes32"], ["source_transfer_id", "bytes32"], ["publication_id", "bytes32"], ["variant_id", "bytes32"], ["total_len", "u64-native-pack-wire<=8591032320"], ["attempt_nonce", "bytes32-nonzero"], ["checkpoint_generation", "u64"], ["custody_present", "u8-enum:0,1"], ["custody_digest", "bytes32-if-present"], ["source_len", "u32:1..401902"], ["source_digest", "bytes32"]],
+    "SOURCE": [["attempt", "attempt_fields"], ["source_offset", "u32"], ["source_total_len", "u32:1..401902"], ["source_chunk_len", "u32:1..1048576"], ["source_chunk", "bytes[source_chunk_len]"]],
+    "ACCEPT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"], ["max_extent_bytes", "u32:1..1048710"], ["checkpoint_batch_bytes", "u32:1..134217728"]],
+    "DATA": [["attempt", "attempt_fields"], ["offset", "u64"], ["extent_len", "u32:1..1048710"], ["astrbs02_record", "bytes[extent_len],length-prefixed-ASTRBS02"]],
     "CHECKPOINT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"]],
     "FINISH": [["attempt", "attempt_fields"], ["final_offset", "u64"], ["commitment_len", "u32:1..65536"], ["semantic_commitment", "bytes[commitment_len]"]],
     "RESULT": [["attempt", "attempt_fields"], ["final_offset", "u64"], ["result_code", "u8-enum:1,2,3,4,5,6"], ["result_digest", "bytes32"]],
@@ -103,8 +104,8 @@ PROFILE5_RUST_ORDER = {
     "ACK": ["o.push(0xdc)", "put_attempt", "x.result_digest"],
 }
 PROFILE5_ATTEMPT_FIELDS = [["transfer_id", "bytes32"], ["attempt_nonce", "bytes32-nonzero"], ["sequence", "u64"]]
-PROFILE5_ABX1_FIELDS = [["first_chunk_index", "u64"], ["carrier_count", "u32:1..131072"], ["carriers", "repeat carrier_count"], ["carrier_len", "u32:1..66215"], ["carrier", "bytes[carrier_len],valid-ASTRBT01"]]
-PROFILE5_COMPOSITE_FIELDS = [["protected_header_len", "u32:1..2048"], ["protected_header", "bytes[protected_header_len],protected-ASTRFR01-DATA-header"], ["abx1_extent", "bytes[extent_len]"]]
+PROFILE5_PACK_FIELDS = [["record_len", "u32:1..1048706"], ["record", "bytes[record_len],valid-ASTRBS02"]]
+PROFILE5_COMPOSITE_FIELDS = [["protected_header_len", "u32:1..2048"], ["protected_header", "bytes[protected_header_len],protected-ASTRFR01-DATA-header"], ["length_prefixed_astrbs02_record", "bytes[record_len+4]"]]
 PROFILE5_FLOWS = {
     "nonempty": ["PLAN", "OPEN", "SOURCE", "ACCEPT", "DATA", "CHECKPOINT", "FINISH", "RESULT", "ACK"],
     "empty": ["PLAN", "OPEN", "SOURCE", "ACCEPT", "FINISH", "RESULT", "ACK"],
@@ -160,9 +161,9 @@ BLOB_DOCUMENTATION_CAPABILITIES = {
         "surface": surface,
         "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
         "semantic_v9_profile": "5:BlobStreamV1",
-        "map_unit": "65536-byte canonical plaintext chunk",
-        "record": "ASTRBT01, at most 66215 bytes",
-        "extent": "ABX1, at most 1048576 bytes",
+        "map_unit": "1048576-byte native plaintext segment",
+        "record": "ASTRBS02, at most 1048706 bytes",
+        "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes",
     }
     for surface in ("node_api", "transports", "recipes")
 }
@@ -175,30 +176,34 @@ BLOB_DOCUMENTATION_CAPABILITIES.update(
                 "authenticated_finish_and_content_verification",
                 "canonical_apply_promotion",
                 "result",
-                "ack",
-                "receipt_cleanup",
+                "result_ack_or_eof_attempt_settlement",
             ],
-            "available_before_settlement_cleanup": True,
-            "receipt_key": ["receiving_mission_authority", "canonical_source"],
-            "receipt_persists_attempt_nonce": False,
-            "sender_hard_deadline_basis": "exact_canonical_wire_length",
+            "available_before_attempt_settlement": True,
+            "durable_resume_authority": [
+                "lifecycle_owned_provisional_source_or_upload_state",
+                "native_pack_checkpoint_journal",
+            ],
+            "attempt_settlement_owns_durable_resume": False,
+            "sender_hard_deadline_basis": "exact_native_pack_wire_length",
             "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+            "contact_no_progress_timeout_seconds": 30,
+            "contact_progress_signal": "completed_authenticated_profile5_operation",
             "authenticated_progress_timeout_seconds": 120,
-            "plaintext_chunk_bytes": 65_536,
-            "encoded_record_max_bytes": 66_215,
-            "extent_max_bytes": 1_048_576,
+            "plaintext_segment_bytes": 1_048_576,
+            "encoded_record_max_bytes": 1_048_706,
+            "length_prefixed_data_max_bytes": 1_048_710,
             "checkpoint_batch_max_bytes": 134_217_728,
-            "pre_profile5_canonical_blob_profile5_eligible": True,
             "capacity_authority": "configured_blob_depot_limits",
         },
         "performance": {
             "schema": 1,
             "surface": "performance",
-            "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
-            "legacy_2026_10_20_supports_current_candidate": False,
-            "current_map_unit": "65536-byte canonical plaintext chunk",
-            "current_record": "ASTRBT01",
-            "current_extent": "ABX1, at most 1048576 bytes",
+            "historical_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+            "historical_2026_10_20_supports_architecture": True,
+            "historical_2026_10_20_qualifies_current_commit": False,
+            "current_map_unit": "1048576-byte native plaintext segment",
+            "current_record": "ASTRBS02, at most 1048706 bytes",
+            "current_data_body": "length-prefixed record, at most 1048710 bytes",
             "current_cm4_qualification": "pending_task_13",
         },
         "requirements_status": {
@@ -259,9 +264,12 @@ REQUIREMENTS_CURRENT_SECTION_NAMES = (
     "production-blob-lifecycle",
 )
 _REQUIREMENTS_CURRENT_TEXT = (
-    "Current Blob transfer uses semantic v9 profile 5 with receiver-authoritative "
-    "checkpoints and ABX1 canonical extents, bounded at 8 GiB and 131,072 chunks; "
-    "semantic v7/v8 profile 4 remains compatibility-only at 64 MiB and 1,024 chunks."
+    "Current Blob transfer uses semantic v9 profile 5 with lifecycle-owned provisional "
+    "source or upload state plus the native pack checkpoint journal as durable resume "
+    "authority, and native 1-MiB ASTRBS02 pack records bounded at 8 GiB and 8,192 "
+    "segments. Atomic promotion precedes RESULT; RESULT_ACK or EOF settles only the "
+    "attempt and owns no durable resume state. Semantic v7/v8 profile 4 remains "
+    "compatibility-only at 64 MiB and 1,024 chunks."
 )
 
 _CAPABILITY_BLOCK = re.compile(
@@ -301,30 +309,39 @@ def render_blob_documentation_capability(surface: str) -> str:
     if surface in {"node_api", "transports", "recipes"}:
         return (
             "Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 "
-            "selects profile 5 BlobStreamV1. Profile 5 maps 65,536-byte canonical "
-            "plaintext chunks into complete ASTRBT01 records of at most 66,215 "
-            "bytes and batches them in ABX1 extents of at most 1,048,576 bytes."
+            "selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext "
+            "segments into append-only ASTRBS02 records of at most 1,048,706 bytes "
+            "and sends one complete length-prefixed record per DATA body, at most "
+            "1,048,710 bytes, without repacking or re-encryption."
         )
     if surface == "runbook":
         return (
-            "The receiver verifies authenticated FINISH and content, applies the "
-            "canonical promotion, sends RESULT, receives ACK, and then removes the "
-            "durable receipt. AVAILABLE may precede settlement cleanup. The receipt "
-            "is keyed by receiving mission authority and canonical source and does "
-            "not persist an attempt nonce. The sender hard deadline uses exact "
-            "canonical wire length; before authenticated OPEN, the receiver uses the "
-            "profile wire ceiling. Authenticated progress times out after 120 seconds. "
-            "The 65,536-byte plaintext chunk, 66,215-byte encoded-record ceiling, "
-            "1,048,576-byte extent ceiling, and 134,217,728-byte checkpoint ceiling "
-            "are distinct. Pre-profile-5 canonical Blobs remain profile-5 eligible. "
-            "Provisional, pending, and completed bytes share configured Blob depot limits."
+            "The receiver verifies authenticated FINISH and content, atomically "
+            "promotes the native pack before sending RESULT. RESULT_ACK or EOF settles "
+            "only the transport attempt and does not own durable resume state. AVAILABLE "
+            "may precede attempt settlement. Durable resume authority is lifecycle-owned "
+            "provisional source or upload state plus the native pack checkpoint journal. "
+            "The sender hard deadline uses exact "
+            "native-pack wire length; before authenticated OPEN, the receiver uses the "
+            "profile wire ceiling. A contact with no completed authenticated Profile-5 "
+            "operation expires after 30 seconds; each such operation refreshes that outer "
+            "watchdog. An individual authenticated Profile-5 operation times out after "
+            "120 seconds of inactivity, and the size-derived hard attempt bound remains "
+            "absolute. "
+            "The 1,048,576-byte plaintext segment, 1,048,706-byte ASTRBS02 record "
+            "ceiling, 1,048,710-byte length-prefixed DATA body ceiling, and "
+            "134,217,728-byte checkpoint ceiling are distinct. "
+            "Provisional upload state, lifecycle-owned provisional source state, native "
+            "pack checkpoint journals, and completed native packs share configured Blob "
+            "depot limits."
         )
     if surface == "performance":
         return (
-            "The 2026-10-20 ASTRBS02 measurements used 1-MiB semantic segments and "
-            "do not qualify the current candidate. Current qualification must measure "
-            "65,536-byte canonical plaintext chunks, ASTRBT01 records, and ABX1 extents "
-            "of at most 1,048,576 bytes; three-CM4 qualification remains Task 13 work."
+            "The 2026-10-20 ASTRBS02 measurements validate the native-pack architecture "
+            "but not the current commit. Current qualification must measure 1,048,576-byte "
+            "plaintext segments, ASTRBS02 records of at most 1,048,706 bytes, and "
+            "length-prefixed DATA bodies of at most 1,048,710 bytes; three-CM4 "
+            "qualification remains Task 13 work."
         )
     if surface == "requirements_status":
         return (
@@ -519,11 +536,33 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
             ):
                 fail(f"Blob documentation {surface} contradiction is present")
 
-    for words in _documentation_sentences(prose["runbook"]):
-        if "promotion" in words and bool(words & {"result", "ack"}):
-                fail("Blob documentation receiver settlement contradiction is present")
-        if {"receipt", "attempt", "nonce"} <= words:
-            fail("Blob documentation receipt attempt contradiction is present")
+    for normalized, words in _documentation_sentence_text(prose["runbook"]):
+        result_before_promotion = re.search(
+            r"\b(?:result|ack)\b.{0,80}\b(?:before|prior to)\b.{0,80}\bpromotion\b",
+            normalized,
+        )
+        promotion_after_result = re.search(
+            r"\bpromotion\b.{0,40}\b(?:follows|after)\b.{0,40}\b(?:result|ack)\b",
+            normalized,
+        )
+        if result_before_promotion or promotion_after_result:
+            fail("Blob documentation receiver settlement contradiction is present")
+        if (
+            "receipt" in words
+            and bool(words & {"durable", "resume", "checkpoint", "authority", "key"})
+        ):
+            fail("Blob documentation durable resume authority contradiction is present")
+        attempt_subject = r"(?:result_?ack|result\s+ack|eof)"
+        settlement_owns_resume = re.search(
+            rf"\b{attempt_subject}\b.{{0,80}}\bowns?\b\s+(?!no\b).{{0,40}}\bresume\b",
+            normalized,
+        )
+        settlement_is_resume_authority = re.search(
+            rf"\b{attempt_subject}\b.{{0,80}}\bis\b\s+(?:the\s+)?(?:durable\s+)?resume\s+authority\b",
+            normalized,
+        )
+        if settlement_owns_resume or settlement_is_resume_authority:
+            fail("Blob documentation attempt settlement authority contradiction is present")
         if (
             bool(words & {"receiver", "receiving", "incoming"})
             and "exact" in words
@@ -647,14 +686,14 @@ def parse_profile_contract(protocol: str) -> None:
         fail("profile 4 limits differ from the executable compatibility bounds")
     expected_profile5 = (
         8_589_934_592,
-        131_072,
+        8_192,
         16_777_216,
     )
     if parse_numeric_declaration(protocol, "Profile 5 limits") != expected_profile5:
         fail("profile 5 limits differ from the executable streaming bounds")
-    expected_sizes = (65_536, 66_215, 1_048_576, 134_217_728, 2_097_152)
+    expected_sizes = (1_048_576, 1_048_706, 1_048_710, 134_217_728, 2_097_152)
     if parse_numeric_declaration(protocol, "Profile 5 size classes") != expected_sizes:
-        fail("profile 5 limits must distinguish chunk, carrier, extent, checkpoint, and frame sizes")
+        fail("profile 5 limits must distinguish segment, record, DATA body, checkpoint, and frame sizes")
     require_once(protocol, f"Profile 5 order: {PROFILE5_PIPELINE}.", "profile 5 grammar")
     require_once(
         protocol,
@@ -823,8 +862,8 @@ def parse_cddl(cddl: str) -> None:
         fail(f"CDDL object-kind registry drifted; found {aliases!r}")
     for declaration in (
         "stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1",
-        'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent',
-        'abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*(carrier-len-u32 canonical-carrier)',
+        'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 record-len-u32 astrbs02-record',
+        'astrbs02-record = "ASTRBS02" authenticated-segment-header ciphertext-and-tag',
     ):
         require_once(cddl, declaration, "CDDL profile 5 grammar")
 
@@ -845,6 +884,7 @@ def rust_numeric_constants(*sources: str) -> dict[str, int]:
         if name in stack or name not in declarations:
             fail(f"executable numeric constant {name} cannot be resolved")
         expression = re.sub(r"\bas\s+(?:u|i|usize)[0-9]*\b", "", declarations[name])
+        expression = re.sub(r"\b[a-z_][a-z0-9_]*::", "", expression)
         expression = re.sub(r"(?<=\d)_(?=\d)", "", expression)
         expression = re.sub(r"(?<=\d)(?:u|i)(?:8|16|32|64|128|size)\b", "", expression)
         for dependency in sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]*\b", expression)), key=len, reverse=True):
@@ -882,21 +922,32 @@ def validate_executable_profile_contract(
     profile: str,
     application_blob: str,
     core_blob: str,
+    core_model: str,
+    core_bridge: str,
     core_blob_stream: str,
     stream_transfer: str,
     iroh: str,
     blob_runtime: str,
 ) -> None:
-    values = rust_numeric_constants(application_blob, core_blob, core_blob_stream, stream_transfer, iroh)
+    values = rust_numeric_constants(
+        application_blob,
+        core_blob,
+        core_model,
+        core_bridge,
+        core_blob_stream,
+        stream_transfer,
+        iroh,
+    )
     expected = {
         "MAX_SELECTED_BLOB_STREAM_BYTES": 8_589_934_592,
-        "MAX_BLOB_CHUNKS": 131_072,
-        "MAX_STREAM_AUTHENTICATED_OPEN_BYTES": 16_777_216,
-        "MAX_BLOB_CHUNK_SIZE": 65_536,
-        "MAX_BLOB_TRANSFER_OBJECT_BYTES": 66_215,
-        "PROFILE5_CANONICAL_EXTENT_BYTES": 1_048_576,
-        "PROFILE5_MAX_CARRIERS_PER_EXTENT": 15,
-        "PROFILE5_MAX_CANONICAL_WIRE_BYTES": 8_679_596_592,
+        "MAX_STREAM_AUTHENTICATED_OPEN_BYTES": 401_902,
+        "BLOB_STREAM_SEGMENT_BYTES": 1_048_576,
+        "BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES": 130,
+        "PROFILE5_PACK_RECORD_PREFIX_BYTES": 4,
+        "PROFILE5_PACK_SEGMENT_RECORD_BYTES": 1_048_706,
+        "PROFILE5_PACK_TRANSPORT_FRAME_BYTES": 1_048_710,
+        "PROFILE5_MAX_PACK_SEGMENTS": 8_192,
+        "PROFILE5_MAX_PACK_WIRE_BYTES": 8_591_032_320,
         "MAX_STREAM_CHECKPOINT_BATCH_BYTES": 134_217_728,
         "DEFAULT_MAX_EXCHANGE_BYTES": 2_097_152,
     }
@@ -913,17 +964,15 @@ def validate_executable_profile_contract(
     if any(fragment not in profile for fragment in required_profile_fragments):
         fail("executable Blob profile registry must bind v7/v8 to profile 4 and v9 to profile 5")
     required_extent_fragments = (
-        "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_CANONICAL_EXTENT_BYTES",
+        "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_PACK_TRANSPORT_FRAME_BYTES",
         "profile5_attempt_bounds_for_extents",
         "8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192",
-        "PROFILE5_CANONICAL_EXTENT_BYTES as u64",
+        "PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u64",
     )
     if any(fragment not in stream_transfer for fragment in required_extent_fragments):
-        fail("production extent admission and attempt bounds must use canonical ABX1 limits")
-    if "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES" in stream_transfer:
-        fail("retired ASTRBS02 extent aliases production admission")
-    if "let profile_ceiling = aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES;" not in blob_runtime:
-        fail("profile 5 receiver ceiling must use the exact canonical maximum wire shape")
+        fail("production DATA admission and attempt bounds must use native pack limits")
+    if "let profile_ceiling = blob_pack_wire_len(aster_mesh::MAX_BLOB_STREAM_BYTES)" not in blob_runtime:
+        fail("profile 5 receiver ceiling must use the exact native pack wire shape")
 
 
 def require_source_fragments(label: str, source: str, fragments: tuple[str, ...]) -> None:
@@ -957,8 +1006,16 @@ def decode_transcript_seed(path: Path) -> tuple[bool, list[str]]:
     return payload[4] == 1, steps
 
 
-def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = ROOT) -> None:
+def validate_profile5_schema(
+    schema: dict,
+    stream_transfer: str,
+    blob_runtime: str | None = None,
+    root: Path = ROOT,
+) -> None:
+    if blob_runtime is None:
+        blob_runtime = (root / "crates/aster-node/src/runtime/blob_stream.rs").read_text()
     compact_stream = re.sub(r"\s+", " ", stream_transfer)
+    compact_blob_runtime = re.sub(r"\s+", " ", blob_runtime)
     if (
         schema.get("format") != "aster-profile5-fixed-binary-v1"
         or schema.get("magic") != "41534d01"
@@ -1071,13 +1128,43 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
         "fn extent(v: u32) -> Result<(), StreamError> { if v == 0 || v as usize > MAX_STREAM_EXTENT_BYTES",
         "validate_semantic_commitment_with_max(bytes, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES)",
         "if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes",
-        "if bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES",
+        "if bytes <= PROFILE5_MAX_PACK_WIRE_BYTES",
         "if self.o == self.b.len()",
     ))
     if compact_stream.count("if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes") != 2:
         fail("executable profile 5 bounded byte validators differ")
     if schema.get("attempt_fields") != PROFILE5_ATTEMPT_FIELDS:
         fail("profile 5 nested attempt tuple differs")
+    source_object = schema.get("source_object", {})
+    semantic_publication = source_object.get("semantic_publication", {})
+    physical_source = source_object.get("physical_source", {})
+    source_identity = source_object.get("identity", {})
+    if (
+        source_object.get("magic") != "4153545250533032"
+        or source_object.get("format_version") != 2
+        or source_object.get("max_encoded_bytes") != 401_902
+        or semantic_publication.get("magic") != "4153545242503032"
+        or semantic_publication.get("format_version") != 2
+        or semantic_publication.get("authenticated") is not True
+        or physical_source.get("magic") != "4153545250503032"
+        or physical_source.get("format_version") != 2
+        or source_identity.get("transfer_id") != "sha256(ASTRPS02)"
+        or source_identity.get("publication_id")
+        != "sha256(authenticated-ASTRBP02)"
+        or source_identity.get("finish")
+        != "byte-equal-authenticated-physical-commitment"
+    ):
+        fail("profile 5 ASTRPS02 source schema differs")
+    core_blob_stream = (root / "crates/aster-core/src/blob_stream.rs").read_text()
+    require_source_fragments("ASTRPS02 core format", core_blob_stream, (
+        'BLOB_STREAM_PUBLICATION_MAGIC: &[u8; 8] = b"ASTRBP02"',
+        'BLOB_STREAM_PHYSICAL_SOURCE_MAGIC: &[u8; 8] = b"ASTRPP02"',
+        'BLOB_STREAM_PUBLICATION_SOURCE_MAGIC: &[u8; 8] = b"ASTRPS02"',
+        "pub const MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES: usize",
+        "MAX_AUTHENTICATED_BLOB_STREAM_PUBLICATION_BYTES",
+        "MAX_AUTHENTICATED_BLOB_STREAM_OPEN_BYTES",
+        "MAX_AUTHENTICATED_BLOB_STREAM_COMMITMENT_BYTES",
+    ))
     for start_marker, end_marker, tokens in (
         ("fn put_attempt", "impl StreamFrame", ["o.extend_from_slice(id)", "o.extend_from_slice(n)", "s.to_be_bytes()"]),
         ("fn attempt(&mut self)", "fn finish(self)", ["let id = self.array()?", "let n = self.array()?", "nonce(&n)?", "Ok((id, n, self.u64()?))"]),
@@ -1092,32 +1179,26 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
             if position < 0:
                 fail("executable profile 5 nested attempt tuple differs")
             cursor = position
-    abx1 = schema.get("abx1", {})
-    if abx1.get("magic") != "41425831" or abx1.get("max_encoded_bytes") != 1_048_576:
-        fail("profile 5 ABX1 schema differs")
-    if abx1.get("fields") != PROFILE5_ABX1_FIELDS:
-        fail("profile 5 ABX1 fields or bounds differ")
-    abx1_start = compact_stream.find("const CANONICAL_BLOB_EXTENT_MAGIC")
-    abx1_end = compact_stream.find("pub(crate) enum StreamClass", abx1_start)
-    abx1_source = compact_stream[abx1_start:abx1_end]
-    for fragment in (
-        'CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1"',
-        "self.carriers.is_empty()",
-        ".checked_add(self.carriers.len() as u64)",
-        "end > aster_mesh::MAX_BLOB_CHUNKS",
-        "carrier.is_empty()",
-        "carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
-        "encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES",
-        "u32::try_from(self.carriers.len())", "u32::try_from(carrier.len())",
-        "bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES",
-        "&bytes[..4] != CANONICAL_BLOB_EXTENT_MAGIC", "bytes[4..12]",
-        "bytes[12..16]", "if count == 0", "length == 0",
-        "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES", "offset != bytes.len()",
+    native_pack = schema.get("native_pack_record", {})
+    if (
+        native_pack.get("magic") != "4153545242533032"
+        or native_pack.get("max_encoded_bytes") != 1_048_710
     ):
-        if fragment not in abx1_source:
-            fail(f"executable profile 5 ABX1 validator differs at {fragment}")
+        fail("profile 5 native pack schema differs")
+    if native_pack.get("fields") != PROFILE5_PACK_FIELDS:
+        fail("profile 5 native pack fields or bounds differ")
+    require_source_fragments("native pack constants", compact_stream, (
+        "PROFILE5_PACK_SEGMENT_RECORD_BYTES",
+        "PROFILE5_PACK_TRANSPORT_FRAME_BYTES",
+    ))
+    require_source_fragments("native pack parser", compact_blob_runtime, (
+        "if encoded_len == 0",
+        "encoded_len > aster_mesh::BLOB_STREAM_SEGMENT_BYTES + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES",
+        "let record_len = encoded_len .checked_add(4)",
+        ".open_encoded(&record[4..])",
+    ))
     composite = schema.get("composite", {})
-    if composite.get("magic") != "41534431" or composite.get("max_encoded_bytes") != 1_050_632:
+    if composite.get("magic") != "41534431" or composite.get("max_encoded_bytes") != 1_050_766:
         fail("profile 5 ASD1 composite schema differs")
     if composite.get("fields") != PROFILE5_COMPOSITE_FIELDS:
         fail("profile 5 ASD1 fields or bounds differ")
@@ -1156,16 +1237,16 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
         "phase = Phase::Data", "phase = Phase::Finished", "phase = Phase::Result",
         "phase = Phase::Terminal", "phase == Phase::Terminal",
         "drive_fuzz_transcript(&frames), model_fuzz_transcript(&frames)",
-        "assert_eq!(model_fuzz_transcript(&frames), expected)",
-        "assert_eq!(drive_fuzz_transcript(&frames), expected)",
+        "model_fuzz_transcript(&frames), expected",
+        "drive_fuzz_transcript(&frames), expected",
         "sender.accept(value.clone())", "receiver.data(value)",
         "sender.checkpoint(value.clone())", "receiver.finish(value.clone())",
         "sender.result(value.clone())", "receiver.result_ack(",
     ))
     if stream_transfer.count("validate_profile5_wire_len(x.total_len)?") != 1 or stream_transfer.count("validate_profile5_wire_len(total_len)?") != 1:
         fail("profile 5 OPEN encoder/decoder wire bound differs")
-    if "bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES" not in stream_transfer:
-        fail("profile 5 OPEN canonical wire bound differs")
+    if "bytes <= PROFILE5_MAX_PACK_WIRE_BYTES" not in stream_transfer:
+        fail("profile 5 OPEN native pack wire bound differs")
     result = next(record for record in records if record["name"] == "RESULT")
     if dict(result["fields"])["result_code"] != "u8-enum:1,2,3,4,5,6":
         fail("profile 5 result-code enum differs")
@@ -1216,6 +1297,8 @@ def main() -> int:
             (ROOT / "crates/aster-core/src/transfer_profile.rs").read_text(),
             (ROOT / "crates/aster-node/src/application/blob.rs").read_text(),
             (ROOT / "crates/aster-core/src/blob.rs").read_text(),
+            (ROOT / "crates/aster-core/src/model.rs").read_text(),
+            (ROOT / "crates/aster-core/src/bridge.rs").read_text(),
             (ROOT / "crates/aster-core/src/blob_stream.rs").read_text(),
             (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
             (ROOT / "crates/aster-iroh/src/lib.rs").read_text(),
@@ -1224,6 +1307,7 @@ def main() -> int:
         validate_profile5_schema(
             json.loads((ROOT / "conformance/profile5-wire-schema.json").read_text()),
             (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
+            (ROOT / "crates/aster-node/src/runtime/blob_stream.rs").read_text(),
         )
         validate_profile5_oracle()
         validate_profile5_runtime_flow()

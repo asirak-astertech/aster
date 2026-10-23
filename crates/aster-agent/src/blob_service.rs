@@ -63,12 +63,14 @@ impl BlobConnectService {
             .await
             .map_err(|error| connect_blob_application_error(error, operation))?;
         let durable_offset = stream.durable_offset();
+        let publication_id = *stream.publication_id().as_bytes();
         let grammar = grammar.resume(durable_offset)?;
         let state = PublishStreamState {
             requests,
             stream: Some(stream),
             grammar: Some(grammar),
             durable_offset,
+            publication_id,
             accepted_pending: true,
             complete: false,
             _permit: permit,
@@ -352,6 +354,7 @@ struct PublishStreamState {
     stream: Option<aster_node::application::SelectedBlobPublishStream>,
     grammar: Option<UploadGrammar>,
     durable_offset: u64,
+    publication_id: [u8; 32],
     accepted_pending: bool,
     complete: bool,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -366,7 +369,10 @@ async fn next_publish_response(
     }
     if state.accepted_pending {
         state.accepted_pending = false;
-        return Ok(Some((publish_accepted(state.durable_offset), state)));
+        return Ok(Some((
+            publish_accepted(state.durable_offset, state.publication_id),
+            state,
+        )));
     }
     loop {
         let Some(frame) = state.requests.next().await else {
@@ -502,13 +508,14 @@ fn parse_read_request(
     ))
 }
 
-fn publish_accepted(offset: u64) -> api::PublishBlobResponse {
+fn publish_accepted(offset: u64, publication_id: [u8; 32]) -> api::PublishBlobResponse {
     api::PublishBlobResponse {
         frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
             api::PublishBlobAccepted {
                 accepted_offset: offset,
                 durable_offset: offset,
                 canonical_frame_bytes: BLOB_RPC_FRAME_BYTES as u32,
+                publication_id: publication_id.to_vec(),
                 ..Default::default()
             },
         ))),

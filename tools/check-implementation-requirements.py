@@ -180,6 +180,99 @@ def validate_blob_capability_documentation(text: str) -> None:
         if " ".join(statement.split()) not in normalized:
             raise ValueError(f"Blob capability documentation {label} declaration is missing")
 
+
+def validate_profile5_native_pack_path(
+    *,
+    active_sources: dict[str, str] | None = None,
+    active_documentation: dict[str, str] | None = None,
+) -> None:
+    """Prevent semantic-v9 Profile-5 from regaining the legacy carrier path."""
+    # The core Blob module still defines the v7/v8 carrier used by retained
+    # compatibility profiles. Guard only the selected semantic-v9 production
+    # path so that shared historical definitions cannot be mistaken for an
+    # active Profile-5 fallback.
+    active_source_paths = (
+        "crates/aster-core/src/blob_stream.rs",
+        "crates/aster-core/src/lib.rs",
+        "crates/aster-core/src/transfer_profile.rs",
+        "crates/aster-node/src/application/blob.rs",
+        "crates/aster-node/src/runtime.rs",
+        "crates/aster-node/src/runtime/blob_stream.rs",
+        "crates/aster-node/src/stream_transfer.rs",
+        "crates/aster-redb-store/src/blob.rs",
+        "crates/aster-redb-store/src/blob/depot.rs",
+        "crates/aster-redb-store/src/blob/stream.rs",
+    )
+    active_documentation_paths = (
+        "README.md",
+        "crates/aster-agent/README.md",
+        "docs/application-recipes.md",
+        "docs/protocol.md",
+        "docs/quickstart/selected-blob-api.md",
+        "docs/transports.md",
+        "docs/validation/blob-streaming-engineering-runbook.md",
+        "docs/validation/blob-streaming-performance.md",
+        "docs/validation/requirements-status.md",
+        "docs/wire.cddl",
+    )
+    forbidden = (
+        "ABX1",
+        "ASTRBT01",
+        "Profile5CanonicalCheckpoint",
+        "Profile5CanonicalWireShape",
+        "profile5_canonical_wire_shape",
+        "PROFILE5_CANONICAL_",
+        "BlobProfile5Receipt",
+        "reserve_profile5_receipt",
+        "checkpoint_profile5_receipt",
+        "resume_profile5_receipt",
+        "complete_profile5_receipt",
+        "begin_profile5_sender_carrier",
+        "begin_profile5_sender_read",
+        "read_profile5_sender_carrier",
+        "commit_verified_profile5_batch_with_policy",
+        "apply_verified_profile5_blob_with_policy",
+    )
+    if active_sources is None:
+        active_sources = {
+            path: (ROOT / path).read_text(encoding="utf-8")
+            for path in active_source_paths
+        }
+    if active_documentation is None:
+        active_documentation = {
+            path: (ROOT / path).read_text(encoding="utf-8")
+            for path in active_documentation_paths
+        }
+
+    escaped: list[str] = []
+    for path, text in active_sources.items():
+        for token in forbidden:
+            if token in text:
+                escaped.append(f"{path}:{token}")
+    profile4_context = re.compile(
+        r"\bprofile[- ]4\b|\bsemantic[- ]v(?:7|8)\b|\bv7/v8\b",
+        re.IGNORECASE,
+    )
+    for path, text in active_documentation.items():
+        for paragraph in re.split(r"\n\s*\n", text):
+            normalized = " ".join(paragraph.split())
+            for claim in re.split(r"(?<=[.!?;])\s+", normalized):
+                clauses = re.split(
+                    r",\s*(?=(?:while|whereas|but|unlike|semantic[- ]v9|profile[- ]5)\b)"
+                    r"|\b(?:while|whereas)\b",
+                    claim,
+                    flags=re.IGNORECASE,
+                )
+                for clause in clauses:
+                    for token in ("ABX1", "ASTRBT01"):
+                        if token in clause and profile4_context.search(clause) is None:
+                            escaped.append(f"{path}:{token}")
+    if escaped:
+        raise ValueError(
+            "semantic-v9 Profile-5 legacy carrier concepts remain active: "
+            + ", ".join(escaped)
+        )
+
 RECEIPT = "docs/validation/requirements-status.md#reproducible-receipt"
 MISSION_RECEIPT = (
     "docs/validation/requirements-status.md#mission-authenticated-runtime-validation"
@@ -2236,6 +2329,7 @@ def main() -> int:
         validate_blob_capability_documentation(
             (ROOT / "docs/validation/capability-roadmap.md").read_text()
         )
+        validate_profile5_native_pack_path()
         expected = expected_rows(read_matrix())
         if args.write:
             write_trace(expected)

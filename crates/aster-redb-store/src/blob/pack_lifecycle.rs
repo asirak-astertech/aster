@@ -68,40 +68,18 @@ pub(crate) const BLOB_PROFILE5_PACKS: TableDefinition<&[u8], &[u8]> =
 
 const PACK_VARIANT_MAGIC: &[u8; 8] = b"ASTRPV01";
 const PACK_VARIANT_VERSION: u16 = 2;
-const PACK_SOURCE_MAGIC: &[u8; 8] = b"ASTRPS01";
-const PACK_SOURCE_VERSION: u16 = 1;
-
-pub(super) fn profile5_source_record(
+pub(super) fn profile5_publication_source_record(
+    authenticated_publication: &[u8],
     authenticated_open: &[u8],
     authenticated_commitment: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
-    let open_len = u32::try_from(authenticated_open.len())
-        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-    let finish_len = u32::try_from(authenticated_commitment.len())
-        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-    let mut source = Vec::with_capacity(
-        8 + 2 + 4 + authenticated_open.len() + 4 + authenticated_commitment.len(),
-    );
-    source.extend_from_slice(PACK_SOURCE_MAGIC);
-    source.extend_from_slice(&PACK_SOURCE_VERSION.to_be_bytes());
-    source.extend_from_slice(&open_len.to_be_bytes());
-    source.extend_from_slice(authenticated_open);
-    source.extend_from_slice(&finish_len.to_be_bytes());
-    source.extend_from_slice(authenticated_commitment);
-    Ok(source)
-}
-
-pub(super) fn profile5_semantic_digest(
-    open: &BlobStreamOpen,
-    commitment: &BlobStreamFinalCommitment,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"aster/blob-profile5-semantic/v1\0");
-    digest.update(open.publisher());
-    digest.update(open.publisher_counter().to_be_bytes());
-    digest.update(open.digest());
-    digest.update(commitment.encode());
-    digest.finalize().into()
+    aster_mesh::BlobStreamPublicationSource::new(
+        authenticated_publication.to_vec(),
+        authenticated_open.to_vec(),
+        authenticated_commitment.to_vec(),
+    )
+    .and_then(|source| source.encode())
+    .map_err(|_| pack_schema_error())
 }
 
 /// Nonconstructible Store-bound projection of one lifecycle-owned Profile-5
@@ -169,7 +147,7 @@ impl PartialEq for BlobPackVariant {
 impl Eq for BlobPackVariant {}
 
 impl BlobPackVariant {
-    pub const fn variant_id(&self) -> BlobVariantId {
+    pub(super) const fn variant_id(&self) -> BlobVariantId {
         self.variant_id
     }
 
@@ -230,10 +208,6 @@ impl BlobPackVariant {
         &self.completion
     }
 
-    pub const fn route_lineage(&self) -> &[u8; 32] {
-        &self.route_lineage
-    }
-
     pub const fn physical_lineage(&self) -> &[u8; 32] {
         &self.physical_lineage
     }
@@ -252,10 +226,6 @@ impl BlobPackVariant {
 
     pub(super) const fn owner_binding(&self) -> &[u8; 32] {
         &self.owner_binding
-    }
-
-    pub(super) fn source_record(&self) -> Result<Vec<u8>, StoreError> {
-        profile5_source_record(&self.authenticated_open, &self.authenticated_commitment)
     }
 
     pub(super) fn is_bound_to(&self, authority: &Arc<()>) -> bool {
@@ -334,10 +304,15 @@ impl BlobPackVariant {
     }
 
     fn decode(encoded: &[u8], authority: Arc<()>) -> Result<Self, StoreError> {
-        let mut cursor = Cursor::new(encoded);
-        if cursor.take(8)? != PACK_VARIANT_MAGIC || cursor.u16()? != PACK_VARIANT_VERSION {
-            return Err(pack_schema_error());
+        let expected_version = PACK_VARIANT_VERSION.to_be_bytes();
+        if encoded.get(..8) != Some(PACK_VARIANT_MAGIC.as_slice())
+            || encoded.get(8..10) != Some(expected_version.as_slice())
+        {
+            return Err(blob_error(BlobStoreError::UnsupportedProfile5PackSchema));
         }
+        let mut cursor = Cursor::new(encoded);
+        let _ = cursor.take(8)?;
+        let _ = cursor.u16()?;
         let variant_id = BlobVariantId::from_bytes(cursor.array()?);
         let route_lineage = cursor.array()?;
         let physical_lineage = cursor.array()?;
@@ -837,21 +812,27 @@ fn audited_lifecycle_imports(
     packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     owner_binding: Option<[u8; 32]>,
 ) -> Result<Vec<super::depot::AuditedLifecycleImport>, StoreError> {
-    packs
-        .iter()?
-        .map(|row| {
-            let (key, value) = row?;
-            let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
-            require_owner_binding(owner_binding, pack.owner_binding)?;
-            if key.value() != pack.variant_id.as_bytes() {
-                return Err(pack_schema_error());
-            }
-            Ok(super::depot::AuditedLifecycleImport {
-                variant_id: pack.variant_id,
-                physical_lineage: pack.physical_lineage,
-            })
-        })
-        .collect()
+    let mut audited = Vec::new();
+    for row in packs.iter()? {
+        let (key, value) = row?;
+        let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
+        require_owner_binding(owner_binding, pack.owner_binding)?;
+        if key.value() != pack.variant_id.as_bytes() {
+            return Err(pack_schema_error());
+        }
+        // A completed upload pack remains provisional authority owned solely
+        // by BLOB_UPLOADS until the atomic publication transaction promotes
+        // it. Treating it as a lifecycle import here invents publication
+        // references/lineage and makes a valid resumable store fail reopen.
+        if pack.state == PackLifecycleState::Provisional {
+            continue;
+        }
+        audited.push(super::depot::AuditedLifecycleImport {
+            variant_id: pack.variant_id,
+            physical_lineage: pack.physical_lineage,
+        });
+    }
+    Ok(audited)
 }
 
 impl super::Store {
@@ -1021,5 +1002,26 @@ impl<'a> Cursor<'a> {
         } else {
             Err(pack_schema_error())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incompatible_pack_encoding_requires_development_depot_reset_or_reimport() {
+        let error = BlobPackVariant::decode(b"ASTRPV01\0\x01", Arc::new(()))
+            .expect_err("pre-native pack encoding must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::UnsupportedProfile5PackSchema)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("reset the development depot or reimport")
+        );
     }
 }

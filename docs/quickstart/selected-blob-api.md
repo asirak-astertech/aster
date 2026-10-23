@@ -35,22 +35,24 @@ durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
-canonical 64-KiB authenticated chunks move as complete `ASTRBT01` records in
-bounded `ABX1` DATA extents through ordered data and control streams, and
-durable receiver checkpoints authorize resume. Semantic v7/v8 profile 4 remains a compatibility
+1-MiB plaintext segments become append-only authenticated `ASTRBS02` records,
+and those same records move over ordered data/control streams without repacking
+or re-encryption. Lifecycle-owned provisional source or upload state plus the
+native pack checkpoint journal authorize resume. Semantic
+v7/v8 profile 4 remains a compatibility
 path for `BlobRangesStreamV1`; v7 admits durable work only and v8 also admits
 authenticated finite custody. A profile-5 attempt never falls back in place to
 profile 4. `EventPagesV1` is Event-only. The default semantic offer is
-`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable wire/ABI, source, manifest, and
-`ASTRBT01` formats remain version 1.
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; profile-4 formats remain unchanged.
 
-There is one canonical durable Blob authority. Every pre-profile-5 canonical
-Blob remains eligible for profile 5 after upgrade; profile selection changes
-the transfer mechanics, not stored identity. A canonical plaintext chunk is
-65,536 bytes, a maximum encoded canonical chunk record is 66,215 bytes, and an
-`ABX1` batched extent is at most 1,048,576 bytes. One negotiated checkpoint
-batch is at most 134,217,728 bytes (128 MiB). Provisional uploads, pending
-network receipts, and completed variants share the configured depot limits.
+Profile 5 uses one native pack representation for local upload, durable
+storage, and network transfer. A plaintext segment is 1,048,576 bytes, a
+maximum encoded `ASTRBS02` record is 1,048,706 bytes, and its length-prefixed
+DATA body is at most 1,048,710 bytes. One negotiated checkpoint batch is at
+most 134,217,728 bytes (128 MiB). Provisional uploads, lifecycle-owned
+provisional network sources, and completed native packs share the configured
+depot limits. Atomic promotion precedes RESULT; RESULT_ACK or EOF settles only
+the transport attempt and owns no durable resume state.
 
 ## Use the live actor API
 
@@ -190,6 +192,14 @@ the identical file bytes, metadata, TTL, and other options with
 `inserted: false`. A new key would describe a new application operation rather
 than recover the uncertain one.
 
+Native gRPC clients receive a stable nonzero `publication_id` in the initial
+`PublishBlobAccepted` response before sending data byte zero. Save it
+immediately: it identifies provisional status as well as the final result, and
+the completed receipt must return the same value. `asterctl blob-publish`
+prints that identity only with its terminal result because the command keeps
+stdout to one result. `blob-status` transfer counters measure exact native
+length-prefixed `ASTRBS02` pack payload bytes, not reserved storage bytes.
+
 Text metadata uses exactly `TTL: durable` or `TTL: 60000 ms`. Finite JSON uses
 exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
@@ -254,8 +264,8 @@ outside that surface. The Rust subscription API below remains separate.
 
 For 800-MiB through 1-GiB engineering runs, including upload and synchronization
 lifecycle, exact WLAN binding, checkpoint/credit semantics,
-pipeline receipt fields, capacity checks, raw baselines, and the ARM64
-canonical ABX1/profile-5 transport example, use the
+pipeline receipt fields, capacity checks, raw baselines, and the ARM64 native
+ASTRBS02/profile-5 transport example, use the
 [Blob streaming engineering runbook](../validation/blob-streaming-engineering-runbook.md).
 
 ## Subscribe to immutable publication metadata
@@ -479,9 +489,11 @@ This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
 down, and later restart with an exact configured peer. A semantic-v9/profile-5
 contact transfers authenticated canonical records through the
-bounded pipeline, checkpoints only recoverable receiver progress, and promotes
-only after terminal-root verification and settlement. Interrupted attempts
-resume from that receiver-authoritative checkpoint. Semantic-v7/v8 profile 4
+bounded pipeline into lifecycle-owned provisional source state and the native
+pack checkpoint journal. It atomically promotes only after terminal-root
+verification and before RESULT. RESULT_ACK or EOF settles only the attempt and
+owns no durable resume state. Interrupted attempts resume from that provisional
+state and journal. Semantic-v7/v8 profile 4
 remains the compatibility path described below. The receiver's completed
 publication and page reads survive another peerless restart.
 

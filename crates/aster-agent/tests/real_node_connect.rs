@@ -415,7 +415,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     call.send(first).await?;
                     let accepted = call
                         .message::<api::PublishBlobResponse>()
-                        .await?
+                        .await
+                        ?
                         .ok_or_else(|| ConnectError::data_loss("missing Blob acceptance"))?
                         .to_owned_message();
                     let Some(api::publish_blob_response::Frame::Accepted(accepted)) = accepted.frame
@@ -450,7 +451,11 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     }
                     call.close_send();
                     let mut receipt = None;
-                    while let Some(response) = call.message::<api::PublishBlobResponse>().await? {
+                    while let Some(response) = call
+                        .message::<api::PublishBlobResponse>()
+                        .await
+                        ?
+                    {
                         if let Some(api::publish_blob_response::Frame::Complete(complete)) =
                             response.to_owned_message().frame
                         {
@@ -563,6 +568,95 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .await
         .expect("cancellation releases staging and capacity after cleanup");
         assert!(recovered_cancelled.inserted);
+
+        let mut status_call = client.publish_blob().await.expect("open status upload");
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"real-node-blob-status".to_vec(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: 1,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send status upload metadata");
+        let accepted = status_call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("read status upload acceptance")
+            .expect("status upload acceptance")
+            .to_owned_message();
+        let Some(api::publish_blob_response::Frame::Accepted(accepted)) = accepted.frame else {
+            panic!("status upload must be accepted before DATA")
+        };
+        assert_eq!(accepted.publication_id.len(), 32);
+        let status_request = api::InspectBlobPublicationRequest {
+            publication_id: accepted.publication_id.clone(),
+            topic: "imagery.maps".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            ..Default::default()
+        };
+        let awaiting = client
+            .inspect_blob_publication(status_request.clone())
+            .await
+            .expect("inspect provisional Blob publication")
+            .into_owned();
+        assert_eq!(awaiting.phase, api::BlobPublicationPhase::AwaitingData);
+        assert_eq!(awaiting.publication_id, accepted.publication_id);
+        assert_eq!(awaiting.durable_plaintext_bytes, 0);
+        assert_eq!(awaiting.blob_id, None);
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: vec![0x39],
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send status upload DATA");
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish status upload");
+        status_call.close_send();
+        let mut status_receipt = None;
+        while let Some(response) = status_call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("read status upload progress")
+        {
+            if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                response.to_owned_message().frame
+            {
+                status_receipt = Some(*complete);
+            }
+        }
+        let status_receipt = status_receipt.expect("status upload completion");
+        assert_eq!(status_receipt.publication_id, accepted.publication_id);
+        let available = client
+            .inspect_blob_publication(status_request)
+            .await
+            .expect("inspect available Blob publication")
+            .into_owned();
+        assert_eq!(available.phase, api::BlobPublicationPhase::Available);
+        assert_eq!(available.durable_plaintext_bytes, 1);
+        assert_eq!(
+            available.blob_id.as_deref(),
+            Some(status_receipt.id.as_slice())
+        );
 
         let deadline_client = api::AsterApplicationServiceClient::new(
             grpc,
@@ -912,6 +1006,19 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("publish finite Blob");
         assert_eq!(finite.ttl_ms, Some(500));
         tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let retired = client
+            .inspect_blob_publication(api::InspectBlobPublicationRequest {
+                publication_id: finite.publication_id.clone(),
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("inspect expired Blob publication")
+            .into_owned();
+        assert_eq!(retired.phase, api::BlobPublicationPhase::ExpiredOrRetired);
+        assert_eq!(retired.blob_id, None);
 
         let mut expired = client
             .read_blob(api::ReadBlobRequest {

@@ -1117,8 +1117,10 @@ type PublishBlobAccepted struct {
 	AcceptedOffset      uint64                 `protobuf:"varint,1,opt,name=accepted_offset,json=acceptedOffset,proto3" json:"accepted_offset,omitempty"`
 	DurableOffset       uint64                 `protobuf:"varint,2,opt,name=durable_offset,json=durableOffset,proto3" json:"durable_offset,omitempty"`
 	CanonicalFrameBytes uint32                 `protobuf:"varint,3,opt,name=canonical_frame_bytes,json=canonicalFrameBytes,proto3" json:"canonical_frame_bytes,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Stable opaque identity for status inspection before upload completion.
+	PublicationId []byte `protobuf:"bytes,4,opt,name=publication_id,json=publicationId,proto3" json:"publication_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishBlobAccepted) Reset() {
@@ -1170,6 +1172,13 @@ func (x *PublishBlobAccepted) GetCanonicalFrameBytes() uint32 {
 		return x.CanonicalFrameBytes
 	}
 	return 0
+}
+
+func (x *PublishBlobAccepted) GetPublicationId() []byte {
+	if x != nil {
+		return x.PublicationId
+	}
+	return nil
 }
 
 type PublishBlobCheckpoint struct {
@@ -4977,11 +4986,12 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x0fPublishBlobData\x12\x16\n" +
 	"\x06offset\x18\x01 \x01(\x04R\x06offset\x12\x14\n" +
 	"\x05bytes\x18\x02 \x01(\fR\x05bytes\"\x13\n" +
-	"\x11PublishBlobFinish\"\x99\x01\n" +
+	"\x11PublishBlobFinish\"\xc0\x01\n" +
 	"\x13PublishBlobAccepted\x12'\n" +
 	"\x0faccepted_offset\x18\x01 \x01(\x04R\x0eacceptedOffset\x12%\n" +
 	"\x0edurable_offset\x18\x02 \x01(\x04R\rdurableOffset\x122\n" +
-	"\x15canonical_frame_bytes\x18\x03 \x01(\rR\x13canonicalFrameBytes\"g\n" +
+	"\x15canonical_frame_bytes\x18\x03 \x01(\rR\x13canonicalFrameBytes\x12%\n" +
+	"\x0epublication_id\x18\x04 \x01(\fR\rpublicationId\"g\n" +
 	"\x15PublishBlobCheckpoint\x12'\n" +
 	"\x0faccepted_offset\x18\x01 \x01(\x04R\x0eacceptedOffset\x12%\n" +
 	"\x0edurable_offset\x18\x02 \x01(\x04R\rdurableOffset\"\xb5\x03\n" +

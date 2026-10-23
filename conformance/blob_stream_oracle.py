@@ -14,13 +14,28 @@ STREAM_MAGIC = b'ASM\x01'
 ATTEMPT_ID = b'\x11' * 32
 ATTEMPT_NONCE = b'\x22' * 32
 MAX_SOURCE_CHUNK = 1024 * 1024
-MAX_AUTHENTICATED_SOURCE = 16 * 1024 * 1024
-MAX_EXTENT = 1024 * 1024
+MAX_AUTHENTICATED_SOURCE = 401_902
+SEGMENT_BYTES = 1024 * 1024
+SEGMENT_OVERHEAD = 130
+MAX_SEGMENT_RECORD = SEGMENT_BYTES + SEGMENT_OVERHEAD
+MAX_DATA_BODY = 4 + MAX_SEGMENT_RECORD
 MAX_CHECKPOINT = 128 * 1024 * 1024
-MAX_CANONICAL_WIRE = 8_679_596_592
+MAX_PACK_WIRE = 8_591_032_320
+AUTHENTICATED_NATIVE_RECORD = bytes.fromhex(
+    '0000009341535452425330320002'
+    + '10' * 32
+    + '20' * 32
+    + '0000000000000007'
+    + '0000000000000000'
+    + '0000000000000000'
+    + '0000000000000011'
+    + '00000011'
+    + '00000021'
+    + 'c50825dfe99c1441f251ced1ee650141c18d32dd250a3168a102f11f6e067efcc7'
+)
 PROTECTED_HEADER_SHA256 = {
-    'profile5-protected-data-header.bin': 'f0c3586ff8d3402074e1c2a216a01762e6b52c9e0cc41bd7e55a2c13477b6ba6',
-    'profile5-protected-data-header-maximum.bin': '7d38327dc1cf38d65251bd99a3a10aaec6d6d905f503fb93cd950df9e0f6e6ea',
+    'profile5-protected-data-header.bin': '8b9401d11aa038741805715586df5cbf438fbba74746a9b290c31e62d6854c88',
+    'profile5-protected-data-header-maximum.bin': '10bc837c1182113a5970baeb20d178b98e0c35d83ab06eef08c94672e909829d',
 }
 
 
@@ -125,80 +140,68 @@ def stream_source():
             + source)
 
 
-def abx1_extent():
-    carrier = canonical_carrier(0, 17)
-    return b'ABX1' + struct.pack('>QI', 0, 1) + struct.pack('>I', len(carrier)) + carrier
+def inspect_native_record(record):
+    """Structurally validate one exact length-prefixed ASTRBS02 pack record."""
+    if len(record) < 4:
+        raise ValueError('native record prefix')
+    encoded_len = struct.unpack('>I', record[:4])[0]
+    if encoded_len == 0 or encoded_len > MAX_SEGMENT_RECORD or len(record) != 4 + encoded_len:
+        raise ValueError('native record length')
+    encoded = memoryview(record)[4:]
+    if encoded_len < SEGMENT_OVERHEAD or encoded[:8].tobytes() != b'ASTRBS02':
+        raise ValueError('segment magic')
+    if struct.unpack('>H', encoded[8:10])[0] != 2:
+        raise ValueError('segment version')
+    if not any(encoded[10:42]) or not any(encoded[42:74]):
+        raise ValueError('segment identity')
+    epoch, index, offset, total = struct.unpack('>QQQQ', encoded[74:106])
+    plaintext_len, ciphertext_len = struct.unpack('>II', encoded[106:114])
+    end = offset + plaintext_len
+    if (epoch == 0 or total == 0 or plaintext_len == 0
+            or plaintext_len > SEGMENT_BYTES or ciphertext_len != plaintext_len + 16
+            or offset != index * SEGMENT_BYTES or end > total
+            or (end < total and plaintext_len != SEGMENT_BYTES)
+            or len(encoded) != 114 + ciphertext_len):
+        raise ValueError('segment fields')
+    return {
+        'encoded_len': encoded_len,
+        'index': index,
+        'offset': offset,
+        'total': total,
+        'plaintext_len': plaintext_len,
+        'ciphertext_len': ciphertext_len,
+    }
 
 
-def canonical_carrier(index, ciphertext_len):
-    return canonical_carrier_with_proof(index, ciphertext_len, ())
+def native_record():
+    inspected = inspect_native_record(AUTHENTICATED_NATIVE_RECORD)
+    assert inspected == {
+        'encoded_len': 147,
+        'index': 0,
+        'offset': 0,
+        'total': 17,
+        'plaintext_len': 17,
+        'ciphertext_len': 33,
+    }
+    return AUTHENTICATED_NATIVE_RECORD
 
 
-def domain_hash(domain, *parts):
-    value = hashlib.sha256(struct.pack('>Q', len(domain)) + domain)
-    for part in parts:
-        value.update(part)
-    return value.digest()
-
-
-def route_levels(ciphertext_lengths):
-    blob_id = b'\x20' * 32
-    leaves = [domain_hash(b'aster/blob-route-leaf/v1', struct.pack('>H', 1), blob_id,
-                          struct.pack('>Q', index),
-                          hashlib.sha256(bytes((index + value) & 0xff
-                                               for value in range(length))).digest(),
-                          struct.pack('>I', length))
-              for index, length in enumerate(ciphertext_lengths)]
-    levels = [leaves]
-    level = 0
-    while len(levels[-1]) > 1:
-        current = levels[-1]
-        levels.append([
-            domain_hash(b'aster/blob-route-node/v1', struct.pack('>H', 1),
-                        struct.pack('>H', level), pair[0], pair[1])
-            if len(pair) == 2 else pair[0]
-            for offset in range(0, len(current), 2)
-            for pair in (current[offset:offset + 2],)
-        ])
-        level += 1
-    return levels
-
-
-def route_proof(levels, index):
-    proof = []
-    position = index
-    for current in levels[:-1]:
-        sibling = position + 1 if position % 2 == 0 else position - 1
-        if sibling < len(current):
-            proof.append(current[sibling])
-        position //= 2
-    return proof
-
-
-def canonical_carrier_with_proof(index, ciphertext_len, proof):
-    ciphertext = bytes((index + value) & 0xff for value in range(ciphertext_len))
-    return (b'ASTRBT01' + struct.pack('>H', 1) + b'\x10' * 32 + b'\x20' * 32
-            + struct.pack('>Q', index) + hashlib.sha256(ciphertext).digest()
-            + struct.pack('>I', ciphertext_len) + bytes([len(proof)])
-            + b''.join(proof) + ciphertext)
-
-
-def maximum_abx1_extent():
-    ciphertext_lengths = [65424] * 15 + [63184]
-    levels = route_levels(ciphertext_lengths)
-    carriers = [canonical_carrier_with_proof(index, length, route_proof(levels, index))
-                for index, length in enumerate(ciphertext_lengths)]
-    used = 16 + sum(4 + len(carrier) for carrier in carriers)
-    extent = (b'ABX1' + struct.pack('>QI', 0, len(carriers))
-              + b''.join(struct.pack('>I', len(carrier)) + carrier for carrier in carriers))
-    assert used == MAX_EXTENT
-    assert len(extent) == MAX_EXTENT
-    return extent
+def maximum_native_record():
+    ciphertext_len = SEGMENT_BYTES + 16
+    encoded = (b'ASTRBS02' + struct.pack('>H', 2) + b'\x10' * 32 + b'\x20' * 32
+               + struct.pack('>QQQQII', 7, 0, 0, SEGMENT_BYTES,
+                             SEGMENT_BYTES, ciphertext_len)
+               + b'\x5a' * ciphertext_len)
+    record = struct.pack('>I', len(encoded)) + encoded
+    assert len(encoded) == MAX_SEGMENT_RECORD
+    assert len(record) == MAX_DATA_BODY
+    inspect_native_record(record)
+    return record
 
 
 def stream_accept(extent_len):
     return (STREAM_MAGIC + b'\xd7' + attempt(0) + struct.pack(
-        '>QQQII', 0, 0, extent_len, MAX_EXTENT, MAX_CHECKPOINT))
+        '>QQQII', 0, 0, extent_len, MAX_DATA_BODY, MAX_CHECKPOINT))
 
 
 def stream_data(extent):
@@ -234,7 +237,7 @@ def decode_stream_record(wire):
         if len(body) not in (259, 291) or body[0:2].tobytes() != b'\x01\x02':
             raise ValueError('open length/class/direction')
         if (struct.unpack('>HH', body[2:6]) != (9, 5)
-                or struct.unpack('>Q', body[174:182])[0] > MAX_CANONICAL_WIRE
+                or struct.unpack('>Q', body[174:182])[0] > MAX_PACK_WIRE
                 or not any(body[182:214])):
             raise ValueError('open context/nonce')
         custody = body[222]
@@ -259,7 +262,7 @@ def decode_stream_record(wire):
             raise ValueError('fixed record')
         if tag == 0xd7:
             durable, _, limit, extent, checkpoint = struct.unpack('>QQQII', body[72:104])
-            if durable > limit or extent == 0 or extent > MAX_EXTENT or checkpoint == 0 or checkpoint > MAX_CHECKPOINT:
+            if durable > limit or extent == 0 or extent > MAX_DATA_BODY or checkpoint == 0 or checkpoint > MAX_CHECKPOINT:
                 raise ValueError('accept bounds')
         elif tag == 0xd9:
             durable, _, limit = struct.unpack('>QQQ', body[72:96])
@@ -272,10 +275,11 @@ def decode_stream_record(wire):
         if len(body) < 84 or not any(body[32:64]):
             raise ValueError('data fixed fields')
         offset, length = struct.unpack('>QI', body[72:84])
-        if length == 0 or length > MAX_EXTENT or offset + length > 0xffffffffffffffff:
+        if length == 0 or length > MAX_DATA_BODY or offset + length > 0xffffffffffffffff:
             raise ValueError('data bounds')
         if len(body) != 84 + length:
             raise ValueError('data framing')
+        inspect_native_record(body[84:].tobytes())
         return tag
     if tag == 0xda:
         if len(body) < 84 or not any(body[32:64]):
@@ -288,18 +292,21 @@ def decode_stream_record(wire):
 
 
 def profile5_stream_corpus():
-    extent = abx1_extent()
+    extent = native_record()
     accepted = [
         ('open', stream_open()), ('source', stream_source()),
-        ('accept', stream_accept(len(extent))), ('data-abx1', stream_data(extent)),
+        ('accept', stream_accept(len(extent))), ('data-native-record', stream_data(extent)),
         ('checkpoint', stream_checkpoint(len(extent))), ('finish', stream_finish(len(extent))),
         ('result', stream_result(len(extent))), ('ack', stream_ack()),
-        ('open-max-wire', stream_open(MAX_CANONICAL_WIRE)),
+        ('open-max-wire', stream_open(MAX_PACK_WIRE)),
     ]
     rows = [('ACCEPT', name, wire) for name, wire in accepted]
     rows.extend([
         ('REJECT', 'open-zero-attempt', accepted[0][1][:187] + b'\x00' * 32 + accepted[0][1][219:]),
-        ('REJECT', 'open-wire-overflow', stream_open(MAX_CANONICAL_WIRE + 1)),
+        ('REJECT', 'open-wire-overflow', stream_open(MAX_PACK_WIRE + 1)),
+        ('REJECT', 'data-legacy-abx1', stream_data(b'ABX1' + b'\x00' * 12)),
+        ('REJECT', 'data-zero-record-length', stream_data(b'\x00' * 4)),
+        ('REJECT', 'data-coalesced-records', stream_data(extent + extent)),
         ('REJECT', 'data-truncated', accepted[3][1][:-1]),
         ('REJECT', 'data-trailing', accepted[3][1] + b'\x00'),
         ('REJECT', 'data-offset-overflow', accepted[3][1][:77] + struct.pack('>Q', 0xffffffffffffffff) + accepted[3][1][85:]),
@@ -318,10 +325,10 @@ def profile5_stream_corpus():
 
 
 def profile5_composite_corpus():
-    extent = abx1_extent()
+    extent = native_record()
     data_header = protected_header('profile5-protected-data-header.bin')
     rows = [
-        ('ACCEPT', 'abx1-data', b'ASD1' + struct.pack('>I', len(data_header)) + data_header + extent),
+        ('ACCEPT', 'native-pack-data', b'ASD1' + struct.pack('>I', len(data_header)) + data_header + extent),
         ('REJECT', 'wrong-magic', b'ASD2' + struct.pack('>I', 2) + b'\xa1\xa2\xb1'),
         ('REJECT', 'zero-header', b'ASD1' + struct.pack('>I', 0) + b'\xb1'),
         ('REJECT', 'oversized-header', b'ASD1' + struct.pack('>I', 2049) + b'\xa1'),
@@ -335,7 +342,7 @@ def profile5_composite_corpus():
 
 
 def profile5_transcript_corpus():
-    extent = abx1_extent()
+    extent = native_record()
     nonempty = [stream_open(len(extent)), stream_source(), stream_accept(len(extent)),
                 stream_data(extent), stream_checkpoint(len(extent)), stream_finish(len(extent)),
                 stream_result(len(extent)), stream_ack()]
@@ -432,12 +439,12 @@ def main():
             seed_path.write_bytes(payload)
         else:
             assert seed_path.read_bytes() == payload, f'{seed_path}: differs from oracle'
-    extent = abx1_extent()
+    extent = native_record()
     header = protected_header('profile5-protected-data-header.bin')
     composite_seeds = {
         'profile5-composite-valid.bin': b'ASD1' + struct.pack('>I', len(header)) + header + extent,
     }
-    maximum = maximum_abx1_extent()
+    maximum = maximum_native_record()
     maximum_header = protected_header('profile5-protected-data-header-maximum.bin')
     composite_seeds['profile5-composite-maximum.bin'] = (
         b'ASD1' + struct.pack('>I', len(maximum_header)) + maximum_header + maximum)

@@ -42,27 +42,27 @@ DOCUMENTATION_CAPABILITIES = {
         "surface": "node_api",
         "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
         "semantic_v9_profile": "5:BlobStreamV1",
-        "map_unit": "65536-byte canonical plaintext chunk",
-        "record": "ASTRBT01, at most 66215 bytes",
-        "extent": "ABX1, at most 1048576 bytes",
+        "map_unit": "1048576-byte native plaintext segment",
+        "record": "ASTRBS02, at most 1048706 bytes",
+        "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes",
     },
     "transports": {
         "schema": 1,
         "surface": "transports",
         "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
         "semantic_v9_profile": "5:BlobStreamV1",
-        "map_unit": "65536-byte canonical plaintext chunk",
-        "record": "ASTRBT01, at most 66215 bytes",
-        "extent": "ABX1, at most 1048576 bytes",
+        "map_unit": "1048576-byte native plaintext segment",
+        "record": "ASTRBS02, at most 1048706 bytes",
+        "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes",
     },
     "recipes": {
         "schema": 1,
         "surface": "recipes",
         "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
         "semantic_v9_profile": "5:BlobStreamV1",
-        "map_unit": "65536-byte canonical plaintext chunk",
-        "record": "ASTRBT01, at most 66215 bytes",
-        "extent": "ABX1, at most 1048576 bytes",
+        "map_unit": "1048576-byte native plaintext segment",
+        "record": "ASTRBS02, at most 1048706 bytes",
+        "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes",
     },
     "runbook": {
         "schema": 1,
@@ -71,30 +71,34 @@ DOCUMENTATION_CAPABILITIES = {
             "authenticated_finish_and_content_verification",
             "canonical_apply_promotion",
             "result",
-            "ack",
-            "receipt_cleanup",
+            "result_ack_or_eof_attempt_settlement",
         ],
-        "available_before_settlement_cleanup": True,
-        "receipt_key": ["receiving_mission_authority", "canonical_source"],
-        "receipt_persists_attempt_nonce": False,
-        "sender_hard_deadline_basis": "exact_canonical_wire_length",
+        "available_before_attempt_settlement": True,
+        "durable_resume_authority": [
+            "lifecycle_owned_provisional_source_or_upload_state",
+            "native_pack_checkpoint_journal",
+        ],
+        "attempt_settlement_owns_durable_resume": False,
+        "sender_hard_deadline_basis": "exact_native_pack_wire_length",
         "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+        "contact_no_progress_timeout_seconds": 30,
+        "contact_progress_signal": "completed_authenticated_profile5_operation",
         "authenticated_progress_timeout_seconds": 120,
-        "plaintext_chunk_bytes": 65_536,
-        "encoded_record_max_bytes": 66_215,
-        "extent_max_bytes": 1_048_576,
+        "plaintext_segment_bytes": 1_048_576,
+        "encoded_record_max_bytes": 1_048_706,
+        "length_prefixed_data_max_bytes": 1_048_710,
         "checkpoint_batch_max_bytes": 134_217_728,
-        "pre_profile5_canonical_blob_profile5_eligible": True,
         "capacity_authority": "configured_blob_depot_limits",
     },
     "performance": {
         "schema": 1,
         "surface": "performance",
-        "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
-        "legacy_2026_10_20_supports_current_candidate": False,
-        "current_map_unit": "65536-byte canonical plaintext chunk",
-        "current_record": "ASTRBT01",
-        "current_extent": "ABX1, at most 1048576 bytes",
+        "historical_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+        "historical_2026_10_20_supports_architecture": True,
+        "historical_2026_10_20_qualifies_current_commit": False,
+        "current_map_unit": "1048576-byte native plaintext segment",
+        "current_record": "ASTRBS02, at most 1048706 bytes",
+        "current_data_body": "length-prefixed record, at most 1048710 bytes",
         "current_cm4_qualification": "pending_task_13",
     },
     "requirements_status": {
@@ -200,9 +204,9 @@ The current handshake negotiates semantic versions `9`, `8`, `7`, `6`, `5`, `4`,
 
 Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
 Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
-Profile 5 limits: 8,589,934,592 object bytes; 131,072 canonical chunks; 16,777,216 authenticated-source bytes.
-Profile 5 size classes: 65,536 plaintext chunk bytes; 66,215 encrypted carrier bytes; 1,048,576 ABX1 extent bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
-Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
+Profile 5 limits: 8,589,934,592 plaintext bytes; 8,192 native segments; 16,777,216 authenticated-source bytes.
+Profile 5 size classes: 1,048,576 plaintext segment bytes; 1,048,706 encoded ASTRBS02 record bytes; 1,048,710 length-prefixed DATA-body bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
+Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
 Profile 5 exact empty transfer: OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT.
 """
 
@@ -227,8 +231,8 @@ semantic-v9-object-kind = 1 / 3 / 4 / 5
 
 ; stream-profile-v5 is fixed binary, not deterministic CBOR.
 stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1
-stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent
-abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*(carrier-len-u32 canonical-carrier)
+stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 record-len-u32 astrbs02-record
+astrbs02-record = "ASTRBS02" authenticated-segment-header ciphertext-and-tag
 """
 
 
@@ -325,8 +329,13 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ),
             (
                 "runbook",
-                "receipt attempt contradiction",
-                "The durable receipt retains the fresh attempt nonce.",
+                "durable resume authority contradiction",
+                "A durable receipt owns receiver resume state.",
+            ),
+            (
+                "runbook",
+                "attempt settlement authority contradiction",
+                "RESULT_ACK owns durable resume state.",
             ),
             (
                 "runbook",
@@ -336,7 +345,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             (
                 "performance",
                 "legacy performance contradiction",
-                "Legacy CM4 measurements confirm the current ABX1 batching policy.",
+                "Legacy CM4 measurements qualify the current native Profile-5 candidate.",
             ),
         )
         for surface, label, contradiction in contradictions:
@@ -435,7 +444,12 @@ class ProtocolVersionContractTests(unittest.TestCase):
         damaged = dict(documents)
         expected = CHECKER.render_requirements_current_section(first)
         damaged["requirements_status"] = damaged["requirements_status"].replace(
-            expected, expected.replace("receiver-authoritative", "sender-authoritative"), 1
+            expected,
+            expected.replace(
+                "lifecycle-owned provisional source or upload state plus the native pack checkpoint journal",
+                "sender-owned attempt receipt",
+            ),
+            1,
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, first):
             CHECKER.validate_blob_documentation_contract(damaged)
@@ -458,10 +472,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
         omitted_v9["requirements_status"] = omitted_v9["requirements_status"].replace(
             expected,
             expected.replace(
-                "Current Blob transfer uses semantic v9 profile 5 with "
-                "receiver-authoritative checkpoints and ABX1 canonical extents, "
-                "bounded at 8 GiB and 131,072 chunks; semantic v7/v8 profile 4 "
-                "remains compatibility-only at 64 MiB and 1,024 chunks.",
+                "Current Blob transfer uses semantic v9 profile 5",
                 "Current v7/v8 profile-4 streaming, semantic-v8 finite custody, "
                 "bounded pressure, and GC remain current-code evidence only.",
             ),
@@ -629,7 +640,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ),
             (
                 "runbook",
-                "The durable receipt does not compress content and retains the fresh attempt nonce.",
+                "A durable receipt does not compress content and owns receiver resume state.",
             ),
             (
                 "runbook",
@@ -637,7 +648,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ),
             (
                 "performance",
-                "Legacy CM4 does not cover packet loss and confirms the current ABX1 candidate.",
+                "Legacy CM4 does not cover packet loss and qualifies the current native candidate.",
             ),
         )
         for surface, claim in unrelated_negations:
@@ -647,8 +658,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
         accurate_but_governed = (
-            ("runbook", "Canonical promotion precedes RESULT and ACK."),
-            ("performance", "Legacy CM4 differs from the current ABX1 candidate."),
+            ("performance", "Legacy CM4 differs from the current native Profile-5 candidate."),
         )
         for surface, claim in accurate_but_governed:
             damaged = dict(documents)
@@ -676,8 +686,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
         }
         documents["performance"] += (
             "<!-- ASTER-BLOB-LEGACY:BEGIN -->\n"
-            "Legacy CM4 results support the historical ASTRBS02 candidate, not "
-            "the current ABX1 candidate.\n"
+            "Legacy CM4 results support the historical ASTRBS02 architecture, not "
+            "the current reviewed candidate.\n"
             "<!-- ASTER-BLOB-LEGACY:END -->\n"
         )
         CHECKER.validate_blob_documentation_contract(documents)
@@ -705,8 +715,13 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ),
             (
                 "runbook",
-                "receipt attempt contradiction",
-                "The durable receipt persists the fresh attempt nonce.",
+                "durable resume authority contradiction",
+                "The durable receipt owns resume state.",
+            ),
+            (
+                "runbook",
+                "attempt settlement authority contradiction",
+                "EOF owns durable resume state.",
             ),
             (
                 "runbook",
@@ -716,7 +731,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             (
                 "performance",
                 "legacy performance contradiction",
-                "The legacy 2026-10-20 CM4 result validates the current ABX1 batching policy.",
+                "The legacy 2026-10-20 CM4 result validates the current native candidate.",
             ),
         )
         for surface, label, contradiction in coexistence_mutations:
@@ -750,8 +765,13 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ),
             (
                 "runbook",
-                "receipt attempt contradiction",
-                "The durable receipt stores the fresh attempt nonce.",
+                "durable resume authority contradiction",
+                "The durable receipt stores resume authority.",
+            ),
+            (
+                "runbook",
+                "attempt settlement authority contradiction",
+                "RESULT_ACK is the durable resume authority.",
             ),
             (
                 "runbook",
@@ -761,7 +781,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             (
                 "performance",
                 "legacy performance contradiction",
-                "These legacy CM4 measurements prove the retained ABX1 batching policy for the current candidate.",
+                "These legacy CM4 measurements prove the current native Profile-5 candidate.",
             ),
         )
         for surface, label, contradiction in paraphrase_mutations:
@@ -776,7 +796,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
         historical["performance"] += (
             "<!-- ASTER-BLOB-LEGACY:BEGIN -->\n"
             "Legacy CM4 measurements validate only the historical ASTRBS02 "
-            "candidate and do not validate the current ABX1 candidate.\n"
+            "architecture and do not qualify the current reviewed candidate.\n"
             "<!-- ASTER-BLOB-LEGACY:END -->"
         )
         CHECKER.validate_blob_documentation_contract(historical)
@@ -889,9 +909,9 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_profile_size_classes_and_checkpoint_limit_are_distinct(self) -> None:
         replacements = {
-            "65,536 plaintext chunk bytes": "1,048,576 plaintext chunk bytes",
-            "66,215 encrypted carrier bytes": "65,536 encrypted carrier bytes",
-            "1,048,576 ABX1 extent bytes": "66,215 ABX1 extent bytes",
+            "1,048,576 plaintext segment bytes": "65,536 plaintext segment bytes",
+            "1,048,706 encoded ASTRBS02 record bytes": "66,215 encoded ASTRBS02 record bytes",
+            "1,048,710 length-prefixed DATA-body bytes": "1,048,576 length-prefixed DATA-body bytes",
             "134,217,728 checkpoint bytes": "8,388,608 checkpoint bytes",
         }
         for original, replacement in replacements.items():
@@ -905,8 +925,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
             "67,108,864 object bytes": "8,589,934,592 object bytes",
             "1,024 canonical chunks": "131,072 canonical chunks",
             "1,048,576 authenticated-source bytes": "16,777,216 authenticated-source bytes",
-            "8,589,934,592 object bytes": "67,108,864 object bytes",
-            "131,072 canonical chunks": "1,024 canonical chunks",
+            "8,589,934,592 plaintext bytes": "67,108,864 plaintext bytes",
+            "8,192 native segments": "1,024 native segments",
             "16,777,216 authenticated-source bytes": "1,048,576 authenticated-source bytes",
         }
         for original, replacement in replacements.items():
@@ -917,7 +937,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_profile_five_pipeline_and_empty_terminal_order_are_checked(self) -> None:
         for original, replacement in (
-            ("PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK",
+            ("PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK",
              "PLAN -> OPEN -> ACCEPT -> DATA -> FINISH"),
             ("OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT",
              "OPEN -> ACCEPT -> RESULT"),
@@ -997,7 +1017,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_cddl_declares_profile_five_fixed_binary_grammar(self) -> None:
         damaged = cddl_contract().replace(
-            'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent\n',
+            'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 record-len-u32 astrbs02-record\n',
             "",
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL profile 5 grammar"):
@@ -1023,9 +1043,9 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 changed = copy.deepcopy(schema)
                 changed["records"][index]["fields"][field_index][1] = "u8"
                 mutations.append((f"{record['name']} {field[0]} width/bound", changed))
-        for path, value in (("ABX1 bound", 1_048_577), ("composite bound", 1_050_631)):
+        for path, value in (("native pack bound", 1_048_709), ("composite bound", 1_050_765)):
             changed = copy.deepcopy(schema)
-            changed["abx1" if path.startswith("ABX1") else "composite"]["max_encoded_bytes"] = value
+            changed["native_pack_record" if path.startswith("native") else "composite"]["max_encoded_bytes"] = value
             mutations.append((path, changed))
         changed = copy.deepcopy(schema)
         next(record for record in changed["records"] if record["name"] == "RESULT")["fields"][-2][1] = "u8-enum:1,2"
@@ -1041,7 +1061,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 changed = copy.deepcopy(schema)
                 changed[section][index][1] = "u8"
                 mutations.append((f"{section} {field[0]} width/bound", changed))
-        for section in ("abx1", "composite"):
+        for section in ("native_pack_record", "composite"):
             changed = copy.deepcopy(schema)
             changed[section]["magic"] = "00000000"
             mutations.append((f"{section} magic", changed))
@@ -1064,6 +1084,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
         root = CHECKER_PATH.parents[1]
         schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
         rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
+        blob_runtime = (root / "crates/aster-node/src/runtime/blob_stream.rs").read_text()
         mutations = {
             "OPEN decoder width": rust.replace("let total_len = r.u64()?;", "let total_len = r.u32()?;", 1),
             "attempt decoder order": rust.replace(
@@ -1072,8 +1093,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 1,
             ),
             "OPEN executable wire bound": rust.replace(
-                "bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES",
-                "bytes <= aster_mesh::MAX_BLOB_CHUNKS",
+                "bytes <= PROFILE5_MAX_PACK_WIRE_BYTES",
+                "bytes <= aster_mesh::MAX_BLOB_STREAM_BYTES",
                 1,
             ),
             "OPEN authenticated source bound": rust.replace(
@@ -1083,26 +1104,6 @@ class ProtocolVersionContractTests(unittest.TestCase):
             "OPEN custody presence enum": rust.replace(
                 "1 => Some(r.array()?)",
                 "2 => Some(r.array()?)",
-                1,
-            ),
-            "ABX1 carrier bound": rust.replace(
-                "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
-                "length > PROFILE5_CANONICAL_EXTENT_BYTES",
-            ),
-            "ABX1 magic": rust.replace('b"ABX1"', 'b"ABX2"', 1),
-            "ABX1 aggregate bound": rust.replace(
-                "bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES",
-                "bytes.len() > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
-                1,
-            ),
-            "ABX1 count bound": rust.replace("if count == 0", "if count == 1", 1),
-            "ABX1 index bound": rust.replace(
-                "end > aster_mesh::MAX_BLOB_CHUNKS",
-                "end >= aster_mesh::MAX_BLOB_CHUNKS",
-            ),
-            "ABX1 trailing bound": rust.replace(
-                "if offset != bytes.len()",
-                "if offset > bytes.len()",
                 1,
             ),
             "ASD1 protected-header bound": rust.replace(
@@ -1196,7 +1197,25 @@ class ProtocolVersionContractTests(unittest.TestCase):
         for name, changed in mutations.items():
             self.assertNotEqual(changed, rust, name)
             with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
-                CHECKER.validate_profile5_schema(schema, changed)
+                CHECKER.validate_profile5_schema(schema, changed, blob_runtime)
+
+        runtime_mutations = {
+            "native record zero-length bound": blob_runtime.replace(
+                "if encoded_len == 0", "if encoded_len == 1", 1
+            ),
+            "native record maximum bound": blob_runtime.replace(
+                "aster_mesh::BLOB_STREAM_SEGMENT_BYTES\n                        + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES",
+                "aster_mesh::BLOB_STREAM_SEGMENT_BYTES",
+                1,
+            ),
+            "native record prefix removal": blob_runtime.replace(
+                ".open_encoded(&record[4..])", ".open_encoded(&record[3..])", 1
+            ),
+        }
+        for name, changed in runtime_mutations.items():
+            self.assertNotEqual(changed, blob_runtime, name)
+            with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
+                CHECKER.validate_profile5_schema(schema, rust, changed)
 
     def test_profile_five_encoder_enum_and_minimum_drift_fail(self) -> None:
         root = CHECKER_PATH.parents[1]
@@ -1218,16 +1237,6 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 r"OPEN encoder validator differs at Some\(d\) => \{ o\.push\(1\)",
             ),
             (
-                "ABX1 nonempty carrier encoder predicate",
-                rust.replace("if self.carriers.is_empty()", "if false", 1),
-                r"ABX1 validator differs at self\.carriers\.is_empty\(\)",
-            ),
-            (
-                "ABX1 nonempty carrier-record encoder predicate",
-                rust.replace("if carrier.is_empty()", "if false", 1),
-                r"ABX1 validator differs at carrier\.is_empty\(\)",
-            ),
-            (
                 "ASD1 nonempty protected-header encoder predicate",
                 rust.replace("if protected_header.is_empty()", "if false", 1),
                 r"ASD1 validator differs at protected_header\.is_empty\(\)",
@@ -1246,6 +1255,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
             "crates/aster-core/src/transfer_profile.rs",
             "crates/aster-node/src/application/blob.rs",
             "crates/aster-core/src/blob.rs",
+            "crates/aster-core/src/model.rs",
+            "crates/aster-core/src/bridge.rs",
             "crates/aster-core/src/blob_stream.rs",
             "crates/aster-node/src/stream_transfer.rs",
             "crates/aster-iroh/src/lib.rs",
@@ -1253,16 +1264,16 @@ class ProtocolVersionContractTests(unittest.TestCase):
         ]
         sources = [(root / path).read_text() for path in paths]
         damaged = list(sources)
-        damaged[3] = damaged[3].replace(
-            "pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = MAX_BLOB_CHUNKS",
-            "pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = 8_589_934_592 + 0 * MAX_BLOB_CHUNKS",
+        damaged[6] = damaged[6].replace(
+            "pub(crate) const PROFILE5_MAX_PACK_WIRE_BYTES: u64 = aster_mesh::MAX_BLOB_STREAM_BYTES",
+            "pub(crate) const PROFILE5_MAX_PACK_WIRE_BYTES: u64 = 8_000_000_000",
             1,
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "executable profile 5 limits"):
             CHECKER.validate_executable_profile_contract(*damaged)
         damaged = list(sources)
-        damaged[6] = damaged[6].replace(
-            "let profile_ceiling = aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES;",
+        damaged[8] = damaged[8].replace(
+            "let profile_ceiling = blob_pack_wire_len(aster_mesh::MAX_BLOB_STREAM_BYTES)",
             "let profile_ceiling = 8u64 * 1024 * 1024 * 1024;",
             1,
         )
@@ -1283,8 +1294,13 @@ class ProtocolVersionContractTests(unittest.TestCase):
             elif payload.startswith(b"ASD1"):
                 protected_len = int.from_bytes(payload[4:8], "big")
                 self.assertTrue(payload[8:8 + protected_len].startswith(b"ASTRFR01"))
-                self.assertTrue(payload[8 + protected_len:].startswith(b"ABX1"))
-                self.assertLessEqual(len(payload), 1_050_632)
+                native_record = payload[8 + protected_len:]
+                self.assertEqual(
+                    int.from_bytes(native_record[:4], "big"), len(native_record) - 4
+                )
+                self.assertTrue(native_record[4:].startswith(b"ASTRBS02"))
+                ORACLE.inspect_native_record(native_record)
+                self.assertLessEqual(len(payload), 1_050_766)
             else:
                 self.assertTrue(payload.startswith(b"AST1"), seed)
                 self.assertIn(payload[4], (0, 1))
@@ -1312,12 +1328,23 @@ class ProtocolVersionContractTests(unittest.TestCase):
             scratch = Path(directory)
             target = scratch / "fuzz/corpus/stream_transfer_decode"
             shutil.copytree(root / "fuzz/corpus/stream_transfer_decode", target)
+            core_target = scratch / "crates/aster-core/src"
+            core_target.mkdir(parents=True)
+            shutil.copy2(
+                root / "crates/aster-core/src/blob_stream.rs",
+                core_target / "blob_stream.rs",
+            )
             seed = target / "profile5-transcript-empty.bin"
             payload = bytearray(seed.read_bytes())
             payload[4] = 0
             seed.write_bytes(payload)
             with self.assertRaisesRegex(CHECKER.ContractViolation, "flow differs"):
-                CHECKER.validate_profile5_schema(schema, rust, scratch)
+                blob_runtime = (
+                    root / "crates/aster-node/src/runtime/blob_stream.rs"
+                ).read_text()
+                CHECKER.validate_profile5_schema(
+                    schema, rust, blob_runtime, root=scratch
+                )
 
     def test_profile_five_oracle_and_vector_drift_fail(self) -> None:
         root = CHECKER_PATH.parents[1]

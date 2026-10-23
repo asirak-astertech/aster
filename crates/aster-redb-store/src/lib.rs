@@ -5280,29 +5280,6 @@ struct BlobDepotTestCounters {
     full_completion_rechecks: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-#[derive(Default)]
-struct Profile5BatchTestCounters {
-    sender_carrier_reads: std::sync::atomic::AtomicU64,
-    sender_carrier_read_fail_at: std::sync::atomic::AtomicU64,
-    durable_batches: std::sync::atomic::AtomicU64,
-    installed_carriers: std::sync::atomic::AtomicU64,
-    source_stage_write_begins: std::sync::atomic::AtomicU64,
-    source_stage_write_commits: std::sync::atomic::AtomicU64,
-    receipt_reservation_write_begins: std::sync::atomic::AtomicU64,
-    receipt_reservation_write_commits: std::sync::atomic::AtomicU64,
-    extent_write_begins: std::sync::atomic::AtomicU64,
-    extent_write_commits: std::sync::atomic::AtomicU64,
-    promotion_write_begins: std::sync::atomic::AtomicU64,
-    promotion_write_commits: std::sync::atomic::AtomicU64,
-    receipt_cleanup_write_begins: std::sync::atomic::AtomicU64,
-    receipt_cleanup_write_commits: std::sync::atomic::AtomicU64,
-    fallback_activation_write_begins: std::sync::atomic::AtomicU64,
-    fallback_activation_write_commits: std::sync::atomic::AtomicU64,
-    temp_file_syncs: std::sync::atomic::AtomicU64,
-    parent_directory_syncs: std::sync::atomic::AtomicU64,
-}
-
 #[cfg(test)]
 type BlobCarrierRangePostReadGate = (
     std::sync::mpsc::SyncSender<()>,
@@ -5313,12 +5290,6 @@ type BlobCarrierRangePostReadGate = (
 type BlobCarrierCommitPostSnapshotGate = (
     std::sync::mpsc::SyncSender<()>,
     std::sync::mpsc::Receiver<()>,
-);
-
-#[cfg(any(test, feature = "test-utils"))]
-type Profile5BatchPrecommitGate = (
-    std::sync::mpsc::SyncSender<()>,
-    std::sync::mpsc::Receiver<bool>,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5357,10 +5328,6 @@ pub struct Store {
     blob_depot_owner_binding: [u8; 32],
     #[cfg(test)]
     blob_depot_test_counters: BlobDepotTestCounters,
-    #[cfg(any(test, feature = "test-utils"))]
-    profile5_batch_test_counters: Profile5BatchTestCounters,
-    #[cfg(any(test, feature = "test-utils"))]
-    profile5_batch_precommit_gate: std::sync::Mutex<Option<Profile5BatchPrecommitGate>>,
     #[cfg(test)]
     blob_carrier_range_post_read_gate: std::sync::Mutex<Option<BlobCarrierRangePostReadGate>>,
     #[cfg(test)]
@@ -6499,10 +6466,6 @@ impl Store {
             blob_depot_owner_binding,
             #[cfg(test)]
             blob_depot_test_counters: BlobDepotTestCounters::default(),
-            #[cfg(any(test, feature = "test-utils"))]
-            profile5_batch_test_counters: Profile5BatchTestCounters::default(),
-            #[cfg(any(test, feature = "test-utils"))]
-            profile5_batch_precommit_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             blob_carrier_range_post_read_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -6873,10 +6836,6 @@ impl Store {
             blob_depot_owner_binding: _,
             #[cfg(test)]
                 blob_depot_test_counters: _,
-            #[cfg(any(test, feature = "test-utils"))]
-                profile5_batch_test_counters: _,
-            #[cfg(any(test, feature = "test-utils"))]
-                profile5_batch_precommit_gate: _,
             #[cfg(test)]
                 blob_carrier_range_post_read_gate: _,
             #[cfg(test)]

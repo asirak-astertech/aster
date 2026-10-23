@@ -3175,6 +3175,8 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::PendingSourceMissing
         | BlobStoreError::VariantDeleting
         | BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
+        BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema
+        | BlobStoreError::UnsupportedProfile5PackSchema => ApplicationErrorKind::LegacyState,
         BlobStoreError::Verification(_)
         | BlobStoreError::UnsupportedExperimentalBlobStreamSchema
         | BlobStoreError::SchemaInvariant(_)

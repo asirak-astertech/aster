@@ -5,7 +5,7 @@ application publish through selected-contact transfer and receiver-local read.
 It is engineering validation, not a production deployment or release
 qualification procedure.
 
-The current receiver settlement, receipt, and timeout contract is machine
+The current receiver settlement, durable-resume, and timeout contract is machine
 checked:
 
 <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
@@ -17,64 +17,59 @@ checked:
     "authenticated_finish_and_content_verification",
     "canonical_apply_promotion",
     "result",
-    "ack",
-    "receipt_cleanup"
+    "result_ack_or_eof_attempt_settlement"
   ],
-  "available_before_settlement_cleanup": true,
-  "receipt_key": [
-    "receiving_mission_authority",
-    "canonical_source"
+  "available_before_attempt_settlement": true,
+  "durable_resume_authority": [
+    "lifecycle_owned_provisional_source_or_upload_state",
+    "native_pack_checkpoint_journal"
   ],
-  "receipt_persists_attempt_nonce": false,
-  "sender_hard_deadline_basis": "exact_canonical_wire_length",
+  "attempt_settlement_owns_durable_resume": false,
+  "sender_hard_deadline_basis": "exact_native_pack_wire_length",
   "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+  "contact_no_progress_timeout_seconds": 30,
+  "contact_progress_signal": "completed_authenticated_profile5_operation",
   "authenticated_progress_timeout_seconds": 120,
-  "plaintext_chunk_bytes": 65536,
-  "encoded_record_max_bytes": 66215,
-  "extent_max_bytes": 1048576,
+  "plaintext_segment_bytes": 1048576,
+  "encoded_record_max_bytes": 1048706,
+  "length_prefixed_data_max_bytes": 1048710,
   "checkpoint_batch_max_bytes": 134217728,
-  "pre_profile5_canonical_blob_profile5_eligible": true,
   "capacity_authority": "configured_blob_depot_limits"
 }
 ```
 <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-The receiver verifies authenticated FINISH and content, applies the canonical promotion, sends RESULT, receives ACK, and then removes the durable receipt. AVAILABLE may precede settlement cleanup. The receipt is keyed by receiving mission authority and canonical source and does not persist an attempt nonce. The sender hard deadline uses exact canonical wire length; before authenticated OPEN, the receiver uses the profile wire ceiling. Authenticated progress times out after 120 seconds. The 65,536-byte plaintext chunk, 66,215-byte encoded-record ceiling, 1,048,576-byte extent ceiling, and 134,217,728-byte checkpoint ceiling are distinct. Pre-profile-5 canonical Blobs remain profile-5 eligible. Provisional, pending, and completed bytes share configured Blob depot limits.
+The receiver verifies authenticated FINISH and content, atomically promotes the native pack before sending RESULT. RESULT_ACK or EOF settles only the transport attempt and does not own durable resume state. AVAILABLE may precede attempt settlement. Durable resume authority is lifecycle-owned provisional source or upload state plus the native pack checkpoint journal. The sender hard deadline uses exact native-pack wire length; before authenticated OPEN, the receiver uses the profile wire ceiling. A contact with no completed authenticated Profile-5 operation expires after 30 seconds; each such operation refreshes that outer watchdog. An individual authenticated Profile-5 operation times out after 120 seconds of inactivity, and the size-derived hard attempt bound remains absolute. The 1,048,576-byte plaintext segment, 1,048,706-byte ASTRBS02 record ceiling, 1,048,710-byte length-prefixed DATA body ceiling, and 134,217,728-byte checkpoint ceiling are distinct. Provisional upload state, lifecycle-owned provisional source state, native pack checkpoint journals, and completed native packs share configured Blob depot limits.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 ## Understand the selected profile
 
-Profile 5 is the semantic-v9 selection. It is not a migration back to v8 and
-does not introduce a second durable Blob representation. Semantic v7/v8 peers
-retain profile 4 for compatibility; a semantic-v9 peer selects profile 5.
-`ASTRBT01` canonical records and the Blob manifest remain the durable
-representation. The former `ASTRBS02` provisional upload-pack format is local
-staging only and has no semantic-v9 wire meaning.
+Profile 5 is the semantic-v9 selection. It is not a migration back to v8.
+Semantic v7/v8 peers retain profile 4 for compatibility; a semantic-v9 peer
+selects profile 5. Profile 5 stores and transfers the same append-only,
+authenticated `ASTRBS02` pack records. It does not repack, re-encrypt, or
+translate them through the profile-4 `ASTRBT01`/`ABX1` carrier representation.
 
 Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects
-profile 5. Profile 5 size terms: 65,536-byte canonical plaintext chunk;
-66,215-byte maximum encoded canonical chunk record; 1,048,576-byte maximum
-ABX1 batched extent. Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
-Canonical legacy eligibility: every pre-profile-5 canonical Blob remains
-eligible for profile 5 after upgrade. Unified capacity: provisional uploads,
-pending network receipts, and completed canonical variants share the
-configured Blob depot limits.
+profile 5. Profile 5 size terms: 1,048,576 plaintext bytes per segment;
+1,048,706 bytes per maximum encoded `ASTRBS02` record; 1,048,710 bytes per
+maximum length-prefixed DATA body. The checkpoint maximum is 134,217,728 bytes
+(128 MiB). Provisional uploads, lifecycle-owned provisional network sources,
+and completed native packs share the configured Blob depot limits.
 
 | Selection | Object maximum | Canonical chunks | Authenticated source |
 | --- | ---: | ---: | ---: |
 | semantic v7/v8, profile 4 | 64 MiB | 1,024 | 1 MiB |
-| semantic v9, profile 5 | 8 GiB | 131,072 | 16 MiB |
+| semantic v9, profile 5 | 8 GiB | 8,192 native segments | 401,902 bytes |
 
-Both profiles use canonical 64-KiB plaintext chunks. A complete length-prefixed
-`ASTRBT01` carrier is at most 66,215 bytes. Profile-5 DATA packs one or more
-whole carriers into one `ABX1` extent no larger than 1 MiB, below Iroh's 2-MiB
-exchange-frame ceiling. SOURCE is sent in records no larger than 1 MiB, with a
-16-MiB authenticated-open maximum. The receiver selects a checkpoint batch no
-larger than 128 MiB.
+Profile 4 retains canonical 64-KiB chunks. Profile 5 instead transfers one
+complete length-prefixed `ASTRBS02` record per DATA body. SOURCE is sent in
+records no larger than 1 MiB, with a 16-MiB authenticated-open maximum. The
+receiver selects a checkpoint batch no larger than 128 MiB.
 
 The bounded exchange is:
 
 ```text
-PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT
+PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT
      -> FINISH -> RESULT -> ACK
 ```
 
@@ -94,13 +89,14 @@ become available before the transport attempt has fully closed.
 Every attempt is gated independently by authenticated peer identity, current
 Blob interest, route authorization, content proof, and nonrevocation. Status is
 canonical-first: `blob-status` reports receiver-local durable publication
-state, not carrier connectivity or source-side intent. The durable receipt
-binds the verified plan, depot/store authority, and durable checkpoint. Its
-checkpoint includes generation, chunk
+state, not carrier connectivity or source-side intent. Lifecycle-owned
+provisional source or upload state binds the verified plan and depot/store
+authority; the native pack checkpoint journal records generation, segment
 index, plaintext offset, pack offset, and wire offset. A fresh instance or
 reopen of the same single contact-agreed adapter therefore resumes the same
-publication without translating durable state. Cross-transport selection and
-failover are not implemented.
+publication without translating durable state. RESULT_ACK or EOF settles only
+the transport attempt after atomic promotion and owns no durable resume state.
+Cross-transport selection and failover are not implemented.
 
 The current adapter is Iroh QUIC. The adapter interface is carrier-independent
 and retains the bindings needed by a reliable ordered full-duplex non-IP
@@ -130,19 +126,53 @@ exchange. Preserve operation keys and exact intent so an uncertain publication
 can converge through the node's durable upload authority. No Blob content or
 database migration is required by this application-wire change.
 
+The first server response is `PublishBlobAccepted`. Its nonzero 32-byte
+`publication_id` exists before data byte zero and must be retained by native
+clients. Every checkpoint belongs to that same publication. The terminal
+result must return the identical ID. A client may use it with
+`InspectBlobPublication` while upload is still in progress. The phases are
+receiver-local durable state: `AWAITING_DATA`, `RECEIVING`,
+`READY_TO_FINALIZE`, `AVAILABLE`, or `EXPIRED_OR_RETIRED`. Transfer-byte
+counters use one domain throughout: exact length-prefixed `ASTRBS02` pack
+payload bytes. They are not storage reservation or filesystem byte counts.
+`asterctl blob-publish` emits its one result only after completion, so shell
+workflows obtain `publicationId` from that result; direct RPC clients can
+observe it at acceptance.
+
+### Reset or reimport an incompatible development depot
+
+The native Profile-5 pack is an unreleased storage format and is not migrated
+from earlier experimental pack encodings. On startup, an incompatible pack row
+fails closed with `unsupported Profile-5 pack schema; reset the development
+depot or reimport Blob data`. Stop the node before recovery. If the old Blob
+bytes remain authoritative elsewhere, export them with the build that created
+the depot, start the current build with a new empty depot, and republish the
+files with their original application operation keys and metadata. Otherwise,
+archive the old depot for diagnosis and initialize a new empty development
+depot. Never delete or rewrite individual database rows: that would bypass
+lifecycle, capacity, and physical-lineage accounting.
+
 ## Capacity and timeout bounds
 
-The local canonical finalization pool has two workers and two queued jobs.
-That bound limits concurrent finalization, not disk consumption. Depot
+The local native-pack promotion pool has two workers and two queued jobs.
+That bound limits concurrent promotion, not disk consumption. Depot
 reservations, completed provisional upload staging, database/journal
-allocation, and finalizers may overlap. Staging is not a second publication
-authority: only promotion of the canonical manifest plus ASTRBT01 carriers
+allocation, and promotion workers may overlap. Staging is not a second publication
+authority: only atomic promotion of the completed authenticated native pack
 creates the Blob publication. Check both state and depot filesystems and leave
 operational reserve; an observed capacity snapshot is not a reservation.
 
 Profile-5 transfer has separate authenticated-progress and absolute attempt
 bounds. Their exact current inputs and values are generated from the typed
 capability record at the top of this runbook.
+
+The node's general 30-second contact bound is a no-progress watchdog, not a
+maximum object-transfer duration. Only completion of an authenticated
+Profile-5 transport operation refreshes it; unauthenticated bytes do not.
+Profile 5 separately retains its 120-second operation-idle timeout and
+size-derived hard attempt deadline. This keeps a stalled contact bounded while
+allowing one healthy large-object contact to run to settlement without forced
+30-second resume churn.
 
 The legacy ten-minute attempt constant is not the normal-success deadline for
 profile 5. CLI/agent RPC deadlines are a separate local application concern;
@@ -180,7 +210,8 @@ and operation key. A different key means a different application operation.
 The agent caps a Blob RPC at 15 minutes, so a larger client `--timeout` cannot
 extend one local upload. If the cap is reached, retry the exact publication;
 operation-key idempotency returns or resumes its durable local outcome. Peer
-synchronization is separate and resumes from the receiver receipt.
+synchronization is separate and resumes from lifecycle-owned provisional
+source state plus the native pack checkpoint journal.
 
 Run status on the destination node. It is safe to start this after local
 publication and before or after a peer becomes reachable:
@@ -212,9 +243,10 @@ sha256sum "$OUTPUT"
 ```
 
 An interrupted CLI download removes its staged bytes and currently restarts at
-zero. That is independent of node-to-node receipt resume, which continues from
-the receiver's authenticated durable checkpoint after a fresh instance or
-reopen of the same single contact-agreed adapter. If the 15-minute read RPC cap
+zero. That is independent of node-to-node native-pack resume, which continues
+from lifecycle-owned provisional source state plus the native pack checkpoint
+journal after a fresh instance or reopen of the same single contact-agreed
+adapter. If the 15-minute read RPC cap
 is reached, confirm `blob-status` still
 reports `AVAILABLE`, remove any owner-only abandoned staging file after
 inspection, and retry the read; the CLI download itself does not resume.
@@ -254,10 +286,15 @@ rg 'profile|carrier_path|checkpoint|interest|route|content|revok|timeout' \
   /path/to/node.log
 ```
 
-`blob_stream_sent_bytes`, `blob_stream_received_bytes`, and
-`blob_stream_resumed_bytes` are attempt accounting. Checkpoints and partitions
-show durable progress. Pipeline service counters overlap; do not add them to
-derive elapsed time. A CONTACT line alone is not proof of publication receipt.
+`blob_stream_sent_bytes` and `blob_stream_received_bytes` count bytes actually
+carried by the contact. `blob_stream_resumed_bytes` counts durable prefixes
+skipped across every Profile-5 exchange aggregated into that contact. It can
+therefore equal a complete object when a later reconciliation round observes
+an already-present publication; that is a zero-byte exact retry, not evidence
+that the preceding fresh transfer skipped the object. Checkpoints and
+partitions show durable progress. Pipeline service counters overlap; do not add
+them to derive elapsed time. A CONTACT line alone is not proof of publication
+receipt.
 
 ## Measure transport and end-to-end performance
 
@@ -265,28 +302,38 @@ Build the current transport example and retain its hash:
 
 ```sh
 cargo build --locked --release -p aster-node \
+  --features device-validation \
   --example blob_stream_transport_benchmark
 BIN=target/release/examples/blob_stream_transport_benchmark
 sha256sum "$BIN"
 ```
 
-Run a local 1-GiB control:
+Use a persistent filesystem with enough free space for the completed source and
+receive packs. CM4 `/tmp` is commonly a small tmpfs, so use `/var/tmp` for the
+full-size control. In separate terminals, start the receiver first:
 
 ```sh
-"$BIN" loopback 1073741824
+TMPDIR=/var/tmp "$BIN" pack-receive 127.0.0.1:18293 1073741824
+TMPDIR=/var/tmp "$BIN" pack-send \
+  127.0.0.1:0 127.0.0.1:18293 1073741824
 ```
 
 Run the receiver first on one device and the sender on another. Bind Aster to
 the network under test; retaining ZeroTier for remote administration does not
-prove that payloads used WLAN.
+prove that payloads used WLAN. The device-validation receiver waits up to five
+minutes for the completed source pack to be prepared; this is harness
+orchestration only. Production local publication does not wait for a peer, and
+the production contact listener has node lifetime rather than Blob-attempt
+lifetime.
 
 ```sh
-# receiver
-./blob_stream_transport_benchmark receive 192.168.60.80:18293 1073741824
+# receiver: rpi4-1
+TMPDIR=/var/tmp ./blob_stream_transport_benchmark \
+  pack-receive 192.168.60.79:18293 1073741824
 
-# sender
-./blob_stream_transport_benchmark send \
-  192.168.60.79:0 192.168.60.80:18293 1073741824
+# sender: rpi4-2
+TMPDIR=/var/tmp ./blob_stream_transport_benchmark pack-send \
+  192.168.60.80:0 192.168.60.79:18293 1073741824
 ```
 
 Capture an adjacent raw-file baseline on the same selected interface, for
@@ -294,6 +341,24 @@ example with `iperf3` or an audited `nc` plus source/receiver `sha256sum`.
 Compare raw throughput, the transport example, local publish, network
 replication, and receiver read separately; do not collapse those stages into
 one unexplained rate.
+
+For a composed selected-node run, cross-build or build the `blob_benchmark`
+example and retain its SHA-256. Its named 1-GiB campaign records first
+visibility, contact settlement, connected shutdown, restart, and full download
+verification as separate intervals:
+
+```sh
+python3 tools/blob_benchmark.py \
+  --campaign profile5-1g \
+  --variant candidate /absolute/repo /absolute/blob_benchmark \
+  --output /durable/new-profile5-1g-results \
+  --state /scratch/new-profile5-1g-state
+```
+
+Do not use `total_ns` alone as operational latency: it deliberately includes
+validation-only shutdown and restart work. Use `publish_to_visible_ns` for the
+first receiver-readable boundary and `publish_to_settled_ns` when terminal
+contact accounting is also required.
 
 Before device work, run the focused contract checks:
 

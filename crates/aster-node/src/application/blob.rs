@@ -22,33 +22,36 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use aster_mesh::prepare_blob;
 use aster_mesh::{
-    BLOB_STREAM_SEGMENT_BYTES, BlobChunkRecord, BlobContentVerification, BlobError,
-    BlobId as CoreBlobId, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
-    BlobPublicationStreamId, BlobStore as CoreBlobStore, BlobStreamFinalCommitment, BlobStreamOpen,
-    ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
-    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority,
-    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, SealedCanonicalBlobChunk, Topic,
-    VerifiedBlobStreamOpen, local_blob_publication_stream_id, prepare_blob,
+    BLOB_STREAM_SEGMENT_BYTES, BlobError, BlobId as CoreBlobId, BlobMetadata as CoreBlobMetadata,
+    BlobPublicationStreamId, BlobStreamFinalCommitment, BlobStreamOpen,
+    BlobStreamPlaintextFrontier, BlobStreamPublication, CustodySample, EncryptedBlobStreamSegment,
+    MAX_BLOB_CHUNKS, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, NodeId, Priority,
+    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen,
+    VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource,
+    local_blob_publication_stream_id,
 };
 use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
 use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
-    BlobDepotCompletion, BlobOperationKey, BlobOperationOwner, BlobOperationRequest,
-    BlobPublicationDisposition, BlobPublicationIntent, BlobReadPlan, BlobSemanticId,
+    BlobOperationKey, BlobOperationOwner, BlobPublicationDisposition, BlobReadPlan, BlobSemanticId,
     BlobSourceProjection, BlobSourceRetention, BlobStoreError, BlobStoreStats,
     BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
-    BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobUploadRequest,
-    BlobUploadReservation, BlobVariantId, ControlPolicySnapshot, ControlTransferId,
-    MAX_BLOB_OPERATION_KEY_BYTES, MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN,
-    MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
+    BlobTransferId, BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot,
+    BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation, ControlPolicySnapshot,
+    ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES, MAX_BLOB_POLL_DELIVERIES,
+    MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, Store, StoreError,
+    StoreLimits, StoredBlob,
 };
 pub use aster_redb_store::{
     BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobRetirementReason,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -59,215 +62,20 @@ use super::blob_stream::{
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
-    application_error, store_error_kind,
+    application_error,
 };
-#[cfg(test)]
-use crate::stream_pipeline::{PipelineStage, PipelineTestProbe, StreamJobId};
 use crate::{
     NodeError,
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, NodeCustodyClock, STORE_FILE, StartupEventVerification,
-        blob_capacity_gc_target, cache_authenticated_blob_route_claim, ensure_principal_active,
-        ensure_state_accepts_normal_operation, equivalent_blob_capacity_error,
-        open_replayed_verifier, open_startup_event_verifier_and_cache,
-        recover_local_blob_capacity_after_cleanup, refresh_application_policy,
+        blob_capacity_gc_target, ensure_principal_active, ensure_state_accepts_normal_operation,
+        equivalent_blob_capacity_error, open_replayed_verifier,
+        open_startup_event_verifier_and_cache, recover_local_blob_capacity_after_cleanup,
+        refresh_application_policy,
     },
-    stream_pipeline::{
-        PipelineLimits, PipelineReport, StreamJobId as PipelineJobId, StreamPartition,
-        run_ordered_blocking_pipeline,
-    },
+    stream_pipeline::{FixedPartitionMapPool, MappedPartition, PipelineError, StreamPartition},
 };
-
-#[derive(Clone, Eq, PartialEq)]
-struct BlobAdmissionRecoveryContext {
-    priority: Priority,
-    topic: Topic,
-    scope: Scope,
-    blob_id: CoreBlobId,
-    depot_chunks: u64,
-    depot_variants: u64,
-}
-
-enum BlobPublishAttemptError {
-    Application(ApplicationError),
-    Capacity {
-        error: StoreError,
-        context: BlobAdmissionRecoveryContext,
-    },
-}
-
-impl From<ApplicationError> for BlobPublishAttemptError {
-    fn from(error: ApplicationError) -> Self {
-        Self::Application(error)
-    }
-}
-
-impl BlobPublishAttemptError {
-    fn into_application(self) -> ApplicationError {
-        match self {
-            Self::Application(error) => error,
-            Self::Capacity { error, .. } => blob_store_application_error("blob publish", error),
-        }
-    }
-}
-
-struct AdmittedFile<'a> {
-    file: &'a mut fs::File,
-    admission: &'a AtomicBool,
-    max_len: u64,
-    #[cfg(test)]
-    pass_two_gate: Option<LivePublishPassTwoTestGate>,
-    #[cfg(test)]
-    expected_len: u64,
-    #[cfg(test)]
-    total_bytes_read: u64,
-    #[cfg(test)]
-    fail_retry_rewind: bool,
-    #[cfg(test)]
-    start_zero_seeks: u8,
-}
-
-#[cfg(test)]
-struct LivePublishPassTwoTestGate {
-    reached: std::sync::mpsc::SyncSender<()>,
-    release: std::sync::mpsc::Receiver<()>,
-}
-
-struct LivePublishContext<'a> {
-    admission: &'a AtomicBool,
-    length_probe: fs::File,
-    expected_len: u64,
-    fatal: &'a mut Option<NodeError>,
-}
-
-impl LivePublishContext<'_> {
-    fn require_admission(&self) -> Result<(), ApplicationError> {
-        if self.admission.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(actor_unavailable("blob publish"))
-        }
-    }
-
-    fn require_exact_len(&self, observed: u64) -> Result<(), ApplicationError> {
-        let current = self
-            .length_probe
-            .metadata()
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        if !current.is_file() || current.len() != self.expected_len || observed != self.expected_len
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Conflict,
-                "blob publish",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl AdmittedFile<'_> {
-    fn require_admission(&self) -> std::io::Result<()> {
-        if self.admission.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "live Blob worker admission closed",
-            ))
-        }
-    }
-}
-
-impl Read for AdmittedFile<'_> {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        self.require_admission()?;
-        #[cfg(test)]
-        if self.pass_two_gate.is_some()
-            && self.total_bytes_read
-                >= self
-                    .expected_len
-                    .saturating_add(u64::from(SELECTED_BLOB_CHUNK_SIZE))
-        {
-            let gate = self
-                .pass_two_gate
-                .take()
-                .expect("present live Blob pass-two gate");
-            gate.reached.send(()).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "live Blob pass-two observer stopped",
-                )
-            })?;
-            gate.release
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("live Blob pass-two release deadline: {error}"),
-                    )
-                })?;
-        }
-        if output.is_empty() {
-            return Ok(0);
-        }
-        let position = self.file.stream_position()?;
-        if position > self.max_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "live Blob source crossed its byte ceiling",
-            ));
-        }
-        let remaining = self.max_len - position;
-        if remaining == 0 {
-            let mut probe = Zeroizing::new([0u8; 1]);
-            return match self.file.read(&mut probe[..])? {
-                0 => Ok(0),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::FileTooLarge,
-                    "live Blob source grew beyond its byte ceiling",
-                )),
-            };
-        }
-        let allowed = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(output.len());
-        let read = self.file.read(&mut output[..allowed])?;
-        #[cfg(test)]
-        {
-            self.total_bytes_read = self
-                .total_bytes_read
-                .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
-                .ok_or_else(|| std::io::Error::other("live Blob test read accounting overflow"))?;
-        }
-        Ok(read)
-    }
-}
-
-impl Seek for AdmittedFile<'_> {
-    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.require_admission()?;
-        #[cfg(test)]
-        if matches!(position, std::io::SeekFrom::Start(0)) {
-            self.start_zero_seeks = self.start_zero_seeks.saturating_add(1);
-            if self.fail_retry_rewind && self.start_zero_seeks == 3 {
-                self.fail_retry_rewind = false;
-                return Err(std::io::Error::other(
-                    "injected live Blob retry rewind failure",
-                ));
-            }
-        }
-        let offset = self.file.seek(position)?;
-        if offset > self.max_len {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "live Blob source crossed its byte ceiling",
-            ))
-        } else {
-            Ok(offset)
-        }
-    }
-}
 
 /// Maximum plaintext accepted by one live Blob publication.
 pub const MAX_SELECTED_LIVE_BLOB_BYTES: u64 = MAX_NETWORK_BLOB_BYTES;
@@ -276,16 +84,14 @@ pub const MAX_SELECTED_LIVE_BLOB_BYTES: u64 = MAX_NETWORK_BLOB_BYTES;
 /// protocol. The legacy live-file/profile-4 path retains its 64 MiB ceiling.
 pub const MAX_SELECTED_BLOB_STREAM_BYTES: u64 = MAX_BLOB_CHUNKS * SELECTED_BLOB_CHUNK_SIZE as u64;
 
-/// Maximum canonical 64 KiB chunks accepted by one live Blob publication.
+/// Historical Profile-4 64-KiB chunks represented by the live compatibility limit.
 pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
 
 /// Maximum plaintext returned by one live Blob page read.
 ///
-/// Eight canonical 64-KiB chunks amortize application-protocol and policy
+/// Eight 64-KiB application-page quanta amortize protocol and policy
 /// checks while keeping each encoded agent response below its 1-MiB ceiling.
 pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 8 * SELECTED_BLOB_CHUNK_SIZE as usize;
-const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
-    MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -300,8 +106,11 @@ const MAX_SELECTED_BLOB_PLAN_RETRIES: usize = 4;
 
 /// Stable selected-profile identity of immutable Blob bytes and identity metadata.
 ///
-/// The selected profile fixes chunking at 64 KiB. Media type and schema bytes
-/// are committed by this identity, so changing either produces another ID.
+/// The historical profile-4 content identity uses a fixed 64-KiB logical
+/// projection. Profile 5 transfers its separately authenticated completed pack
+/// as 1-MiB plaintext segments and does not recreate that projection on the
+/// wire. Media type and schema bytes are committed by this identity, so changing
+/// either produces another ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobId([u8; 32]);
 
@@ -738,6 +547,28 @@ pub struct BlobPublicationInspection {
     pub total_units: u64,
     pub durable_units: u64,
     pub blob_id: Option<BlobId>,
+}
+
+fn retired_blob_publication_inspection(
+    publication_id: BlobStreamPublicationId,
+) -> BlobPublicationInspection {
+    BlobPublicationInspection {
+        publication_id,
+        phase: BlobPublicationPhase::ExpiredOrRetired,
+        plaintext_total_bytes: 0,
+        durable_plaintext_bytes: 0,
+        transfer_total_bytes: 0,
+        durable_transfer_bytes: 0,
+        total_units: 0,
+        durable_units: 0,
+        blob_id: None,
+    }
+}
+
+fn profile5_transfer_total_bytes(total_len: u64) -> Result<u64, ApplicationError> {
+    crate::stream_transfer::blob_pack_wire_len(total_len).map_err(|_| {
+        ApplicationError::new(ApplicationErrorKind::Integrity, "blob publication status")
+    })
 }
 
 /// Local durable Blob capacity observations. These counters do not reserve space.
@@ -1524,38 +1355,128 @@ impl SelectedBlobCommand {
     }
 }
 
-struct VerifiedStoredBlob {
-    blob: ContentVerifiedBlobEnvelope,
-    manifest_bytes: Vec<u8>,
-    semantic_id: BlobSemanticId,
-    acceptance_marker: u64,
-}
-
-struct VerifiedLiveBlob {
-    stored: VerifiedStoredBlob,
-    projection: BlobSourceProjection,
-    retention: BlobSourceRetention,
-    completion: BlobDepotCompletion,
-    sealed: Vec<u8>,
-    variant_id: aster_redb_store::BlobVariantId,
-}
-
 struct VerifiedProfile5LiveBlob {
     stored: StoredBlob,
     projection: BlobSourceProjection,
     retention: BlobSourceRetention,
-    open: VerifiedBlobStreamOpen,
+    publication: VerifiedBlobStreamPublication,
+    physical_open: VerifiedBlobStreamOpen,
     commitment: BlobStreamFinalCommitment,
 }
 
-struct VerifiedLiveCandidate {
-    semantic_id: BlobSemanticId,
-    transfer_id: aster_redb_store::BlobTransferId,
-    projection: BlobSourceProjection,
-    retention: BlobSourceRetention,
-    disposition: Option<BlobPublicationDisposition>,
-    policy_active: bool,
-    current_lineage: bool,
+const BLOB_READ_MAP_WORKERS: usize = 4;
+const BLOB_READ_PIPELINE_ITEMS: u64 = 4;
+
+struct OpenedBlobReadSegment {
+    offset: u64,
+    plaintext: Zeroizing<Vec<u8>>,
+}
+
+struct LocalBlobReadCache {
+    request: BlobReadRequest,
+    plan: BlobReadPlan,
+    selected: VerifiedProfile5LiveBlob,
+    reader: Option<aster_redb_store::Profile5PackReadSession>,
+    map_pool: Option<FixedPartitionMapPool<OpenedBlobReadSegment>>,
+    mapped: BTreeMap<u64, MappedPartition<OpenedBlobReadSegment>>,
+    submitted_index: u64,
+    next_segment_index: u64,
+    segment_count: u64,
+    active_segment: Option<OpenedBlobReadSegment>,
+    active_position: usize,
+    next_offset: u64,
+    #[cfg(test)]
+    opened_segments: u64,
+}
+
+impl LocalBlobReadCache {
+    fn fill_pipeline(&mut self) -> Result<(), ApplicationError> {
+        while self.submitted_index < self.segment_count
+            && self.submitted_index.saturating_sub(self.next_segment_index)
+                < BLOB_READ_PIPELINE_ITEMS
+        {
+            let record = self
+                .reader
+                .as_mut()
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?
+                .next_record()
+                .map_err(|error| application_error("blob read page", error.into()))?
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?;
+            self.map_pool
+                .as_ref()
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?
+                .submit_unbudgeted(StreamPartition::new(
+                    self.submitted_index,
+                    record.into_bytes(),
+                ))
+                .map_err(blob_read_pipeline_error)?;
+            self.submitted_index = self.submitted_index.checked_add(1).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn next_opened_segment(&mut self) -> Result<OpenedBlobReadSegment, ApplicationError> {
+        while !self.mapped.contains_key(&self.next_segment_index) {
+            let mapped = self
+                .map_pool
+                .as_mut()
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?
+                .recv_mapped_blocking()
+                .map_err(blob_read_pipeline_error)?;
+            let index = mapped.index();
+            if index < self.next_segment_index
+                || index >= self.submitted_index
+                || self.mapped.insert(index, mapped).is_some()
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+        }
+        let mapped = self
+            .mapped
+            .remove(&self.next_segment_index)
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+            })?;
+        let opened = mapped.into_value();
+        let expected_offset = self
+            .next_segment_index
+            .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+            })?;
+        if opened.offset != expected_offset {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob read page",
+            ));
+        }
+        self.next_segment_index = self.next_segment_index.checked_add(1).ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+        })?;
+        #[cfg(test)]
+        {
+            self.opened_segments += 1;
+        }
+        self.fill_pipeline()?;
+        Ok(opened)
+    }
+}
+
+fn blob_read_pipeline_error(_error: PipelineError) -> ApplicationError {
+    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
 }
 
 struct VerifiedBlobDeliveryMetadata {
@@ -1571,12 +1492,6 @@ struct VerifiedBlobDeliveryMetadata {
     media_type: Option<String>,
     schema_id: Vec<u8>,
     acceptance_marker: u64,
-    storage: VerifiedBlobDeliveryStorage,
-}
-
-enum VerifiedBlobDeliveryStorage {
-    Legacy(BlobDepotCompletion),
-    Profile5(aster_redb_store::Profile5PackReadSession),
 }
 
 impl VerifiedBlobDeliveryMetadata {
@@ -1600,39 +1515,42 @@ impl VerifiedBlobDeliveryMetadata {
     }
 }
 
-// Two finalizers bound simultaneous metadata authentication and atomic
+// Two promotion workers bound simultaneous metadata authentication and atomic
 // promotion. The already-encrypted pack remains the only data representation.
-const BLOB_FINALIZE_WORKERS: usize = 2;
-const BLOB_FINALIZE_QUEUE_CAPACITY: usize = 2;
+const BLOB_PACK_PROMOTION_WORKERS: usize = 2;
+const BLOB_PACK_PROMOTION_QUEUE_CAPACITY: usize = 2;
 
-mod finalize_store {
+mod promotion_store {
     use super::*;
 
-    /// One attempted call across the complete finalizer-to-Store/helper
+    /// One attempted call across the complete promotion-worker-to-Store/helper
     /// boundary. These are orchestration operations, not nested redb calls.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) enum BlobFinalizeStoreOperation {
+    pub(super) enum BlobPackPromotionStoreOperation {
         ReplayAuthority,
         ReadControlHead,
         RefreshPolicy,
         ReserveProfile5Upload,
         CheckpointProfile5Pack,
         CompleteProfile5Pack,
+        ReadProfile5PackBinding,
         CommitProfile5Publication,
+        CacheProfile5Publication,
+        AbortProfile5Upload,
     }
 
-    /// Non-escaping Store authority for one finalizer job.
+    /// Non-escaping Store authority for one promotion job.
     ///
     /// Deliberately has no `Deref`, `AsRef<Store>`, or raw Store getter. Every
     /// top-level Store-backed action in `run_measured` must be named here.
-    pub(super) struct BlobFinalizeStore {
+    pub(super) struct BlobPackPromotionStore {
         inner: Arc<Store>,
         operations: AtomicU64,
         #[cfg(test)]
-        trace: std::sync::Mutex<Vec<BlobFinalizeStoreOperation>>,
+        trace: std::sync::Mutex<Vec<BlobPackPromotionStoreOperation>>,
     }
 
-    impl BlobFinalizeStore {
+    impl BlobPackPromotionStore {
         pub(super) fn new(inner: Arc<Store>) -> Self {
             Self {
                 inner,
@@ -1642,7 +1560,7 @@ mod finalize_store {
             }
         }
 
-        fn record(&self, operation: BlobFinalizeStoreOperation) {
+        fn record(&self, operation: BlobPackPromotionStoreOperation) {
             self.operations.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(test))]
             let _ = operation;
@@ -1658,7 +1576,7 @@ mod finalize_store {
         }
 
         #[cfg(test)]
-        pub(super) fn trace(&self) -> Vec<BlobFinalizeStoreOperation> {
+        pub(super) fn trace(&self) -> Vec<BlobPackPromotionStoreOperation> {
             self.trace
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1669,12 +1587,12 @@ mod finalize_store {
             &self,
             mission: &UnprotectedReferenceMission,
         ) -> Result<ReferenceEnvelopeSealer, NodeError> {
-            self.record(BlobFinalizeStoreOperation::ReplayAuthority);
+            self.record(BlobPackPromotionStoreOperation::ReplayAuthority);
             open_replayed_verifier(&self.inner, mission)
         }
 
         pub(super) fn control_head(&self) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
-            self.record(BlobFinalizeStoreOperation::ReadControlHead);
+            self.record(BlobPackPromotionStoreOperation::ReadControlHead);
             self.inner.control_head()
         }
 
@@ -1684,7 +1602,7 @@ mod finalize_store {
             verifier: &mut ReferenceEnvelopeSealer,
             verifier_head: &mut Option<(u64, ControlTransferId)>,
         ) -> Result<Option<ControlPolicySnapshot>, NodeError> {
-            self.record(BlobFinalizeStoreOperation::RefreshPolicy);
+            self.record(BlobPackPromotionStoreOperation::RefreshPolicy);
             refresh_application_policy(&self.inner, mission, verifier, verifier_head)
         }
 
@@ -1708,7 +1626,7 @@ mod finalize_store {
                 Option<&[u8]>,
             ) -> Result<(VerifiedBlobStreamOpen, Vec<u8>), StoreError>,
         {
-            self.record(BlobFinalizeStoreOperation::ReserveProfile5Upload);
+            self.record(BlobPackPromotionStoreOperation::ReserveProfile5Upload);
             self.inner
                 .reserve_profile5_upload_with_policy(policy, request, initial_custody, build)
         }
@@ -1720,7 +1638,7 @@ mod finalize_store {
             expected: aster_redb_store::BlobUploadCheckpoint,
             durable: aster_redb_store::pack::BlobPackCheckpoint,
         ) -> Result<aster_redb_store::BlobUploadCheckpoint, StoreError> {
-            self.record(BlobFinalizeStoreOperation::CheckpointProfile5Pack);
+            self.record(BlobPackPromotionStoreOperation::CheckpointProfile5Pack);
             self.inner
                 .checkpoint_blob_upload(policy, reservation, expected, durable)
         }
@@ -1734,7 +1652,7 @@ mod finalize_store {
             commitment: &aster_mesh::VerifiedBlobStreamFinalCommitment,
             lineage: aster_mesh::BlobStreamLineage,
         ) -> Result<aster_redb_store::BlobUploadCheckpoint, StoreError> {
-            self.record(BlobFinalizeStoreOperation::CompleteProfile5Pack);
+            self.record(BlobPackPromotionStoreOperation::CompleteProfile5Pack);
             self.inner.complete_profile5_upload_pack(
                 policy,
                 reservation,
@@ -1750,82 +1668,128 @@ mod finalize_store {
             policy: &ControlPolicySnapshot,
             reservation: &BlobUploadReservation,
             expected: &aster_redb_store::BlobUploadCheckpoint,
+            publication: &aster_mesh::VerifiedBlobStreamPublication,
             precommit_sample: Option<CustodySample>,
         ) -> Result<aster_redb_store::BlobOnceOutcome, StoreError> {
-            self.record(BlobFinalizeStoreOperation::CommitProfile5Publication);
-            self.inner.commit_profile5_upload_once_with_policy(
+            self.record(BlobPackPromotionStoreOperation::CommitProfile5Publication);
+            self.inner.commit_profile5_publication_once_with_policy(
                 policy,
                 reservation,
                 expected,
+                publication,
                 precommit_sample,
             )
+        }
+
+        pub(super) fn profile5_publication_binding(
+            &self,
+            reservation: &BlobUploadReservation,
+            expected: &aster_redb_store::BlobUploadCheckpoint,
+        ) -> Result<[u8; 32], StoreError> {
+            self.record(BlobPackPromotionStoreOperation::ReadProfile5PackBinding);
+            self.inner
+                .profile5_upload_publication_binding(reservation, expected)
+        }
+
+        pub(super) fn cache_profile5_publication(
+            &self,
+            cache: &AuthenticatedEventRouteCache,
+            verifier: &ReferenceEnvelopeSealer,
+            stored: &StoredBlob,
+            lifecycle: &std::sync::MutexGuard<'_, ()>,
+        ) -> Result<(), NodeError> {
+            self.record(BlobPackPromotionStoreOperation::CacheProfile5Publication);
+            crate::runtime::cache_authenticated_profile5_blob_route_claim(
+                &self.inner,
+                cache,
+                verifier,
+                stored,
+                lifecycle,
+            )
+        }
+
+        pub(super) fn abort_profile5_upload(
+            &self,
+            reservation: &BlobUploadReservation,
+        ) -> Result<bool, StoreError> {
+            self.record(BlobPackPromotionStoreOperation::AbortProfile5Upload);
+            self.inner.abort_blob_upload(reservation)
         }
     }
 }
 
-use finalize_store::BlobFinalizeStore;
+use promotion_store::BlobPackPromotionStore;
 #[cfg(test)]
-use finalize_store::BlobFinalizeStoreOperation;
+use promotion_store::BlobPackPromotionStoreOperation;
 
-pub(crate) type BlobFinalizeCompletion =
+pub(crate) type BlobPackPromotionCompletion =
     oneshot::Receiver<Result<BlobPublishResult, ApplicationError>>;
 
 pub(crate) enum BlobPublishFinalization {
     Completed(BlobPublishResult),
-    Scheduled(BlobFinalizeCompletion),
+    Scheduled(BlobPackPromotionCompletion),
 }
 
 enum PreparedBlobPublishFinalization {
     Completed(BlobPublishResult),
-    Pending(Box<BlobFinalizeJob>),
+    Pending(Box<BlobPackPromotionJob>),
 }
 
-struct BlobFinalizeJob {
+struct BlobPackPromotionAuthority {
     mission: UnprotectedReferenceMission,
-    store: BlobFinalizeStore,
+    store: BlobPackPromotionStore,
     custody_clock: NodeCustodyClock,
+    source_route_cache: Arc<AuthenticatedEventRouteCache>,
+}
+
+struct BlobPackPromotionJob {
+    mission: UnprotectedReferenceMission,
+    store: BlobPackPromotionStore,
+    custody_clock: NodeCustodyClock,
+    source_route_cache: Arc<AuthenticatedEventRouteCache>,
     reservation: BlobUploadReservation,
     checkpoint: aster_redb_store::BlobUploadCheckpoint,
     open: VerifiedBlobStreamOpen,
     writer: BlobPackWriter,
     #[cfg(test)]
-    gate: Option<BlobFinalizeTestGate>,
+    gate: Option<BlobPackPromotionTestGate>,
 }
 
-struct BlobFinalizeWork {
-    job: BlobFinalizeJob,
+struct BlobPackPromotionWork {
+    job: BlobPackPromotionJob,
     completion: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
 }
 
 #[derive(Default)]
-struct BlobFinalizeCounts {
+struct BlobPackPromotionCounts {
     accepted: AtomicU64,
     completed: AtomicU64,
     active: AtomicUsize,
     peak_active: AtomicUsize,
-    last_report: std::sync::Mutex<Option<BlobFinalizeMetrics>>,
+    last_report: std::sync::Mutex<Option<BlobPackPromotionMetrics>>,
 }
 
 #[derive(Clone, Debug)]
-struct BlobFinalizeMetrics {
+struct BlobPackPromotionMetrics {
+    #[cfg(test)]
     segment_count: u64,
     plaintext_bytes_reprocessed: u64,
     ciphertext_bytes_rewritten: u64,
-    /// Attempted calls through the complete private finalizer Store boundary.
+    /// Attempted calls through the complete private promotion-worker Store boundary.
     store_boundary_operations: u64,
     #[cfg(test)]
-    store_boundary_trace: Vec<BlobFinalizeStoreOperation>,
+    store_boundary_trace: Vec<BlobPackPromotionStoreOperation>,
 }
 
-struct BlobFinalizePool {
-    sender: Option<std::sync::mpsc::SyncSender<BlobFinalizeWork>>,
+struct BlobPackPromotionPool {
+    sender: Option<std::sync::mpsc::SyncSender<BlobPackPromotionWork>>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    counts: Arc<BlobFinalizeCounts>,
+    counts: Arc<BlobPackPromotionCounts>,
 }
 
 #[cfg(test)]
 #[derive(Clone)]
-struct BlobFinalizeTestGate {
+struct BlobPackPromotionTestGate {
     started: std::sync::mpsc::SyncSender<()>,
     finished: std::sync::mpsc::SyncSender<()>,
     release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -1833,7 +1797,7 @@ struct BlobFinalizeTestGate {
 }
 
 #[cfg(test)]
-impl BlobFinalizeTestGate {
+impl BlobPackPromotionTestGate {
     fn enter(&self) {
         _ = self.started.try_send(());
         let (released, wake) = &*self.release;
@@ -1856,7 +1820,7 @@ impl BlobFinalizeTestGate {
             })
             .is_ok()
         {
-            panic!("injected Blob finalizer worker panic");
+            panic!("injected Blob promotion worker panic");
         }
     }
 
@@ -1865,19 +1829,20 @@ impl BlobFinalizeTestGate {
     }
 }
 
-impl BlobFinalizePool {
+impl BlobPackPromotionPool {
     fn new() -> Result<Self, ApplicationError> {
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<BlobFinalizeWork>(BLOB_FINALIZE_QUEUE_CAPACITY);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<BlobPackPromotionWork>(
+            BLOB_PACK_PROMOTION_QUEUE_CAPACITY,
+        );
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
-        let counts = Arc::new(BlobFinalizeCounts::default());
+        let counts = Arc::new(BlobPackPromotionCounts::default());
         let mut workers: Vec<std::thread::JoinHandle<()>> =
-            Vec::with_capacity(BLOB_FINALIZE_WORKERS);
-        for worker_index in 0..BLOB_FINALIZE_WORKERS {
+            Vec::with_capacity(BLOB_PACK_PROMOTION_WORKERS);
+        for worker_index in 0..BLOB_PACK_PROMOTION_WORKERS {
             let receiver = Arc::clone(&receiver);
             let counts = Arc::clone(&counts);
             let worker = match std::thread::Builder::new()
-                .name(format!("aster-blob-finalize-{worker_index}"))
+                .name(format!("aster-blob-promote-{worker_index}"))
                 .spawn(move || {
                     loop {
                         let work = receiver
@@ -1922,7 +1887,7 @@ impl BlobFinalizePool {
                     }
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::StateUnavailable,
-                        "blob finalization pool",
+                        "blob pack promotion pool",
                     ));
                 }
             };
@@ -1935,9 +1900,12 @@ impl BlobFinalizePool {
         })
     }
 
-    fn try_submit(&self, job: BlobFinalizeJob) -> Result<BlobFinalizeCompletion, ApplicationError> {
+    fn try_submit(
+        &self,
+        job: BlobPackPromotionJob,
+    ) -> Result<BlobPackPromotionCompletion, ApplicationError> {
         let (completion, received) = oneshot::channel();
-        let work = BlobFinalizeWork { job, completion };
+        let work = BlobPackPromotionWork { job, completion };
         match self
             .sender
             .as_ref()
@@ -1962,13 +1930,13 @@ impl BlobFinalizePool {
     }
 
     #[cfg(test)]
-    fn last_report_for_test(&self) -> BlobFinalizeMetrics {
+    fn last_report_for_test(&self) -> BlobPackPromotionMetrics {
         self.counts
             .last_report
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .expect("completed local finalization report")
+            .expect("completed local pack promotion report")
     }
 
     fn shutdown(&mut self) {
@@ -1981,7 +1949,9 @@ impl BlobFinalizePool {
             self.counts.accepted.load(Ordering::Acquire),
             self.counts.completed.load(Ordering::Acquire)
         );
-        debug_assert!(self.counts.peak_active.load(Ordering::Acquire) <= BLOB_FINALIZE_WORKERS);
+        debug_assert!(
+            self.counts.peak_active.load(Ordering::Acquire) <= BLOB_PACK_PROMOTION_WORKERS
+        );
         if let Some(report) = self
             .counts
             .last_report
@@ -1991,534 +1961,39 @@ impl BlobFinalizePool {
         {
             debug_assert_eq!(report.plaintext_bytes_reprocessed, 0);
             debug_assert_eq!(report.ciphertext_bytes_rewritten, 0);
-            debug_assert_eq!(report.store_boundary_operations, 7);
+            debug_assert_eq!(report.store_boundary_operations, 9);
         }
     }
 }
 
-impl Drop for BlobFinalizePool {
+impl Drop for BlobPackPromotionPool {
     fn drop(&mut self) {
-        // Finalizer jobs are synchronous and never await the Tokio runtime or
+        // Pack promotion jobs are synchronous and never await the Tokio runtime or
         // application actor, so joining here is safe even when facade teardown
         // originates on a runtime thread.
         self.shutdown();
     }
 }
 
-#[cfg(any())]
-impl BlobFinalizeJob {
+impl BlobPackPromotionJob {
     fn new(
-        mission: UnprotectedReferenceMission,
-        store: BlobFinalizeStore,
-        source_route_cache: Arc<AuthenticatedEventRouteCache>,
-        custody_clock: NodeCustodyClock,
-        reservation: BlobUploadReservation,
-        cleanup_upload: bool,
-    ) -> Self {
-        Self {
-            mission,
-            store,
-            source_route_cache,
-            custody_clock,
-            reservation,
-            cleanup_upload,
-            #[cfg(test)]
-            gate: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_test_gate(mut self, gate: Option<BlobFinalizeTestGate>) -> Self {
-        self.gate = gate;
-        self
-    }
-
-    fn run_measured(self) -> Result<(BlobPublishResult, BlobFinalizeMetrics), ApplicationError> {
-        let BlobFinalizeJob {
-            mission,
-            store,
-            source_route_cache,
-            custody_clock,
-            reservation,
-            cleanup_upload,
-            #[cfg(test)]
-            gate,
-        } = self;
-        #[cfg(test)]
-        if let Some(gate) = &gate {
-            gate.enter();
-        }
-
-        // Replay current authority inside this owned job. This deliberately
-        // happens after handoff from the application actor, so preparation and
-        // canonical encryption cannot stall unrelated application commands.
-        let mut verifier = store
-            .replay_authority(&mission)
-            .map_err(|error| application_error("blob stream finish", error))?;
-        let mut verifier_head = store
-            .control_head()
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let policy = match store.refresh_policy(&mission, &mut verifier, &mut verifier_head) {
-            Ok(Some(policy)) => policy,
-            Ok(None) => {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::PolicyUnsettled,
-                    "blob stream finish",
-                ));
-            }
-            Err(error) => return Err(application_error("blob stream finish", error)),
-        };
-        let request = reservation.request().clone();
-        let (current, checkpoint) = store
-            .reserve_upload(&policy, &request)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        if current != reservation || checkpoint.durable_plaintext_offset() != request.total_len {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
-        }
-        let identity = current.pack_identity();
-        let upload = BlobUploadDescriptor::new(
-            identity.upload_id(),
-            *identity.request_digest(),
-            identity.total_len(),
-            current.content_epoch(),
-        )
-        .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let opener = verifier
-            .blob_upload_segment_opener(&request.scope, &request.topic, &upload)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let root = store
-            .open_pack_root()
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let metadata = CoreBlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let durable = checkpoint.durable_pack_checkpoint().ok_or_else(|| {
-            ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream finish")
-        })?;
-        let (plaintext_digests, whole_plaintext_sha256) =
-            load_upload_digest_material(&root, &identity, durable)
-                .map_err(|error| blob_pack_application_error("blob stream finish", error))?
-                .into_parts();
-        let prepared = Arc::new(
-            PreparedBlob::from_retained_digests(
-                request.total_len,
-                SELECTED_BLOB_CHUNK_SIZE,
-                metadata,
-                whole_plaintext_sha256,
-                plaintext_digests,
-            )
-            .map_err(|error| blob_core_error("blob stream finish", error))?,
-        );
-        if prepared.total_len() != request.total_len {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
-        }
-        let prepared_id = prepared.id();
-        let retained_digests = prepared.retained_digests();
-        let digest_owned_bytes = retained_digests.capacity().saturating_mul(32);
-        let metadata_owned_bytes = request
-            .media_type
-            .as_ref()
-            .map_or(0, String::capacity)
-            .saturating_add(request.schema_id.capacity());
-        let depot_operations = Arc::new(AtomicU64::new(0));
-        let mut service = verifier
-            .blob_service_with_store(
-                &request.scope,
-                &request.topic,
-                current.content_epoch(),
-                MeasuredBlobStore::new(
-                    store
-                        .open_upload_depot(&current)
-                        .map_err(|error| application_error("blob stream finish", error.into()))?,
-                    Arc::clone(&depot_operations),
-                ),
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let manifest = Arc::new(
-            service
-                .install_prepared(&prepared)
-                .map_err(|error| blob_core_error("blob stream finish", error))?,
-        );
-        let sealer = service
-            .canonical_chunk_sealer()
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        drop(prepared);
-        let token = *local_blob_publication_stream_id(
-            request.owner.publisher,
-            request.owner.operation.as_bytes(),
-        )
-        .as_bytes();
-        let job_id = PipelineJobId::from_bytes(token[..16].try_into().map_err(|_| {
-            ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream finish")
-        })?);
-        let limits = PipelineLimits::new(
-            BLOB_FINALIZE_CHUNK_WORKERS,
-            BLOB_FINALIZE_MAX_IN_FLIGHT_SEGMENTS,
-            BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB,
-            BLOB_FINALIZE_MAX_IN_FLIGHT_SEGMENTS,
-        )
-        .map_err(blob_stream_pipeline_error)?;
-        let total_len = request.total_len;
-        let segment_count = total_len.div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64);
-        let partitions = (0..segment_count).map(|index| {
-            Ok(StreamPartition::new_accounted(
-                index,
-                Vec::new(),
-                BLOB_FINALIZE_SEGMENT_OWNED_BYTES,
-            ))
-        });
-        let map_manifest = Arc::clone(&manifest);
-        let map_digests = Arc::clone(&retained_digests);
-        let map_identity = identity;
-        let map_checkpoint = durable.clone();
-        let map_root = root;
-        let buffer_tracker = Arc::new(BlobFinalizeBufferTracker::default());
-        let map_buffer_tracker = Arc::clone(&buffer_tracker);
-        #[cfg(test)]
-        let mapped_zeroized = PipelineTestProbe::mapped_ciphertext_observer_for_job(job_id)
-            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
-        let mut encrypted_bytes = 0_u64;
-        let mut plaintext_bytes_read = 0_u64;
-        let mut provisional_segment_reads = 0_u64;
-        let report = run_ordered_blocking_pipeline(
-            job_id,
-            partitions,
-            limits,
-            move |partition| {
-                let mut owned = map_buffer_tracker.guard();
-                let _cpu_permit = blob_finalize_cpu_budget().acquire();
-                let segment_index = partition.index();
-                #[cfg(test)]
-                if PipelineTestProbe::finalizer_map_failure_for_job(job_id, segment_index) {
-                    return Err(crate::stream_pipeline::PipelineError::MapFailed(
-                        "injected local finalizer map failure".into(),
-                    ));
-                }
-                drop(partition);
-                let mut reader = aster_redb_store::pack::BlobPackReader::open_projected_upload_pinned_at_segment(
-                    &map_root,
-                    &map_identity,
-                    &map_checkpoint,
-                    segment_index,
-                )
-                .map_err(|error| crate::stream_pipeline::PipelineError::MapFailed(error.to_string()))?;
-                let segment = reader
-                    .next_segment_observing_owned_bytes(|bytes| owned.set(bytes))
-                    .map_err(|error| crate::stream_pipeline::PipelineError::MapFailed(error.to_string()))?
-                    .ok_or_else(|| crate::stream_pipeline::PipelineError::MapFailed(
-                        "projected provisional segment is missing".into(),
-                    ))?;
-                let segment_owned_bytes = segment.owned_bytes();
-                let (plaintext, _) = opener
-                    .open(&segment)
-                    .map_err(|error| crate::stream_pipeline::PipelineError::MapFailed(error.to_string()))?;
-                owned.set(segment_owned_bytes.saturating_add(plaintext.capacity()));
-                #[cfg(test)]
-                PipelineTestProbe::observe_finalizer_provisional_decrypt(job_id);
-                let first_chunk = segment_index
-                    .checked_mul(BLOB_FINALIZE_CHUNKS_PER_SEGMENT as u64)
-                    .ok_or_else(|| crate::stream_pipeline::PipelineError::MapFailed(
-                        "canonical chunk index overflow".into(),
-                    ))?;
-                let mut chunks = Vec::with_capacity(BLOB_FINALIZE_CHUNKS_PER_SEGMENT);
-                owned.set(
-                    segment_owned_bytes
-                        .saturating_add(plaintext.capacity())
-                        .saturating_add(blob_finalize_mapped_chunks_owned(
-                            &chunks,
-                            chunks.capacity(),
-                        )),
-                );
-                for (within, bytes) in plaintext.chunks(SELECTED_BLOB_CHUNK_SIZE as usize).enumerate() {
-                    let index = first_chunk + within as u64;
-                    let digest = map_digests
-                        .get(usize::try_from(index).map_err(|_| {
-                            crate::stream_pipeline::PipelineError::MapFailed(
-                                "canonical chunk index overflow".into(),
-                            )
-                        })?)
-                        .ok_or_else(|| crate::stream_pipeline::PipelineError::MapFailed(
-                            "canonical chunk digest is missing".into(),
-                        ))?;
-                    let chunk_plaintext = bytes.to_vec();
-                    owned.set(
-                        segment_owned_bytes
-                            .saturating_add(plaintext.capacity())
-                            .saturating_add(blob_finalize_mapped_chunks_owned(
-                                &chunks,
-                                chunks.capacity(),
-                            ))
-                            .saturating_add(chunk_plaintext.capacity()),
-                    );
-                    let sealed = sealer
-                        .seal(&map_manifest, index, digest, chunk_plaintext)
-                        .map_err(|error| crate::stream_pipeline::PipelineError::MapFailed(error.to_string()))?;
-                    chunks.push(BlobFinalizeMappedChunk {
-                        sealed,
-                        #[cfg(test)]
-                        zeroized: BlobFinalizeZeroizeObserver(Arc::clone(&mapped_zeroized)),
-                    });
-                    owned.set(
-                        segment_owned_bytes
-                            .saturating_add(plaintext.capacity())
-                            .saturating_add(blob_finalize_mapped_chunks_owned(
-                                &chunks,
-                                chunks.capacity(),
-                            )),
-                    );
-                }
-                let mapped_owned_bytes =
-                    blob_finalize_mapped_chunks_owned(&chunks, chunks.capacity());
-                owned.set(mapped_owned_bytes);
-                Ok(BlobFinalizeMappedSegment {
-                    chunks,
-                    plaintext_bytes: plaintext.len() as u64,
-                    owned,
-                })
-            },
-            BlobFinalizeMappedSegment::owned_bytes,
-            |mapped| {
-                #[cfg(test)]
-                let index = mapped.index();
-                #[cfg(test)]
-                if PipelineTestProbe::finalizer_sink_failure_for_job(job_id, index) {
-                    return Err(crate::stream_pipeline::PipelineError::SinkFailed(
-                        "injected local finalizer sink failure".into(),
-                    ));
-                }
-                let BlobFinalizeMappedSegment {
-                    chunks,
-                    plaintext_bytes,
-                    mut owned,
-                } = mapped.into_value();
-                plaintext_bytes_read = plaintext_bytes_read.saturating_add(plaintext_bytes);
-                provisional_segment_reads = provisional_segment_reads.saturating_add(1);
-                let chunk_capacity = chunks.capacity();
-                let mut chunks = chunks.into_iter();
-                while let Some(chunk) = chunks.next() {
-                    let BlobFinalizeMappedChunk {
-                        sealed,
-                        #[cfg(test)]
-                        zeroized,
-                    } = chunk;
-                    encrypted_bytes = encrypted_bytes.saturating_add(sealed.ciphertext_len() as u64);
-                    service
-                        .commit_sealed_chunk(&manifest, sealed)
-                        .map_err(|error| crate::stream_pipeline::PipelineError::SinkFailed(error.to_string()))?;
-                    #[cfg(test)]
-                    drop(zeroized);
-                    owned.set(blob_finalize_mapped_chunks_owned(
-                        chunks.as_slice(),
-                        chunk_capacity,
-                    ));
-                }
-                drop(chunks);
-                owned.set(0);
-                Ok(())
-            },
-        )
-        .map_err(blob_stream_pipeline_error)?;
-        if report.accepted_items() != segment_count
-            || report.completed_items() != segment_count
-            || plaintext_bytes_read != request.total_len
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
-        }
-        let observed_worker_buffer_peak_bytes = buffer_tracker.peak();
-        drop(retained_digests);
-        let (finished, finish_memory) = service
-            .finish_manifest_measured(&manifest)
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let preparation_buffer_peak_bytes = digest_owned_bytes.saturating_add(metadata_owned_bytes);
-        let pipeline_buffer_peak_bytes = digest_owned_bytes
-            .saturating_add(observed_worker_buffer_peak_bytes)
-            .saturating_add(metadata_owned_bytes);
-        let finish_owned_bytes = finish_memory
-            .peak_owned_bytes()
-            .saturating_add(metadata_owned_bytes);
-        let retained_manifest_bytes = finish_memory.retained_manifest_bytes();
-        let publication_buffer_peak = Arc::new(AtomicUsize::new(
-            retained_manifest_bytes.saturating_add(metadata_owned_bytes),
-        ));
-        drop(service);
-        let depot_operations = depot_operations.load(Ordering::Relaxed);
-        let completion = store
-            .complete_prepared_blob(&manifest, *finished.manifest_digest())
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let intent = BlobPublicationIntent::new_with_ttl(
-            request.owner.publisher,
-            request.topic.clone(),
-            request.scope.clone(),
-            request.priority,
-            prepared_id,
-            request.ttl_ms,
-        )
-        .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let operation = BlobOperationRequest::new(&request.owner.operation, &intent);
-        let sample = if request.ttl_ms.is_some() {
-            Some(
-                custody_clock
-                    .sample()
-                    .map_err(|error| application_error("blob stream finish", error))?,
-            )
-        } else {
-            None
-        };
-        let build_publication_buffer_peak = Arc::clone(&publication_buffer_peak);
-        let outcome = store
-            .commit_publication(
-                &policy,
-                &operation,
-                request.ttl_ms,
-                sample,
-                sample,
-                &completion,
-                |publication| {
-                    let manifest_len = u64::try_from(finished.manifest_bytes().len())
-                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-                    let header = publication.header(
-                        request.priority,
-                        finished.route_commitment(),
-                        manifest_len,
-                        current.content_epoch(),
-                    )?;
-                    let sealed = verifier
-                        .seal_blob_manifest(&header, finished.manifest_bytes())
-                        .map_err(|error| {
-                            StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                        })?
-                        .bytes;
-                    build_publication_buffer_peak.fetch_max(
-                        retained_manifest_bytes
-                            .saturating_add(sealed.capacity())
-                            .saturating_add(metadata_owned_bytes),
-                        Ordering::Relaxed,
-                    );
-                    let route = verifier.verify_blob(&sealed).map_err(|error| {
-                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                    })?;
-                    let blob =
-                        match verifier
-                            .verify_blob_content(route, &sealed)
-                            .map_err(|error| {
-                                StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                            })? {
-                            BlobContentVerification::ContentVerified {
-                                blob,
-                                manifest_bytes,
-                            } if manifest_bytes == finished.manifest_bytes() => {
-                                build_publication_buffer_peak.fetch_max(
-                                    retained_manifest_bytes
-                                        .saturating_add(sealed.capacity())
-                                        .saturating_add(manifest_bytes.capacity())
-                                        .saturating_add(metadata_owned_bytes),
-                                    Ordering::Relaxed,
-                                );
-                                blob
-                            }
-                            _ => return Err(StoreError::Blob(BlobStoreError::CompletionMismatch)),
-                        };
-                    Ok((blob, sealed))
-                },
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        publication_buffer_peak.fetch_max(
-            retained_manifest_bytes
-                .saturating_add(outcome.blob().sealed.capacity())
-                .saturating_add(metadata_owned_bytes),
-            Ordering::Relaxed,
-        );
-        let stored = SelectedBlobNode::verify_stored_blob_without_completion(
-            mission.mission_authority_id(),
-            &mut verifier,
-            outcome.blob(),
-            Some(&intent),
-            current.content_epoch(),
-            "blob stream finish",
-        )?;
-        publication_buffer_peak.fetch_max(
-            retained_manifest_bytes
-                .saturating_add(outcome.blob().sealed.capacity())
-                .saturating_add(stored.manifest_bytes.capacity())
-                .saturating_add(metadata_owned_bytes),
-            Ordering::Relaxed,
-        );
-        store
-            .cache_route(
-                &source_route_cache,
-                &verifier,
-                &stored.blob,
-                &stored.manifest_bytes,
-                &outcome.blob().sealed,
-                outcome.blob().acceptance_marker,
-            )
-            .map_err(|error| application_error("blob stream finish", error))?;
-        if cleanup_upload {
-            store
-                .complete_upload(&current, outcome.blob().transfer_id)
-                .map_err(|error| application_error("blob stream finish", error.into()))?;
-        }
-        let mut result = blob_publish_result(&stored, outcome.inserted());
-        result.publication_id = Some(BlobStreamPublicationId::from_bytes(token)?);
-        let observed_publication_buffer_peak_bytes =
-            publication_buffer_peak.load(Ordering::Relaxed);
-        let observed_buffer_peak_bytes = preparation_buffer_peak_bytes
-            .max(pipeline_buffer_peak_bytes)
-            .max(finish_owned_bytes)
-            .max(observed_publication_buffer_peak_bytes);
-        let conservative_owned_byte_bound =
-            BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES / BLOB_FINALIZE_WORKERS;
-        let store_boundary_operations = store.operation_count();
-        #[cfg(test)]
-        let store_boundary_trace = store.trace();
-        Ok((
-            result,
-            BlobFinalizeMetrics {
-                pipeline: report,
-                observed_buffer_peak_bytes,
-                observed_worker_buffer_peak_bytes,
-                observed_publication_buffer_peak_bytes,
-                conservative_owned_byte_bound,
-                #[cfg(test)]
-                digest_owned_bytes,
-                #[cfg(test)]
-                finish_owned_bytes,
-                #[cfg(test)]
-                retained_manifest_bytes,
-                plaintext_bytes_read,
-                encrypted_bytes,
-                provisional_segment_reads,
-                depot_operations,
-                store_boundary_operations,
-                #[cfg(test)]
-                store_boundary_trace,
-            },
-        ))
-    }
-}
-
-impl BlobFinalizeJob {
-    fn new(
-        mission: UnprotectedReferenceMission,
-        store: BlobFinalizeStore,
-        custody_clock: NodeCustodyClock,
+        authority: BlobPackPromotionAuthority,
         reservation: BlobUploadReservation,
         checkpoint: aster_redb_store::BlobUploadCheckpoint,
         open: VerifiedBlobStreamOpen,
         writer: BlobPackWriter,
     ) -> Self {
+        let BlobPackPromotionAuthority {
+            mission,
+            store,
+            custody_clock,
+            source_route_cache,
+        } = authority;
         Self {
             mission,
             store,
             custody_clock,
+            source_route_cache,
             reservation,
             checkpoint,
             open,
@@ -2529,16 +2004,19 @@ impl BlobFinalizeJob {
     }
 
     #[cfg(test)]
-    fn with_test_gate(mut self, gate: Option<BlobFinalizeTestGate>) -> Self {
+    fn with_test_gate(mut self, gate: Option<BlobPackPromotionTestGate>) -> Self {
         self.gate = gate;
         self
     }
 
-    fn run_measured(self) -> Result<(BlobPublishResult, BlobFinalizeMetrics), ApplicationError> {
-        let BlobFinalizeJob {
+    fn run_measured(
+        self,
+    ) -> Result<(BlobPublishResult, BlobPackPromotionMetrics), ApplicationError> {
+        let BlobPackPromotionJob {
             mission,
             store,
             custody_clock,
+            source_route_cache,
             reservation,
             checkpoint,
             open,
@@ -2649,10 +2127,46 @@ impl BlobFinalizeJob {
                 lineage,
             )
             .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let outcome = store
-            .commit_profile5_publication(&policy, &current, &completed, final_sample)
+        let physical_lineage = store
+            .profile5_publication_binding(&current, &completed)
             .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let publication = BlobStreamPublication::new(
+            open.open().clone(),
+            commitment.blob_id(),
+            final_sample,
+            physical_lineage,
+        )
+        .map_err(|error| blob_core_error("blob stream finish", error))?;
+        let authenticated_publication = verifier
+            .seal_blob_stream_publication(&publication)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let verified_publication = verifier
+            .verify_blob_stream_publication(&authenticated_publication)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let lifecycle = source_route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| application_error("blob stream finish", error))?;
+        let outcome = match store.commit_profile5_publication(
+            &policy,
+            &current,
+            &completed,
+            &verified_publication,
+            final_sample,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if terminal_local_profile5_promotion_error(&error) {
+                    store
+                        .abort_profile5_upload(&current)
+                        .map_err(|abort| application_error("blob stream finish", abort.into()))?;
+                }
+                return Err(application_error("blob stream finish", error.into()));
+            }
+        };
         let stored = outcome.blob();
+        store
+            .cache_profile5_publication(&source_route_cache, &verifier, stored, &lifecycle)
+            .map_err(|error| application_error("blob stream finish", error))?;
         if stored.blob_id != commitment.blob_id()
             || stored.header.stamp.dot.publisher != open.open().publisher()
             || stored.header.stamp.dot.counter != open.open().publisher_counter()
@@ -2688,7 +2202,8 @@ impl BlobFinalizeJob {
         let store_boundary_trace = store.trace();
         Ok((
             result,
-            BlobFinalizeMetrics {
+            BlobPackPromotionMetrics {
+                #[cfg(test)]
                 segment_count,
                 plaintext_bytes_reprocessed: 0,
                 ciphertext_bytes_rewritten: 0,
@@ -2706,7 +2221,7 @@ impl BlobFinalizeJob {
 /// State, Record, and the live runtime. Blob network reconciliation is absent
 /// from this stopped local slice.
 pub struct SelectedBlobNode {
-    finalize_pool: BlobFinalizePool,
+    pack_promotion_pool: BlobPackPromotionPool,
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
@@ -2714,19 +2229,18 @@ pub struct SelectedBlobNode {
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
     publish_streams: BTreeMap<[u8; 32], LocalBlobPublishStream>,
-    completed_publish_streams: BTreeMap<[u8; 32], (BlobPublishStreamRequest, BlobPublishResult)>,
+    completed_publish_streams: BTreeMap<[u8; 32], CompletedBlobPublishStream>,
+    read_cache: Option<LocalBlobReadCache>,
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
-    live_publish_pass_two_gate: Option<LivePublishPassTwoTestGate>,
-    #[cfg(test)]
-    stream_finalize_gate: Option<BlobFinalizeTestGate>,
-    #[cfg(test)]
-    live_publish_retry_rewind_failure: bool,
+    stream_pack_promotion_gate: Option<BlobPackPromotionTestGate>,
     #[cfg(test)]
     live_operation_preflight_coherence_fault: bool,
     #[cfg(test)]
     live_read_projection_coherence_fault: bool,
+    #[cfg(test)]
+    live_pack_projection_coherence_fault: bool,
     #[cfg(test)]
     live_selected_load_policy_race_fault: bool,
     #[cfg(test)]
@@ -2743,6 +2257,39 @@ pub struct SelectedBlobNode {
     publish_attempts: u64,
     #[cfg(test)]
     last_live_publish_source_bytes_read: u64,
+    #[cfg(test)]
+    last_read_cache_opened_segments: u64,
+}
+
+struct CompletedBlobPublishStream {
+    request: BlobPublishStreamRequest,
+    result: BlobPublishResult,
+    plaintext_root: [u8; 32],
+}
+
+#[cfg(test)]
+struct TestReadCounter<'a, R> {
+    inner: &'a mut R,
+    bytes_read: u64,
+}
+
+#[cfg(test)]
+impl<R: Read> Read for TestReadCounter<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("test source byte count overflowed"))?;
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+impl<R: Seek> Seek for TestReadCounter<'_, R> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
 }
 
 impl SelectedBlobNode {
@@ -2801,7 +2348,7 @@ impl SelectedBlobNode {
         let custody_clock = NodeCustodyClock::open(verifier.identity())
             .map_err(|error| application_error("blob open", error))?;
         let mut selected = Self {
-            finalize_pool: BlobFinalizePool::new()?,
+            pack_promotion_pool: BlobPackPromotionPool::new()?,
             mission,
             store: Arc::new(store),
             verifier,
@@ -2810,18 +2357,17 @@ impl SelectedBlobNode {
             custody_clock,
             publish_streams: BTreeMap::new(),
             completed_publish_streams: BTreeMap::new(),
+            read_cache: None,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
-            live_publish_pass_two_gate: None,
-            #[cfg(test)]
-            stream_finalize_gate: None,
-            #[cfg(test)]
-            live_publish_retry_rewind_failure: false,
+            stream_pack_promotion_gate: None,
             #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
             live_read_projection_coherence_fault: false,
+            #[cfg(test)]
+            live_pack_projection_coherence_fault: false,
             #[cfg(test)]
             live_selected_load_policy_race_fault: false,
             #[cfg(test)]
@@ -2838,6 +2384,8 @@ impl SelectedBlobNode {
             publish_attempts: 0,
             #[cfg(test)]
             last_live_publish_source_bytes_read: 0,
+            #[cfg(test)]
+            last_read_cache_opened_segments: 0,
         };
         selected.current_policy("blob open")?;
         Ok(selected)
@@ -2852,7 +2400,7 @@ impl SelectedBlobNode {
         custody_clock: NodeCustodyClock,
     ) -> Result<Self, ApplicationError> {
         Ok(Self {
-            finalize_pool: BlobFinalizePool::new()?,
+            pack_promotion_pool: BlobPackPromotionPool::new()?,
             mission,
             store,
             verifier,
@@ -2861,18 +2409,17 @@ impl SelectedBlobNode {
             custody_clock,
             publish_streams: BTreeMap::new(),
             completed_publish_streams: BTreeMap::new(),
+            read_cache: None,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
-            live_publish_pass_two_gate: None,
-            #[cfg(test)]
-            stream_finalize_gate: None,
-            #[cfg(test)]
-            live_publish_retry_rewind_failure: false,
+            stream_pack_promotion_gate: None,
             #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
             live_read_projection_coherence_fault: false,
+            #[cfg(test)]
+            live_pack_projection_coherence_fault: false,
             #[cfg(test)]
             live_selected_load_policy_race_fault: false,
             #[cfg(test)]
@@ -2889,6 +2436,8 @@ impl SelectedBlobNode {
             publish_attempts: 0,
             #[cfg(test)]
             last_live_publish_source_bytes_read: 0,
+            #[cfg(test)]
+            last_read_cache_opened_segments: 0,
         })
     }
 
@@ -2902,22 +2451,13 @@ impl SelectedBlobNode {
     }
 
     #[cfg(test)]
-    fn set_live_publish_pass_two_gate(
-        &mut self,
-        reached: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) {
-        self.live_publish_pass_two_gate = Some(LivePublishPassTwoTestGate { reached, release });
-    }
-
-    #[cfg(test)]
-    fn set_stream_finalize_gate_for_test(
+    fn set_stream_pack_promotion_gate_for_test(
         &mut self,
         started: std::sync::mpsc::SyncSender<()>,
         finished: std::sync::mpsc::SyncSender<()>,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     ) {
-        self.stream_finalize_gate = Some(BlobFinalizeTestGate {
+        self.stream_pack_promotion_gate = Some(BlobPackPromotionTestGate {
             started,
             finished,
             release,
@@ -2926,17 +2466,12 @@ impl SelectedBlobNode {
     }
 
     #[cfg(test)]
-    fn panic_stream_finalizations_for_test(&mut self, count: usize) {
-        self.stream_finalize_gate
+    fn panic_stream_pack_promotions_for_test(&mut self, count: usize) {
+        self.stream_pack_promotion_gate
             .as_ref()
-            .expect("finalization panic injection requires a gate")
+            .expect("pack promotion panic injection requires a gate")
             .panic_remaining
             .store(count, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    fn inject_live_publish_retry_rewind_failure(&mut self) {
-        self.live_publish_retry_rewind_failure = true;
     }
 
     #[cfg(test)]
@@ -3031,9 +2566,12 @@ impl SelectedBlobNode {
                     Err(error)
                 } else {
                     if admission.load(Ordering::Acquire) {
-                        _ = response.send(result);
+                        if response.send(result).is_err() {
+                            self.finish_read_cache();
+                        }
                     } else {
                         drop(result);
+                        self.finish_read_cache();
                         _ = response.send(Err(actor_unavailable("blob read page")));
                     }
                     Ok(())
@@ -3193,19 +2731,37 @@ impl SelectedBlobNode {
             .store
             .resume_blob_upload(&owner)
             .map_err(|error| application_error("blob stream open", error.into()))?;
+        // Finite operation retries must advance receiver-local custody before
+        // resolving the completed owner mapping. Otherwise an exact retry can
+        // return a publication which expired since its previous operation.
+        let initial_custody = self.finite_publish_initial_sample(request.options)?;
+        #[cfg(test)]
+        if std::mem::replace(&mut self.live_operation_preflight_coherence_fault, false) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream open",
+            ));
+        }
         if let Some(stored) = self
             .store
             .blob_for_owner_with_policy(&policy, &owner)
             .map_err(|error| application_error("blob stream open", error.into()))?
         {
-            let result = self.completed_blob_upload_result(&stored, &request, epoch, token)?;
+            let (result, plaintext_root) =
+                self.completed_blob_upload_result(&stored, &request, epoch, token)?;
             if let Some((reservation, _)) = existing_upload {
                 self.store
                     .complete_blob_upload(&reservation, stored.transfer_id)
                     .map_err(|error| application_error("blob stream open", error.into()))?;
             }
-            self.completed_publish_streams
-                .insert(token, (request.clone(), result));
+            self.completed_publish_streams.insert(
+                token,
+                CompletedBlobPublishStream {
+                    request: request.clone(),
+                    result,
+                    plaintext_root,
+                },
+            );
             return Ok(OpenedBlobPublishStream {
                 token,
                 progress: BlobPublishProgress {
@@ -3214,83 +2770,46 @@ impl SelectedBlobNode {
                 },
             });
         }
-        let initial_custody = self.finite_publish_initial_sample(request.options)?;
-        let policy_revision = policy.head().map_or(1, |(revision, _)| revision);
-        let authorization_digest = self
-            .verifier
-            .blob_stream_authorization_digest(&request.publication.scope, epoch)
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::RequestRejected, "blob stream open")
-            })?;
-        let publication = request.publication.clone();
-        let mission_id = self.verifier.mission_authority_id();
-        let verifier = &self.verifier;
-        let (reservation, checkpoint, open) = self
-            .store
-            .reserve_profile5_upload_with_policy(
-                &policy,
-                &upload_request,
-                initial_custody,
-                |semantic, authenticated| {
-                    if let Some(authenticated) = authenticated {
-                        let verified =
-                            verifier
-                                .verify_blob_stream_open(authenticated)
-                                .map_err(|error| {
-                                    StoreError::Blob(BlobStoreError::Verification(
-                                        error.to_string(),
-                                    ))
-                                })?;
-                        return Ok((verified, authenticated.to_vec()));
+        let first = self.reserve_profile5_publish_stream(
+            &policy,
+            &upload_request,
+            &request,
+            initial_custody,
+            epoch,
+        );
+        let (reservation, checkpoint, open) = match first {
+            Ok(reserved) => reserved,
+            Err(error) if blob_capacity_gc_target(&error).is_some() => {
+                let source_route_cache = Arc::clone(&self.source_route_cache);
+                let lifecycle = source_route_cache
+                    .lock_blob_lifecycle()
+                    .map_err(|error| application_error("blob stream open", error))?;
+                if !self.recover_native_capacity_while_locked(
+                    &source_route_cache,
+                    &lifecycle,
+                    &error,
+                    &request,
+                )? {
+                    return Err(blob_store_application_error("blob stream open", error));
+                }
+                match self.reserve_profile5_publish_stream(
+                    &policy,
+                    &upload_request,
+                    &request,
+                    initial_custody,
+                    epoch,
+                ) {
+                    Ok(reserved) => reserved,
+                    Err(retry) if equivalent_blob_capacity_error(&error, &retry) => {
+                        return Err(blob_store_application_error("blob stream open", error));
                     }
-                    let mut publication_salt = [0_u8; 32];
-                    getrandom::fill(&mut publication_salt).map_err(|error| {
-                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                    })?;
-                    let open = BlobStreamOpen::new(
-                        local_blob_publication_stream_id(
-                            upload_request.owner.publisher,
-                            upload_request.owner.operation.as_bytes(),
-                        ),
-                        upload_request.owner.publisher,
-                        upload_request.owner.operation.as_bytes().to_vec(),
-                        mission_id,
-                        semantic.counter(),
-                        semantic.context().clone(),
-                        publication.topic.clone(),
-                        publication.scope.clone(),
-                        CoreBlobMetadata::new(
-                            publication.media_type.clone(),
-                            publication.schema_id.clone(),
-                        )
-                        .map_err(|error| {
-                            StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                        })?,
-                        publication.priority,
-                        request.options.ttl_ms(),
-                        initial_custody,
-                        request.total_len,
-                        epoch,
-                        policy_revision,
-                        authorization_digest,
-                        publication_salt,
-                    )
-                    .map_err(|error| {
-                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                    })?;
-                    let authenticated = verifier.seal_blob_stream_open(&open).map_err(|error| {
-                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                    })?;
-                    let verified =
-                        verifier
-                            .verify_blob_stream_open(&authenticated)
-                            .map_err(|error| {
-                                StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                            })?;
-                    Ok((verified, authenticated))
-                },
-            )
-            .map_err(|error| application_error("blob stream open", error.into()))?;
+                    Err(retry) => {
+                        return Err(application_error("blob stream open", retry.into()));
+                    }
+                }
+            }
+            Err(error) => return Err(application_error("blob stream open", error.into())),
+        };
         let identity = reservation.pack_identity();
         let sealer = self
             .verifier
@@ -3336,6 +2855,139 @@ impl SelectedBlobNode {
                 durable_offset,
             },
         })
+    }
+
+    fn reserve_profile5_publish_stream(
+        &mut self,
+        policy: &ControlPolicySnapshot,
+        upload_request: &BlobUploadRequest,
+        request: &BlobPublishStreamRequest,
+        initial_custody: Option<CustodySample>,
+        epoch: u64,
+    ) -> Result<
+        (
+            BlobUploadReservation,
+            BlobUploadCheckpoint,
+            VerifiedBlobStreamOpen,
+        ),
+        StoreError,
+    > {
+        #[cfg(test)]
+        {
+            self.publish_attempts = self.publish_attempts.saturating_add(1);
+            if let Some(error) = self.injected_capacity_failures.pop_front() {
+                return Err(error);
+            }
+        }
+        let policy_revision = policy.head().map_or(1, |(revision, _)| revision);
+        let authorization_digest = self
+            .verifier
+            .blob_stream_authorization_digest(&request.publication.scope, epoch)
+            .ok_or_else(|| {
+                StoreError::Blob(BlobStoreError::Verification(
+                    "Profile-5 publisher lacks current Blob authorization".into(),
+                ))
+            })?;
+        let publication = &request.publication;
+        let mission_id = self.verifier.mission_authority_id();
+        let verifier = &self.verifier;
+        self.store.reserve_profile5_upload_with_policy(
+            policy,
+            upload_request,
+            initial_custody,
+            |semantic, authenticated| {
+                if let Some(authenticated) = authenticated {
+                    let verified =
+                        verifier
+                            .verify_blob_stream_open(authenticated)
+                            .map_err(|error| {
+                                StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                            })?;
+                    return Ok((verified, authenticated.to_vec()));
+                }
+                let mut publication_salt = [0_u8; 32];
+                getrandom::fill(&mut publication_salt).map_err(|error| {
+                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                })?;
+                let open = BlobStreamOpen::new(
+                    local_blob_publication_stream_id(
+                        upload_request.owner.publisher,
+                        upload_request.owner.operation.as_bytes(),
+                    ),
+                    upload_request.owner.publisher,
+                    upload_request.owner.operation.as_bytes().to_vec(),
+                    mission_id,
+                    semantic.counter(),
+                    semantic.context().clone(),
+                    publication.topic.clone(),
+                    publication.scope.clone(),
+                    CoreBlobMetadata::new(
+                        publication.media_type.clone(),
+                        publication.schema_id.clone(),
+                    )
+                    .map_err(|error| {
+                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                    })?,
+                    publication.priority,
+                    request.options.ttl_ms(),
+                    initial_custody,
+                    request.total_len,
+                    epoch,
+                    policy_revision,
+                    authorization_digest,
+                    publication_salt,
+                )
+                .map_err(|error| {
+                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                })?;
+                let authenticated = verifier.seal_blob_stream_open(&open).map_err(|error| {
+                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                })?;
+                let verified =
+                    verifier
+                        .verify_blob_stream_open(&authenticated)
+                        .map_err(|error| {
+                            StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                        })?;
+                Ok((verified, authenticated))
+            },
+        )
+    }
+
+    fn recover_native_capacity_while_locked(
+        &mut self,
+        source_route_cache: &AuthenticatedEventRouteCache,
+        lifecycle: &std::sync::MutexGuard<'_, ()>,
+        error: &StoreError,
+        request: &BlobPublishStreamRequest,
+    ) -> Result<bool, ApplicationError> {
+        let Some(target) = blob_capacity_gc_target(error) else {
+            return Ok(false);
+        };
+        #[cfg(not(test))]
+        let _ = target;
+        #[cfg(test)]
+        {
+            self.capacity_gc_attempts = self.capacity_gc_attempts.saturating_add(1);
+            self.capacity_gc_targets.push(target);
+        }
+        let sample = self
+            .custody_clock
+            .sample()
+            .map_err(|error| application_error("blob stream open", error))?;
+        recover_local_blob_capacity_after_cleanup(
+            &self.store,
+            &self.verifier,
+            source_route_cache,
+            error,
+            request.publication.priority,
+            None,
+            0,
+            1,
+            Some(sample),
+            lifecycle,
+        )
+        .map_err(|error| application_error("blob stream open", error))
     }
 
     fn append_publish_stream_inner(
@@ -3414,9 +3066,20 @@ impl SelectedBlobNode {
     ) -> Result<BlobPublishResult, ApplicationError> {
         match self.schedule_publish_stream_finalization(token)? {
             BlobPublishFinalization::Completed(result) => Ok(result),
-            BlobPublishFinalization::Scheduled(completion) => completion
-                .blocking_recv()
-                .map_err(|_| actor_unavailable("blob stream finish"))?,
+            BlobPublishFinalization::Scheduled(mut completion) => loop {
+                match completion.try_recv() {
+                    Ok(result) => break result,
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        // Promotion runs on its own bounded OS-thread pool. A
+                        // synchronous caller may itself be inside Tokio, where
+                        // `blocking_recv` would panic by nesting the runtime.
+                        std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    }
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        break Err(actor_unavailable("blob stream finish"));
+                    }
+                }
+            },
         }
     }
 
@@ -3429,7 +3092,7 @@ impl SelectedBlobNode {
                 Ok(BlobPublishFinalization::Completed(result))
             }
             PreparedBlobPublishFinalization::Pending(job) => self
-                .finalize_pool
+                .pack_promotion_pool
                 .try_submit(*job)
                 .map(BlobPublishFinalization::Scheduled),
         }
@@ -3439,8 +3102,8 @@ impl SelectedBlobNode {
         &mut self,
         token: [u8; 32],
     ) -> Result<PreparedBlobPublishFinalization, ApplicationError> {
-        if let Some((_, result)) = self.completed_publish_streams.remove(&token) {
-            return Ok(PreparedBlobPublishFinalization::Completed(result));
+        if let Some(completed) = self.completed_publish_streams.remove(&token) {
+            return Ok(PreparedBlobPublishFinalization::Completed(completed.result));
         }
         let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
@@ -3478,31 +3141,21 @@ impl SelectedBlobNode {
                 )
                 .map_err(|error| application_error("blob stream finish", error.into()))?;
         }
-        let job = BlobFinalizeJob::new(
-            self.mission.clone(),
-            BlobFinalizeStore::new(Arc::clone(&self.store)),
-            self.custody_clock.clone(),
+        let job = BlobPackPromotionJob::new(
+            BlobPackPromotionAuthority {
+                mission: self.mission.clone(),
+                store: BlobPackPromotionStore::new(Arc::clone(&self.store)),
+                custody_clock: self.custody_clock.clone(),
+                source_route_cache: Arc::clone(&self.source_route_cache),
+            },
             stream.reservation,
             stream.checkpoint,
             stream.open,
             stream.writer,
         );
         #[cfg(test)]
-        let job = job.with_test_gate(self.stream_finalize_gate.clone());
+        let job = job.with_test_gate(self.stream_pack_promotion_gate.clone());
         Ok(PreparedBlobPublishFinalization::Pending(Box::new(job)))
-    }
-
-    #[cfg(test)]
-    fn finish_publish_stream_without_cleanup_for_test(
-        &mut self,
-        token: [u8; 32],
-    ) -> Result<(BlobPublishResult, Option<BlobFinalizeMetrics>), ApplicationError> {
-        match self.prepare_publish_stream_finalization(token)? {
-            PreparedBlobPublishFinalization::Completed(result) => Ok((result, None)),
-            PreparedBlobPublishFinalization::Pending(job) => (*job)
-                .run_measured()
-                .map(|(result, measured)| (result, Some(measured))),
-        }
     }
 
     fn completed_blob_upload_result(
@@ -3511,29 +3164,38 @@ impl SelectedBlobNode {
         request: &BlobPublishStreamRequest,
         current_epoch: u64,
         token: [u8; 32],
-    ) -> Result<BlobPublishResult, ApplicationError> {
+    ) -> Result<(BlobPublishResult, [u8; 32]), ApplicationError> {
+        let source_route_cache = Arc::clone(&self.source_route_cache);
+        let _lifecycle = source_route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| application_error("blob stream open", error))?;
+        let (projection, retention) = self.completed_projection(stored, "blob stream open")?;
+        let verified = source_route_cache
+            .authenticated_profile5_blob_source(&self.verifier, &projection, retention)
+            .map_err(|_| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream open")
+            })?;
         match self
             .store
             .open_profile5_pack_application_read(stored.variant_id)
         {
             Ok(session) => {
-                let open = session.open();
-                let commitment = session.commitment();
+                self.require_profile5_stored_source_match(
+                    stored,
+                    &projection,
+                    &session,
+                    &verified,
+                    "blob stream open",
+                )?;
+                let open = verified.publication().publication().open();
+                let commitment = verified.physical_commitment().commitment();
                 let metadata = open.metadata();
                 if open.stream_id().as_bytes() != &token
                     || open.publisher() != self.identity()
                     || open.operation_key() != request.publication.operation_key
                     || open.mission_id() != &self.mission_authority()
-                    || open.topic() != &request.publication.topic
-                    || open.scope() != &request.publication.scope
-                    || open.priority() != request.publication.priority
-                    || open.ttl_ms() != request.options.ttl_ms()
-                    || open.total_len() != request.total_len
-                    || open.content_epoch() > current_epoch
-                    || metadata.media_type() != request.publication.media_type.as_deref()
-                    || metadata.schema_id() != request.publication.schema_id
                     || commitment.blob_id() != stored.blob_id
-                    || commitment.total_len() != request.total_len
+                    || commitment.total_len() != open.total_len()
                     || stored.header.stamp.dot.publisher != open.publisher()
                     || stored.header.stamp.dot.counter != open.publisher_counter()
                     || stored.header.topic != *open.topic()
@@ -3541,6 +3203,7 @@ impl SelectedBlobNode {
                     || stored.header.priority != open.priority()
                     || stored.header.ttl_ms != open.ttl_ms()
                     || stored.header.key_epoch != open.content_epoch()
+                    || open.content_epoch() > current_epoch
                     || !self
                         .verifier
                         .can_route_blob(open.scope(), open.content_epoch())
@@ -3555,73 +3218,50 @@ impl SelectedBlobNode {
                         "blob stream open",
                     ));
                 }
-                return Ok(BlobPublishResult {
-                    publication_id: Some(BlobStreamPublicationId::from_bytes(token)?),
-                    id: BlobId::from_core(commitment.blob_id()),
-                    publisher: open.publisher(),
-                    publisher_counter: open.publisher_counter(),
-                    priority: open.priority(),
-                    ttl_ms: open.ttl_ms(),
-                    total_len: open.total_len(),
-                    media_type: metadata.media_type().map(str::to_owned),
-                    schema_id: metadata.schema_id().to_vec(),
-                    acceptance_marker: stored.acceptance_marker,
-                    inserted: false,
-                });
+                if open.topic() != &request.publication.topic
+                    || open.scope() != &request.publication.scope
+                    || open.priority() != request.publication.priority
+                    || open.ttl_ms() != request.options.ttl_ms()
+                    || open.total_len() != request.total_len
+                    || metadata.media_type() != request.publication.media_type.as_deref()
+                    || metadata.schema_id() != request.publication.schema_id
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Conflict,
+                        "blob stream open",
+                    ));
+                }
+                Ok((
+                    BlobPublishResult {
+                        publication_id: Some(BlobStreamPublicationId::from_bytes(token)?),
+                        id: BlobId::from_core(commitment.blob_id()),
+                        publisher: open.publisher(),
+                        publisher_counter: open.publisher_counter(),
+                        priority: open.priority(),
+                        ttl_ms: open.ttl_ms(),
+                        total_len: open.total_len(),
+                        media_type: metadata.media_type().map(str::to_owned),
+                        schema_id: metadata.schema_id().to_vec(),
+                        acceptance_marker: stored.acceptance_marker,
+                        inserted: false,
+                    },
+                    *commitment.plaintext_root(),
+                ))
             }
-            Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
-            Err(error) => {
-                return Err(application_error("blob stream open", error.into()));
+            Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                Err(incompatible_profile5_storage("blob stream open"))
             }
+            Err(error) => Err(application_error("blob stream open", error.into())),
         }
-        let intent = BlobPublicationIntent::new_with_ttl(
-            self.identity(),
-            request.publication.topic.clone(),
-            request.publication.scope.clone(),
-            request.publication.priority,
-            stored.blob_id,
-            request.options.ttl_ms(),
-        )
-        .map_err(|error| application_error("blob stream open", error.into()))?;
-        let operation_key = BlobOperationKey::new(request.publication.operation_key.clone())
-            .map_err(|error| application_error("blob stream open", error.into()))?;
-        let operation = BlobOperationRequest::new(&operation_key, &intent);
-        let policy = self.current_policy("blob stream open")?;
-        let exact = self
-            .store
-            .blob_for_operation_with_policy(&policy, &operation)
-            .map_err(|error| application_error("blob stream open", error.into()))?
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream open")
-            })?;
-        let verified = self.verify_stored_blob(
-            &exact,
-            Some(&intent),
-            current_epoch,
-            "blob stream open",
-            false,
-        )?;
-        let mut result = blob_publish_result(&verified, false);
-        if result.total_len != request.total_len
-            || result.media_type != request.publication.media_type
-            || result.schema_id != request.publication.schema_id
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Conflict,
-                "blob stream open",
-            ));
-        }
-        result.publication_id = Some(BlobStreamPublicationId::from_bytes(token)?);
-        Ok(result)
     }
 
     /// Streams, encrypts, and durably publishes one immutable Blob.
     ///
-    /// The first pass uses one bounded zeroizing plaintext-chunk buffer and,
-    /// after it completes, retains only a manifest-bounded digest vector. The
-    /// second pass commits independently authenticated 64 KiB encrypted chunks.
-    /// A semantic publication becomes visible only after the complete depot
-    /// variant, source envelope, and operation mapping commit atomically.
+    /// Plaintext is read once through the bounded Profile-5 map/reorder/sink
+    /// pipeline. Each 1-MiB segment becomes one independently authenticated
+    /// `ASTRBS02` pack record, and those same records are the network DATA
+    /// units. A semantic publication becomes visible only after the complete
+    /// native pack, source envelope, and operation mapping commit atomically.
     pub fn publish<R: Read + Seek>(
         &mut self,
         request: BlobPublishRequest,
@@ -3637,46 +3277,14 @@ impl SelectedBlobNode {
         options: BlobPublishOptions,
         source: &mut R,
     ) -> Result<BlobPublishResult, ApplicationError> {
-        let initial_sample = self.finite_publish_initial_sample(options)?;
-        let retry_request = request.clone();
-        match self.publish_inner(request, options, initial_sample, source, None, None, None) {
-            Err(BlobPublishAttemptError::Capacity { error, context }) => {
-                if source.seek(std::io::SeekFrom::Start(0)).is_err() {
-                    return Err(blob_store_application_error("blob publish", error));
-                }
-                let source_route_cache = Arc::clone(&self.source_route_cache);
-                let lifecycle = source_route_cache
-                    .lock_blob_lifecycle()
-                    .map_err(|error| application_error("blob publish", error))?;
-                if !self.recover_capacity_while_locked(
-                    &source_route_cache,
-                    &lifecycle,
-                    &error,
-                    &context,
-                )? {
-                    return Err(blob_store_application_error("blob publish", error));
-                }
-                match self.publish_inner(
-                    retry_request,
-                    options,
-                    initial_sample,
-                    source,
-                    None,
-                    Some(&lifecycle),
-                    Some(&context),
-                ) {
-                    Ok(result) => Ok(result),
-                    Err(BlobPublishAttemptError::Capacity { error: retry, .. })
-                        if equivalent_blob_capacity_error(&error, &retry) =>
-                    {
-                        Err(blob_store_application_error("blob publish", error))
-                    }
-                    Err(retry) => Err(retry.into_application()),
-                }
-            }
-            Err(error) => Err(error.into_application()),
-            Ok(result) => Ok(result),
-        }
+        self.publish_native_reader(
+            request,
+            options,
+            source,
+            MAX_SELECTED_BLOB_STREAM_BYTES,
+            None,
+            None,
+        )
     }
 
     /// Executes one live publication after accepting ownership of its file.
@@ -3713,7 +3321,6 @@ impl SelectedBlobNode {
         if !admission.load(Ordering::Acquire) {
             return Err(actor_unavailable("blob publish"));
         }
-        let initial_sample = self.finite_publish_initial_sample(options)?;
         if source
             .stream_position()
             .map_err(|error| application_error("blob publish", error.into()))?
@@ -3740,92 +3347,224 @@ impl SelectedBlobNode {
             ));
         }
         let expected_len = metadata.len();
-        let length_probe = source
-            .try_clone()
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        let mut context = LivePublishContext {
-            admission,
-            length_probe,
-            expected_len,
-            fatal,
-        };
-        let mut source = AdmittedFile {
-            file: &mut source,
-            admission,
-            max_len: MAX_SELECTED_LIVE_BLOB_BYTES,
-            #[cfg(test)]
-            pass_two_gate: self.live_publish_pass_two_gate.take(),
-            #[cfg(test)]
-            expected_len,
-            #[cfg(test)]
-            total_bytes_read: 0,
-            #[cfg(test)]
-            fail_retry_rewind: std::mem::replace(
-                &mut self.live_publish_retry_rewind_failure,
-                false,
-            ),
-            #[cfg(test)]
-            start_zero_seeks: 0,
-        };
-        let retry_request = request.clone();
-        let result = match self.publish_inner(
+        #[cfg(not(test))]
+        let result = self.publish_native_reader(
             request,
             options,
-            initial_sample,
             &mut source,
-            Some(&mut context),
-            None,
-            None,
-        ) {
-            Err(BlobPublishAttemptError::Capacity {
-                error,
-                context: recovery,
-            }) => {
-                context.require_admission()?;
-                if source.seek(std::io::SeekFrom::Start(0)).is_err() {
-                    return Err(blob_store_application_error("blob publish", error));
-                }
-                let source_route_cache = Arc::clone(&self.source_route_cache);
-                let lifecycle = source_route_cache
-                    .lock_blob_lifecycle()
-                    .map_err(|error| application_error("blob publish", error))?;
-                let recovered = self.recover_capacity_while_locked(
-                    &source_route_cache,
-                    &lifecycle,
-                    &error,
-                    &recovery,
-                )?;
-                if recovered {
-                    context.require_admission()?;
-                    match self.publish_inner(
-                        retry_request,
-                        options,
-                        initial_sample,
-                        &mut source,
-                        Some(&mut context),
-                        Some(&lifecycle),
-                        Some(&recovery),
-                    ) {
-                        Ok(result) => Ok(result),
-                        Err(BlobPublishAttemptError::Capacity { error: retry, .. })
-                            if equivalent_blob_capacity_error(&error, &retry) =>
-                        {
-                            Err(blob_store_application_error("blob publish", error))
-                        }
-                        Err(retry) => Err(retry.into_application()),
-                    }
-                } else {
-                    Err(blob_store_application_error("blob publish", error))
-                }
-            }
-            Err(error) => Err(error.into_application()),
-            Ok(result) => Ok(result),
-        };
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+            Some(expected_len),
+            Some(admission),
+        );
         #[cfg(test)]
+        let result = {
+            let mut counted = TestReadCounter {
+                inner: &mut source,
+                bytes_read: 0,
+            };
+            let result = self.publish_native_reader(
+                request,
+                options,
+                &mut counted,
+                MAX_SELECTED_LIVE_BLOB_BYTES,
+                Some(expected_len),
+                Some(admission),
+            );
+            self.last_live_publish_source_bytes_read = counted.bytes_read;
+            result
+        };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == ApplicationErrorKind::Integrity)
         {
-            self.last_live_publish_source_bytes_read = source.total_bytes_read;
+            *fatal = Some(NodeError::FatalBlobCoherence(
+                "live native Blob publication failed a durable invariant".into(),
+            ));
         }
         result
+    }
+
+    fn publish_native_reader<R: Read + Seek>(
+        &mut self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: &mut R,
+        max_len: u64,
+        expected_len: Option<u64>,
+        admission: Option<&AtomicBool>,
+    ) -> Result<BlobPublishResult, ApplicationError> {
+        if source
+            .stream_position()
+            .map_err(|error| application_error("blob publish", error.into()))?
+            != 0
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob publish",
+            ));
+        }
+        let total_len = source
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|error| application_error("blob publish", error.into()))?;
+        source
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|error| application_error("blob publish", error.into()))?;
+        if total_len == 0 {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob publish",
+            ));
+        }
+        if total_len > max_len {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob publish",
+            ));
+        }
+        if expected_len.is_some_and(|expected| expected != total_len) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Conflict,
+                "blob publish",
+            ));
+        }
+        if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
+            return Err(actor_unavailable("blob publish"));
+        }
+
+        let opened = self.open_publish_stream_inner(BlobPublishStreamRequest {
+            publication: request,
+            options,
+            total_len,
+        })?;
+        let mut offset = opened.progress.accepted_offset;
+        self.verify_native_publish_retry_prefix(opened.token, source, offset, admission)?;
+        source
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(|error| application_error("blob publish", error.into()))?;
+        while offset < total_len {
+            if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
+                return Err(actor_unavailable("blob publish"));
+            }
+            let remaining = total_len - offset;
+            let read_len = usize::try_from(remaining.min(BLOB_STREAM_SEGMENT_BYTES as u64))
+                .expect("bounded native Blob segment length");
+            let mut bytes = Zeroizing::new(vec![0_u8; read_len]);
+            source
+                .read_exact(&mut bytes)
+                .map_err(|error| application_error("blob publish", error.into()))?;
+            let progress = self.append_publish_stream_inner(opened.token, offset, bytes)?;
+            offset = progress.accepted_offset;
+        }
+        let observed_len = source
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|error| application_error("blob publish", error.into()))?;
+        if observed_len != total_len
+            || admission.is_some_and(|admission| !admission.load(Ordering::Acquire))
+        {
+            return Err(if observed_len != total_len {
+                ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish")
+            } else {
+                actor_unavailable("blob publish")
+            });
+        }
+        self.finish_publish_stream_inner(opened.token)
+            .map_err(|error| ApplicationError::new(error.kind(), "blob publish"))
+    }
+
+    /// Verifies bytes skipped by a resumed one-shot publication against the
+    /// exact durable Profile-5 pack. Fresh publications remain single-pass:
+    /// this path is entered only when the Store reports a nonzero durable
+    /// offset. It prevents a changed file from being silently combined with a
+    /// prior durable prefix or accepted as an exact completed-operation retry.
+    fn verify_native_publish_retry_prefix<R: Read>(
+        &mut self,
+        token: [u8; 32],
+        source: &mut R,
+        prefix_len: u64,
+        admission: Option<&AtomicBool>,
+    ) -> Result<(), ApplicationError> {
+        if prefix_len == 0 {
+            return Ok(());
+        }
+        if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
+            return Err(actor_unavailable("blob publish"));
+        }
+
+        let (total_len, expected_prefix, expected_root) =
+            if let Some(stream) = self.publish_streams.get(&token) {
+                let checkpoint = stream
+                    .checkpoint
+                    .durable_pack_checkpoint()
+                    .ok_or_else(|| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish")
+                    })?
+                    .clone();
+                if checkpoint.plaintext_offset() != prefix_len {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob publish",
+                    ));
+                }
+                (
+                    stream.total_len,
+                    Some(checkpoint.frontier().plaintext_commitment()),
+                    None,
+                )
+            } else {
+                let completed = self.completed_publish_streams.get(&token).ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish")
+                })?;
+                if completed.request.total_len != prefix_len {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob publish",
+                    ));
+                }
+                (
+                    completed.request.total_len,
+                    None,
+                    Some(completed.plaintext_root),
+                )
+            };
+
+        let mut frontier = BlobStreamPlaintextFrontier::new();
+        let mut offset = 0_u64;
+        let mut index = 0_u64;
+        while offset < prefix_len {
+            if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
+                return Err(actor_unavailable("blob publish"));
+            }
+            let read_len =
+                usize::try_from((prefix_len - offset).min(BLOB_STREAM_SEGMENT_BYTES as u64))
+                    .expect("bounded Profile-5 retry partition");
+            let mut bytes = Zeroizing::new(vec![0_u8; read_len]);
+            source
+                .read_exact(&mut bytes)
+                .map_err(|error| application_error("blob publish", error.into()))?;
+            frontier
+                .append(index, offset, total_len, &bytes)
+                .map_err(|error| blob_core_error("blob publish", error))?;
+            offset = offset.checked_add(read_len as u64).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish")
+            })?;
+            index += 1;
+        }
+        let matches = if let Some(expected) = expected_root {
+            frontier
+                .finish(total_len)
+                .map_err(|error| blob_core_error("blob publish", error))?
+                == expected
+        } else {
+            frontier.checkpoint().plaintext_commitment()
+                == expected_prefix.expect("resumed upload has a prefix commitment")
+        };
+        if !matches {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Conflict,
+                "blob publish",
+            ));
+        }
+        Ok(())
     }
 
     fn finite_publish_initial_sample(
@@ -3841,484 +3580,8 @@ impl SelectedBlobNode {
                 "blob publish",
             ));
         }
-        self.custody_clock
-            .sample()
+        self.observe_current_blob_custody_sample("blob stream open")
             .map(Some)
-            .map_err(|error| application_error("blob publish", error))
-    }
-
-    fn recover_capacity_while_locked(
-        &mut self,
-        source_route_cache: &AuthenticatedEventRouteCache,
-        lifecycle: &std::sync::MutexGuard<'_, ()>,
-        error: &StoreError,
-        context: &BlobAdmissionRecoveryContext,
-    ) -> Result<bool, ApplicationError> {
-        let Some(target) = blob_capacity_gc_target(error) else {
-            return Ok(false);
-        };
-        #[cfg(not(test))]
-        let _ = target;
-        #[cfg(test)]
-        {
-            self.capacity_gc_attempts = self.capacity_gc_attempts.saturating_add(1);
-            self.capacity_gc_targets.push(target);
-        }
-        let sample = self
-            .custody_clock
-            .sample()
-            .map_err(|error| application_error("blob publish", error))?;
-        recover_local_blob_capacity_after_cleanup(
-            &self.store,
-            &self.verifier,
-            source_route_cache,
-            error,
-            context.priority,
-            Some((&context.topic, &context.scope, context.blob_id)),
-            context.depot_chunks,
-            context.depot_variants,
-            Some(sample),
-            lifecycle,
-        )
-        .map_err(|error| application_error("blob publish", error))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "one retry retains the original store error and immutable recovery context by value"
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "publish admission, source, retry, and held-lifecycle inputs stay explicit"
-    )]
-    fn publish_inner<R: Read + Seek>(
-        &mut self,
-        request: BlobPublishRequest,
-        options: BlobPublishOptions,
-        initial_sample: Option<CustodySample>,
-        source: &mut R,
-        mut live: Option<&mut LivePublishContext<'_>>,
-        held_lifecycle: Option<&std::sync::MutexGuard<'_, ()>>,
-        expected_recovery: Option<&BlobAdmissionRecoveryContext>,
-    ) -> Result<BlobPublishResult, BlobPublishAttemptError> {
-        #[cfg(test)]
-        {
-            self.publish_attempts = self.publish_attempts.saturating_add(1);
-        }
-        let BlobPublishRequest {
-            operation_key,
-            topic,
-            scope,
-            priority,
-            media_type,
-            schema_id,
-        } = request;
-        let operation = BlobOperationKey::new(operation_key)
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        let metadata = CoreBlobMetadata::new(media_type, schema_id)
-            .map_err(|error| blob_core_error("blob publish", error))?;
-        let policy = self.current_policy("blob publish")?;
-        let epoch = self.active_epoch(&scope, "blob publish")?;
-        self.require_blob_grants(&topic, &scope, epoch, "blob publish")?;
-        let prepared =
-            prepare_blob(source, SELECTED_BLOB_CHUNK_SIZE, metadata).map_err(blob_prepare_error)?;
-        if prepared.total_len() == 0 || prepared.chunk_count() == 0 {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::InvalidRequest,
-                "blob publish",
-            )
-            .into());
-        }
-        if live.is_some()
-            && (prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-                || prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS)
-        {
-            return Err(
-                ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish").into(),
-            );
-        }
-        let recovery_context = BlobAdmissionRecoveryContext {
-            priority,
-            topic: topic.clone(),
-            scope: scope.clone(),
-            blob_id: prepared.id(),
-            // Core depot mutation rejects one chunk row at a time. Earlier
-            // chunks may already be durable when this admission fails, so the
-            // rejected atomic unit is exactly one chunk, not the manifest.
-            depot_chunks: 1,
-            depot_variants: 1,
-        };
-        if expected_recovery.is_some_and(|expected| expected != &recovery_context) {
-            return Err(
-                ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish").into(),
-            );
-        }
-        #[cfg(test)]
-        if let Some(error) = self.injected_capacity_failures.pop_front() {
-            if blob_capacity_gc_target(&error).is_some() {
-                return Err(BlobPublishAttemptError::Capacity {
-                    error,
-                    context: recovery_context,
-                });
-            }
-            if let Some(context) = live.as_deref_mut()
-                && live_blob_durable_coherence_error(&error)
-            {
-                *context.fatal = Some(NodeError::FatalBlobCoherence(
-                    "injected live Blob retry reported durable coherence loss".into(),
-                ));
-            }
-            return Err(BlobPublishAttemptError::Application(ApplicationError::new(
-                store_error_kind(&error),
-                "blob publish",
-            )));
-        }
-        if let Some(context) = live.as_deref_mut() {
-            context.require_admission()?;
-            context.require_exact_len(prepared.total_len())?;
-            if source
-                .stream_position()
-                .map_err(|error| application_error("blob publish", error.into()))?
-                != 0
-            {
-                return Err(
-                    ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish").into(),
-                );
-            }
-        }
-        let intent = BlobPublicationIntent::new_with_ttl(
-            self.identity(),
-            topic.clone(),
-            scope.clone(),
-            priority,
-            prepared.id(),
-            options.ttl_ms(),
-        )
-        .map_err(|error| application_error("blob publish", error.into()))?;
-        let operation_request = BlobOperationRequest::new(&operation, &intent);
-
-        let retry_cache = Arc::clone(&self.source_route_cache);
-        let retry_lifecycle = if held_lifecycle.is_some() {
-            None
-        } else {
-            match retry_cache.lock_blob_lifecycle() {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(error) => {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(live_blob_coherence_fatal(
-                            "pre-retry Blob lifecycle lock",
-                            error,
-                        ));
-                        return Err(ApplicationError::new(
-                            ApplicationErrorKind::Integrity,
-                            "blob publish",
-                        )
-                        .into());
-                    }
-                    return Err(application_error("blob publish", error).into());
-                }
-            }
-        };
-        if options.ttl_ms().is_some() {
-            let retry_sample = self
-                .custody_clock
-                .sample()
-                .map_err(|error| application_error("blob publish", error))?;
-            self.store
-                .observe_blob_custody_sample(retry_sample)
-                .map_err(|error| application_error("blob publish", error.into()))?;
-        }
-        let operation_preflight = {
-            #[cfg(test)]
-            if std::mem::replace(&mut self.live_operation_preflight_coherence_fault, false) {
-                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "injected orphan live Blob operation",
-                )))
-            } else {
-                self.store
-                    .blob_for_operation_with_policy(&policy, &operation_request)
-            }
-            #[cfg(not(test))]
-            self.store
-                .blob_for_operation_with_policy(&policy, &operation_request)
-        };
-        let existing = match operation_preflight {
-            Ok(existing) => existing,
-            Err(error) => {
-                if live.is_some() && live_blob_durable_coherence_error(&error) {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(live_blob_coherence_fatal(
-                            "live Blob operation preflight",
-                            error.into(),
-                        ));
-                    }
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob publish",
-                    )
-                    .into());
-                }
-                return Err(application_error("blob publish", error.into()).into());
-            }
-        };
-        if let Some(existing) = existing {
-            let result = match self.verify_publication_retry(
-                &existing,
-                &intent,
-                &prepared,
-                epoch,
-                live.is_some(),
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(NodeError::FatalBlobCoherence(
-                            "live Blob operation retry lost its exact authenticated claim".into(),
-                        ));
-                    }
-                    return Err(error.into());
-                }
-            };
-            return Ok(result);
-        }
-        drop(retry_lifecycle);
-
-        let (finished, local_import_lease) = {
-            let (depot, local_import_lease) = match self
-                .store
-                .blob_depot_for_local_publish_with_operation(&operation, live.is_none())
-            {
-                Ok(depot) => depot,
-                Err(error) => {
-                    if live.is_some() && live_blob_durable_coherence_error(&error) {
-                        if let Some(context) = live.as_deref_mut() {
-                            *context.fatal = Some(live_blob_coherence_fatal(
-                                "live Blob initial depot open",
-                                error.into(),
-                            ));
-                        }
-                        return Err(ApplicationError::new(
-                            ApplicationErrorKind::Integrity,
-                            "blob publish",
-                        )
-                        .into());
-                    }
-                    if blob_capacity_gc_target(&error).is_some() {
-                        return Err(BlobPublishAttemptError::Capacity {
-                            error,
-                            context: recovery_context.clone(),
-                        });
-                    }
-                    return Err(application_error("blob publish", error.into()).into());
-                }
-            };
-            let mut service = self
-                .verifier
-                .blob_service_with_store(&scope, &topic, epoch, depot)
-                .map_err(|error| application_error("blob publish", error.into()))?;
-            let (manifest, progress) =
-                match service.install_prepared(&prepared).and_then(|manifest| {
-                    service
-                        .encrypt_some(source, &manifest, prepared.chunk_count())
-                        .map(|progress| (manifest, progress))
-                }) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        drop(service);
-                        return Err(live_blob_core_attempt_error(
-                            error,
-                            &mut live,
-                            &recovery_context,
-                        ));
-                    }
-                };
-            if !progress.complete || progress.verified_chunks != prepared.chunk_count() {
-                return Err(
-                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
-                );
-            }
-            if let Some(context) = live.as_deref_mut() {
-                context.require_admission()?;
-                let observed = source
-                    .seek(std::io::SeekFrom::End(0))
-                    .map_err(|error| application_error("blob publish", error.into()))?;
-                context.require_exact_len(observed)?;
-            }
-            let result = service.finish_manifest(&manifest);
-            drop(service);
-            (
-                result.map_err(|error| {
-                    live_blob_core_attempt_error(error, &mut live, &recovery_context)
-                })?,
-                local_import_lease,
-            )
-        };
-
-        let reservation = self
-            .store
-            .reserve_local_blob_with_policy(
-                &policy,
-                self.identity(),
-                &topic,
-                &scope,
-                options.ttl_ms(),
-                initial_sample,
-            )
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        let manifest_len = u64::try_from(finished.manifest_bytes().len()).map_err(|_| {
-            ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish")
-        })?;
-        let header = reservation
-            .header(priority, finished.route_commitment(), manifest_len, epoch)
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        let sealed = self
-            .verifier
-            .seal_blob_manifest(&header, finished.manifest_bytes())
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        let verified = self.open_blob(&sealed.bytes, "blob publish")?;
-        if verified.blob.blob_id() != prepared.id()
-            || verified.manifest_bytes != finished.manifest_bytes()
-            || verified.blob.manifest_digest() != finished.manifest_digest()
-        {
-            return Err(
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
-            );
-        }
-        let completion = match if live.is_some() {
-            self.store
-                .completed_local_blob(&verified.blob, &verified.manifest_bytes)
-        } else {
-            self.store.blob_depot().and_then(|mut depot| {
-                depot.completed_blob(&verified.blob, &verified.manifest_bytes)
-            })
-        } {
-            Ok(completion) => completion,
-            Err(error) => {
-                if live.is_some() && live_blob_durable_coherence_error(&error) {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(live_blob_coherence_fatal(
-                            "live Blob completion proof",
-                            error.into(),
-                        ));
-                    }
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob publish",
-                    )
-                    .into());
-                }
-                return Err(application_error("blob publish", error.into()).into());
-            }
-        };
-        let source_route_cache = Arc::clone(&self.source_route_cache);
-        if let Some(context) = live.as_deref_mut() {
-            context.require_admission()?;
-        }
-        let _lifecycle = if held_lifecycle.is_some() {
-            None
-        } else {
-            match source_route_cache.lock_blob_lifecycle() {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(error) => {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(live_blob_coherence_fatal(
-                            "pre-commit Blob lifecycle lock",
-                            error,
-                        ));
-                        return Err(ApplicationError::new(
-                            ApplicationErrorKind::Integrity,
-                            "blob publish",
-                        )
-                        .into());
-                    }
-                    return Err(application_error("blob publish", error).into());
-                }
-            }
-        };
-        if let Some(context) = live.as_deref_mut() {
-            context.require_admission()?;
-        }
-        let final_sample = if options.ttl_ms().is_some() {
-            Some(
-                self.custody_clock
-                    .sample()
-                    .map_err(|error| application_error("blob publish", error))?,
-            )
-        } else {
-            None
-        };
-        let outcome = match self.store.commit_reserved_local_blob_once_with_policy(
-            &policy,
-            &operation_request,
-            &reservation,
-            &verified.blob,
-            &sealed.bytes,
-            &completion,
-            final_sample,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if live.is_some() && live_blob_durable_coherence_error(&error) {
-                    if let Some(context) = live.as_deref_mut() {
-                        *context.fatal = Some(live_blob_coherence_fatal(
-                            "live Blob durable commit precondition",
-                            error.into(),
-                        ));
-                    }
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob publish",
-                    )
-                    .into());
-                }
-                if blob_capacity_gc_target(&error).is_some() {
-                    return Err(BlobPublishAttemptError::Capacity {
-                        error,
-                        context: recovery_context,
-                    });
-                }
-                return Err(blob_store_application_error("blob publish", error).into());
-            }
-        };
-        drop(local_import_lease);
-        let stored = match self.verify_stored_blob(
-            outcome.blob(),
-            Some(&intent),
-            epoch,
-            "blob publish",
-            false,
-        ) {
-            Ok(stored) => stored,
-            Err(error) => {
-                if let Some(context) = live.as_deref_mut() {
-                    *context.fatal = Some(NodeError::FatalBlobCoherence(
-                        "durable live Blob commit failed post-commit verification".into(),
-                    ));
-                }
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = cache_authenticated_blob_route_claim(
-            &self.store,
-            &source_route_cache,
-            &self.verifier,
-            &stored.blob,
-            &stored.manifest_bytes,
-            &outcome.blob().sealed,
-            outcome.blob().acceptance_marker,
-        ) {
-            if let Some(context) = live {
-                *context.fatal = Some(live_blob_coherence_fatal(
-                    "durable live Blob commit cache transition",
-                    error,
-                ));
-                return Err(
-                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
-                );
-            }
-            return Err(application_error("blob publish", error).into());
-        }
-        Ok(blob_publish_result(&stored, outcome.inserted()))
     }
 
     /// Idempotently creates one durable metadata-only Blob subscription.
@@ -4478,36 +3741,16 @@ impl SelectedBlobNode {
                     .open_profile5_pack_application_read(stored.variant_id)
                 {
                     Ok(session) => {
-                        let open = session.open();
-                        let commitment = session.commitment();
+                        let verified_source = self.verify_profile5_stored_source(
+                            &stored,
+                            projection,
+                            &session,
+                            "blob poll",
+                        )?;
+                        let open = verified_source.publication().publication().open();
+                        let commitment = verified_source.physical_commitment().commitment();
                         let metadata = open.metadata();
-                        if open.publisher() != projection.publisher
-                            || open.topic() != &projection.topic
-                            || open.scope() != &projection.scope
-                            || open.content_epoch() != projection.epoch
-                            || open.total_len() != projection.total_len
-                            || commitment.blob_id() != projection.blob_id
-                            || commitment.segment_count() != projection.chunk_count
-                            || projection.chunk_size != BLOB_STREAM_SEGMENT_BYTES as u32
-                            || session.route_lineage() != &projection.route_lineage
-                            || session.physical_lineage() != &projection.physical_lineage
-                            || self.verifier.blob_stream_authorization_digest(
-                                open.scope(),
-                                open.content_epoch(),
-                            ) != Some(*session.route_lineage())
-                            || !self.verifier.is_current_blob_physical_lineage_binding(
-                                open.scope(),
-                                open.topic(),
-                                open.content_epoch(),
-                                session.physical_lineage(),
-                            )
-                            || stored.header.stamp.dot.publisher != open.publisher()
-                            || stored.header.stamp.dot.counter != open.publisher_counter()
-                            || stored.header.topic != *open.topic()
-                            || stored.header.scope != *open.scope()
-                            || stored.header.key_epoch != open.content_epoch()
-                            || stored.acceptance_marker != candidate.acceptance_marker()
-                        {
+                        if stored.acceptance_marker != candidate.acceptance_marker() {
                             return Err(ApplicationError::new(
                                 ApplicationErrorKind::Integrity,
                                 "blob poll",
@@ -4526,8 +3769,11 @@ impl SelectedBlobNode {
                             media_type: metadata.media_type().map(str::to_owned),
                             schema_id: metadata.schema_id().to_vec(),
                             acceptance_marker: stored.acceptance_marker,
-                            storage: VerifiedBlobDeliveryStorage::Profile5(session),
                         };
+                        // Poll returns authenticated metadata only. Keeping a
+                        // pack read lease per candidate would make page size
+                        // depend on the depot's concurrent-reader limit.
+                        drop(session);
                         if verified.insert(publication, delivery).is_some() {
                             return Err(ApplicationError::new(
                                 ApplicationErrorKind::Integrity,
@@ -4537,108 +3783,11 @@ impl SelectedBlobNode {
                         selection.deliverable.push(projection.semantic_id);
                         continue;
                     }
-                    Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
+                    Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                        return Err(incompatible_profile5_storage("blob poll"));
+                    }
                     Err(error) => return Err(application_error("blob poll", error.into())),
                 }
-                let current_lineage = {
-                    #[cfg(test)]
-                    if std::mem::replace(&mut self.live_poll_coherence_fault, false) {
-                        Err(NodeError::Protocol(
-                            "injected live Blob poll source-claim mismatch".into(),
-                        ))
-                    } else {
-                        self.source_route_cache.is_current_blob_source_projection(
-                            &self.verifier,
-                            projection,
-                            retention,
-                        )
-                    }
-                    #[cfg(not(test))]
-                    self.source_route_cache.is_current_blob_source_projection(
-                        &self.verifier,
-                        projection,
-                        retention,
-                    )
-                }
-                .map_err(|error| application_error("blob poll", error))?;
-                if !current_lineage {
-                    selection.inactive.push(projection.semantic_id);
-                    continue;
-                }
-                let opened =
-                    self.verify_stored_blob(&stored, None, current_epoch, "blob poll", false)?;
-                if opened.semantic_id != projection.semantic_id
-                    || opened.acceptance_marker != candidate.acceptance_marker()
-                    || opened.blob.topic() != &projection.topic
-                    || opened.blob.scope() != &projection.scope
-                    || opened.blob.publisher() != projection.publisher
-                    || opened.blob.key_epoch() != current_epoch
-                {
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob poll",
-                    ));
-                }
-                let (cache_current, completion) = self
-                    .source_route_cache
-                    .verify_completed_blob_source_claim(
-                        &self.verifier,
-                        projection,
-                        retention,
-                        &stored.sealed,
-                        opened.blob.blob_id(),
-                        opened.blob.manifest().total_len(),
-                        opened.blob.manifest().chunk_size(),
-                        opened.blob.manifest().chunk_count(),
-                        stored.variant_id,
-                    )
-                    .map_err(|error| application_error("blob poll", error))?;
-                if !cache_current
-                    || !self.verifier.is_current_source_route_lineage(
-                        opened.blob.scope(),
-                        opened.blob.key_epoch(),
-                        opened.blob.route_lineage(),
-                    )
-                    || !self.verifier.is_current_blob_physical_lineage(
-                        opened.blob.scope(),
-                        opened.blob.topic(),
-                        opened.blob.key_epoch(),
-                        opened.blob.physical_lineage(),
-                    )
-                {
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob poll",
-                    ));
-                }
-                self.store
-                    .blob_depot_for_authenticated_read(&completion)
-                    .and_then(|mut depot| depot.recheck_completion(&completion))
-                    .map_err(|error| application_error("blob poll", error.into()))?;
-
-                let metadata = opened.blob.manifest().metadata();
-                let delivery = VerifiedBlobDeliveryMetadata {
-                    publication,
-                    id: BlobId::from_core(opened.blob.blob_id()),
-                    publisher: opened.blob.publisher(),
-                    publisher_counter: opened.blob.dot().counter,
-                    topic: opened.blob.topic().clone(),
-                    scope: opened.blob.scope().clone(),
-                    priority: opened.blob.priority(),
-                    ttl_ms: opened.blob.ttl_ms(),
-                    total_len: opened.blob.manifest().total_len(),
-                    media_type: metadata.media_type().map(str::to_owned),
-                    schema_id: metadata.schema_id().to_vec(),
-                    acceptance_marker: opened.acceptance_marker,
-                    storage: VerifiedBlobDeliveryStorage::Legacy(completion),
-                };
-                if verified.insert(publication, delivery).is_some() {
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob poll",
-                    ));
-                }
-                selection.deliverable.push(projection.semantic_id);
             }
 
             // Retirements are one delivery family and always win the page. Verify
@@ -4650,6 +3799,13 @@ impl SelectedBlobNode {
                     .contains(&candidate.projection().semantic_id)
                     && candidate.acknowledged_attempt().is_none()
             });
+            #[cfg(test)]
+            if std::mem::replace(&mut self.live_poll_coherence_fault, false) {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob poll",
+                ));
+            }
             self.observe_current_blob_custody_sample("blob poll")?;
             let rechecked_plan = self
                 .store
@@ -4745,21 +3901,6 @@ impl SelectedBlobNode {
                         ApplicationErrorKind::Integrity,
                         "blob poll",
                     ));
-                }
-                match &metadata.storage {
-                    VerifiedBlobDeliveryStorage::Legacy(completion) => self
-                        .store
-                        .blob_depot_for_authenticated_read(completion)
-                        .and_then(|mut depot| depot.recheck_completion(completion))
-                        .map_err(|error| application_error("blob poll", error.into()))?,
-                    VerifiedBlobDeliveryStorage::Profile5(session) => {
-                        if session.commitment().blob_id().as_bytes() != metadata.id.as_bytes() {
-                            return Err(ApplicationError::new(
-                                ApplicationErrorKind::Integrity,
-                                "blob poll",
-                            ));
-                        }
-                    }
                 }
                 deliveries.push(BlobDeliveryItem::Content(
                     metadata.into_delivery(delivery.attempt, delivery.token),
@@ -4875,38 +4016,49 @@ impl SelectedBlobNode {
     ) -> Result<BlobPublicationInspection, ApplicationError> {
         let policy = self.current_policy("blob publication status")?;
         let token = *request.publication_id.as_bytes();
-        if let Some((upload, result)) = self.completed_publish_streams.get(&token) {
-            if upload.publication.topic != request.topic
-                || upload.publication.scope != request.scope
+        if let Some(completed) = self.completed_publish_streams.get(&token) {
+            if completed.request.publication.topic != request.topic
+                || completed.request.publication.scope != request.scope
             {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::NotFound,
                     "blob publication status",
                 ));
             }
+            let transfer_total_bytes = profile5_transfer_total_bytes(completed.result.total_len)?;
             return Ok(BlobPublicationInspection {
                 publication_id: request.publication_id,
                 phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: result.total_len,
-                durable_plaintext_bytes: result.total_len,
-                transfer_total_bytes: 0,
-                durable_transfer_bytes: 0,
-                total_units: result
+                plaintext_total_bytes: completed.result.total_len,
+                durable_plaintext_bytes: completed.result.total_len,
+                transfer_total_bytes,
+                durable_transfer_bytes: transfer_total_bytes,
+                total_units: completed
+                    .result
                     .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                durable_units: result
+                    .div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
+                durable_units: completed
+                    .result
                     .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                blob_id: Some(result.id),
+                    .div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
+                blob_id: Some(completed.result.id),
             });
         }
-        // A canonical operation is authoritative even while cleanup authority
+        // A lifecycle operation is authoritative even while cleanup authority
         // for its provisional pack remains durably charged after a crash.
-        if let Some(stored) = self
+        let local_publication = match self
             .store
             .blob_for_local_publication_with_policy(&policy, request.publication_id.into_core())
-            .map_err(|error| application_error("blob publication status", error.into()))?
         {
+            Ok(stored) => stored,
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => {
+                return Ok(retired_blob_publication_inspection(request.publication_id));
+            }
+            Err(error) => {
+                return Err(application_error("blob publication status", error.into()));
+            }
+        };
+        if let Some(stored) = local_publication {
             if stored.header.topic != request.topic || stored.header.scope != request.scope {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::NotFound,
@@ -4925,8 +4077,17 @@ impl SelectedBlobNode {
                 .open_profile5_pack_application_read(stored.variant_id)
             {
                 Ok(session) => {
-                    let open = session.open();
-                    let commitment = session.commitment();
+                    let transfer_total_bytes = session.wire_len();
+                    let (projection, _) =
+                        self.completed_projection(&stored, "blob publication status")?;
+                    let verified = self.verify_profile5_stored_source(
+                        &stored,
+                        &projection,
+                        &session,
+                        "blob publication status",
+                    )?;
+                    let open = verified.publication().publication().open();
+                    let commitment = verified.physical_commitment().commitment();
                     if open.stream_id() != request.publication_id.into_core()
                         || open.topic() != &request.topic
                         || open.scope() != &request.scope
@@ -4946,36 +4107,20 @@ impl SelectedBlobNode {
                         phase: BlobPublicationPhase::Available,
                         plaintext_total_bytes: open.total_len(),
                         durable_plaintext_bytes: open.total_len(),
-                        transfer_total_bytes: 0,
-                        durable_transfer_bytes: 0,
+                        transfer_total_bytes,
+                        durable_transfer_bytes: transfer_total_bytes,
                         total_units: commitment.segment_count(),
                         durable_units: commitment.segment_count(),
                         blob_id: Some(BlobId::from_core(commitment.blob_id())),
                     });
                 }
-                Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
+                Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                    return Err(incompatible_profile5_storage("blob publication status"));
+                }
                 Err(error) => {
                     return Err(application_error("blob publication status", error.into()));
                 }
             }
-            let verified =
-                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
-            let result = blob_publish_result(&verified, false);
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: result.total_len,
-                durable_plaintext_bytes: result.total_len,
-                transfer_total_bytes: 0,
-                durable_transfer_bytes: 0,
-                total_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                durable_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                blob_id: Some(result.id),
-            });
         }
         if let Some(upload) = self.publish_streams.get(&token) {
             if upload.request.topic != request.topic || upload.request.scope != request.scope {
@@ -4985,6 +4130,7 @@ impl SelectedBlobNode {
                 ));
             }
             let durable_plaintext = upload.checkpoint.durable_plaintext_offset();
+            let transfer_total_bytes = profile5_transfer_total_bytes(upload.total_len)?;
             let durable_units = upload
                 .checkpoint
                 .durable_pack_checkpoint()
@@ -5000,11 +4146,11 @@ impl SelectedBlobNode {
                 },
                 plaintext_total_bytes: upload.total_len,
                 durable_plaintext_bytes: durable_plaintext,
-                transfer_total_bytes: upload.reservation.staging_charge_bytes(),
+                transfer_total_bytes,
                 durable_transfer_bytes: upload
                     .checkpoint
                     .durable_pack_checkpoint()
-                    .map_or(0, |checkpoint| checkpoint.pack_len()),
+                    .map_or(0, |checkpoint| checkpoint.payload_len()),
                 total_units: upload.total_len.div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
                 durable_units,
                 blob_id: None,
@@ -5042,6 +4188,7 @@ impl SelectedBlobNode {
                 ));
             }
             let durable_plaintext = checkpoint.durable_plaintext_offset();
+            let transfer_total_bytes = profile5_transfer_total_bytes(upload.total_len)?;
             return Ok(BlobPublicationInspection {
                 publication_id: request.publication_id,
                 phase: if durable_plaintext == 0 {
@@ -5053,10 +4200,10 @@ impl SelectedBlobNode {
                 },
                 plaintext_total_bytes: upload.total_len,
                 durable_plaintext_bytes: durable_plaintext,
-                transfer_total_bytes: reservation.staging_charge_bytes(),
+                transfer_total_bytes,
                 durable_transfer_bytes: checkpoint
                     .durable_pack_checkpoint()
-                    .map_or(0, |checkpoint| checkpoint.pack_len()),
+                    .map_or(0, |checkpoint| checkpoint.payload_len()),
                 total_units: upload.total_len.div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
                 durable_units: checkpoint
                     .durable_pack_checkpoint()
@@ -5065,16 +4212,20 @@ impl SelectedBlobNode {
             });
         }
         // Incoming profile-5 publication identity is the authenticated source
-        // transfer ID. Canonical content authority wins over a residual
-        // settlement receipt; the receipt projects progress only before the
-        // publication is available. No adapter identity is stored.
+        // transfer ID. Native pack upload state and its checkpoint journal are
+        // the only pre-publication progress authority.
         let profile5_source =
             aster_redb_store::BlobTransferId::new(*request.publication_id.as_bytes());
-        if let Some(stored) = self
-            .store
-            .get_blob(profile5_source)
-            .map_err(|error| application_error("blob publication status", error.into()))?
-        {
+        let received_publication = match self.store.get_blob(profile5_source) {
+            Ok(stored) => stored,
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => {
+                return Ok(retired_blob_publication_inspection(request.publication_id));
+            }
+            Err(error) => {
+                return Err(application_error("blob publication status", error.into()));
+            }
+        };
+        if let Some(stored) = received_publication {
             if stored.header.topic != request.topic || stored.header.scope != request.scope {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::NotFound,
@@ -5088,77 +4239,55 @@ impl SelectedBlobNode {
                 epoch,
                 "blob publication status",
             )?;
-            let verified =
-                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
-            let result = blob_publish_result(&verified, false);
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: result.total_len,
-                durable_plaintext_bytes: result.total_len,
-                transfer_total_bytes: 0,
-                durable_transfer_bytes: 0,
-                total_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                durable_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                blob_id: Some(result.id),
-            });
-        }
-        if let Some((receipt, progress)) = self
-            .store
-            .resume_profile5_receipt(profile5_source)
-            .map_err(|error| application_error("blob publication status", error.into()))?
-        {
-            let projection = self
+            match self
                 .store
-                .blob_source_projection(profile5_source)
-                .map_err(|error| application_error("blob publication status", error.into()))?
-                .ok_or_else(|| {
-                    ApplicationError::new(
-                        ApplicationErrorKind::StateUnavailable,
-                        "blob publication status",
-                    )
-                })?;
-            if projection.source.topic != request.topic || projection.source.scope != request.scope
+                .open_profile5_pack_application_read(stored.variant_id)
             {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
+                Ok(session) => {
+                    let transfer_total_bytes = session.wire_len();
+                    let (projection, _) =
+                        self.completed_projection(&stored, "blob publication status")?;
+                    let verified = self.verify_profile5_stored_source(
+                        &stored,
+                        &projection,
+                        &session,
+                        "blob publication status",
+                    )?;
+                    let open = verified.publication().publication().open();
+                    let commitment = verified.physical_commitment().commitment();
+                    if stored.transfer_id.as_bytes() != request.publication_id.as_bytes()
+                        || open.topic() != &request.topic
+                        || open.scope() != &request.scope
+                        || open.content_epoch() > epoch
+                        || commitment.blob_id() != stored.blob_id
+                        || stored.header.stamp.dot.publisher != open.publisher()
+                        || stored.header.stamp.dot.counter != open.publisher_counter()
+                        || stored.header.key_epoch != open.content_epoch()
+                    {
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "blob publication status",
+                        ));
+                    }
+                    return Ok(BlobPublicationInspection {
+                        publication_id: request.publication_id,
+                        phase: BlobPublicationPhase::Available,
+                        plaintext_total_bytes: open.total_len(),
+                        durable_plaintext_bytes: open.total_len(),
+                        transfer_total_bytes,
+                        durable_transfer_bytes: transfer_total_bytes,
+                        total_units: commitment.segment_count(),
+                        durable_units: commitment.segment_count(),
+                        blob_id: Some(BlobId::from_core(commitment.blob_id())),
+                    });
+                }
+                Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                    return Err(incompatible_profile5_storage("blob publication status"));
+                }
+                Err(error) => {
+                    return Err(application_error("blob publication status", error.into()));
+                }
             }
-            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
-            self.require_blob_grants(
-                &request.topic,
-                &request.scope,
-                epoch,
-                "blob publication status",
-            )?;
-            if projection.source.epoch != epoch {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::ExpiredOrRetired,
-                    "blob publication status",
-                ));
-            }
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: if progress.durable_plaintext_offset() == 0 {
-                    BlobPublicationPhase::AwaitingData
-                } else if progress.durable_plaintext_offset() < receipt.plaintext_total_bytes() {
-                    BlobPublicationPhase::Receiving
-                } else {
-                    BlobPublicationPhase::ReadyToFinalize
-                },
-                plaintext_total_bytes: receipt.plaintext_total_bytes(),
-                durable_plaintext_bytes: progress.durable_plaintext_offset(),
-                transfer_total_bytes: receipt.transfer_total_bytes(),
-                durable_transfer_bytes: progress.durable_wire_offset(),
-                total_units: receipt.total_units(),
-                durable_units: progress.next_segment_index(),
-                blob_id: None,
-            });
         }
         Ok(BlobPublicationInspection {
             publication_id: request.publication_id,
@@ -5400,236 +4529,95 @@ impl SelectedBlobNode {
             epoch,
             "blob read page",
         )?;
-        let source_route_cache = Arc::clone(&self.source_route_cache);
-        let initial_lifecycle = match source_route_cache.lock_blob_lifecycle() {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                *fatal = Some(live_blob_coherence_fatal(
-                    "initial live Blob read lifecycle lock",
-                    error,
-                ));
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-        };
-        if live_blob_read_cancelled(admission, response) {
-            drop(initial_lifecycle);
-            return Err(actor_unavailable("blob read page"));
-        }
-        let read_projection = {
-            #[cfg(test)]
-            if std::mem::replace(&mut self.live_read_projection_coherence_fault, false) {
-                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "injected orphan live Blob content index",
-                )))
-            } else {
-                self.store.prepare_blob_read_with_policy(
-                    &policy,
-                    &request.blob.topic,
-                    &request.blob.scope,
-                    request.blob.id.into_core(),
-                )
-            }
-            #[cfg(not(test))]
-            self.store.prepare_blob_read_with_policy(
-                &policy,
-                &request.blob.topic,
-                &request.blob.scope,
-                request.blob.id.into_core(),
-            )
-        };
-        let plan = match read_projection {
-            Ok(plan) => plan,
-            Err(StoreError::Blob(BlobStoreError::NotFound)) => {
-                drop(initial_lifecycle);
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob read page",
-                ));
-            }
-            Err(error) => {
-                if live_blob_durable_coherence_error(&error) {
+        let reusable = self.read_cache.as_ref().is_some_and(|cache| {
+            cache.request == request.blob && cache.next_offset == request.offset
+        });
+        let mut cache = if reusable {
+            self.read_cache.take().expect("reusable Blob read cache")
+        } else {
+            self.finish_read_cache();
+            let source_route_cache = Arc::clone(&self.source_route_cache);
+            let initial_lifecycle = match source_route_cache.lock_blob_lifecycle() {
+                Ok(lifecycle) => lifecycle,
+                Err(error) => {
                     *fatal = Some(live_blob_coherence_fatal(
-                        "live Blob durable read projection",
-                        error.into(),
+                        "initial live Blob read lifecycle lock",
+                        error,
                     ));
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::Integrity,
                         "blob read page",
                     ));
                 }
-                return Err(application_error("blob read page", error.into()));
+            };
+            if live_blob_read_cancelled(admission, response) {
+                drop(initial_lifecycle);
+                return Err(actor_unavailable("blob read page"));
             }
-        };
-        if let Some(selected) = self.prepare_profile5_live_read(&plan, epoch, fatal)? {
-            drop(initial_lifecycle);
-            return self.read_profile5_page(
-                request, &policy, &plan, selected, admission, response, fatal,
-            );
-        }
-        let selected = self.verify_live_read_plan(&plan, epoch, fatal)?;
-        if live_blob_read_cancelled(admission, response) {
-            return Err(actor_unavailable("blob read page"));
-        }
-        let total_len = selected.stored.blob.manifest().total_len();
-        if total_len == 0 {
-            if request.offset != 0 {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::InvalidRequest,
-                    "blob read page",
-                ));
-            }
-            self.require_live_read_authority(&policy, &plan, &selected, 0, 0, fatal)?;
-            let metadata = selected.stored.blob.manifest().metadata();
-            return Ok(BlobReadPage {
-                publication: BlobPublicationId::from_store(selected.stored.semantic_id),
-                id: BlobId::from_core(selected.stored.blob.blob_id()),
-                publisher: selected.stored.blob.publisher(),
-                publisher_counter: selected.stored.blob.dot().counter,
-                priority: selected.stored.blob.priority(),
-                ttl_ms: selected.stored.blob.ttl_ms(),
-                total_len,
-                media_type: metadata.media_type().map(str::to_owned),
-                schema_id: metadata.schema_id().to_vec(),
-                acceptance_marker: selected.stored.acceptance_marker,
-                offset: 0,
-                complete: true,
-                next_offset: 0,
-                plaintext: Zeroizing::new(Vec::new()),
-            });
-        }
-        if request.offset >= total_len {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::InvalidRequest,
-                "blob read page",
-            ));
-        }
-        let remaining = total_len - request.offset;
-        let page_len = usize::try_from(remaining.min(request.max_bytes as u64)).map_err(|_| {
-            ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob read page")
-        })?;
-        let next_offset = request
-            .offset
-            .checked_add(u64::try_from(page_len).map_err(|_| {
-                ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob read page")
-            })?)
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob read page")
-            })?;
-        let complete = next_offset == total_len;
-        let first_chunk = request.offset / u64::from(SELECTED_BLOB_CHUNK_SIZE);
-        let last_chunk = next_offset
-            .checked_sub(1)
-            .map(|last_byte| last_byte / u64::from(SELECTED_BLOB_CHUNK_SIZE))
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-            })?;
-        let range_chunk_count = last_chunk
-            .checked_sub(first_chunk)
-            .and_then(|span| span.checked_add(1))
-            .filter(|count| (1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(count))
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-            })?;
-
-        self.require_live_read_authority(
-            &policy,
-            &plan,
-            &selected,
-            first_chunk,
-            range_chunk_count,
-            fatal,
-        )?;
-        drop(initial_lifecycle);
-        let mut plaintext = Zeroizing::new(vec![0u8; page_len]);
-        let decrypt_result = (|| -> Result<(), ApplicationError> {
-            let mut service = self
-                .verifier
-                .blob_service_with_store(
-                    selected.stored.blob.scope(),
-                    selected.stored.blob.topic(),
-                    selected.stored.blob.key_epoch(),
-                    self.store
-                        .blob_depot_for_authenticated_read(&selected.completion)
-                        .map_err(|error| application_error("blob read page", error.into()))?,
+            let read_projection = {
+                #[cfg(test)]
+                if std::mem::replace(&mut self.live_read_projection_coherence_fault, false) {
+                    Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                        "injected orphan live Blob content index",
+                    )))
+                } else {
+                    self.store.prepare_blob_read_with_policy(
+                        &policy,
+                        &request.blob.topic,
+                        &request.blob.scope,
+                        request.blob.id.into_core(),
+                    )
+                }
+                #[cfg(not(test))]
+                self.store.prepare_blob_read_with_policy(
+                    &policy,
+                    &request.blob.topic,
+                    &request.blob.scope,
+                    request.blob.id.into_core(),
                 )
-                .map_err(|error| application_error("blob read page", error.into()))?;
-            let stats = service
-                .read_range_for_verified(&selected.stored.blob, request.offset, &mut plaintext)
-                .map_err(|error| blob_core_error("blob read page", error))?;
-            if stats.plaintext_bytes != page_len as u64
-                || stats.verified_chunks != range_chunk_count
-                || !(1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(&stats.verified_chunks)
-            {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = decrypt_result {
-            if error.kind() == ApplicationErrorKind::Integrity {
-                *fatal = Some(NodeError::FatalBlobCoherence(
-                    "bounded live Blob page decryption failed integrity verification".into(),
-                ));
-            }
-            return Err(error);
-        }
-        if live_blob_read_cancelled(admission, response) {
-            return Err(actor_unavailable("blob read page"));
-        }
-        #[cfg(test)]
-        if let Some((reached, release)) = self.final_read_gate.take() {
-            reached.wait();
-            release.wait();
-        }
-        let final_lifecycle = match source_route_cache.lock_blob_lifecycle() {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                *fatal = Some(live_blob_coherence_fatal(
-                    "final live Blob read lifecycle lock",
-                    error,
-                ));
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
+            };
+            let plan = match read_projection {
+                Ok(plan) => plan,
+                Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                    drop(initial_lifecycle);
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::NotFound,
+                        "blob read page",
+                    ));
+                }
+                Err(error) => {
+                    if live_blob_durable_coherence_error(&error) {
+                        *fatal = Some(live_blob_coherence_fatal(
+                            "live Blob durable read projection",
+                            error.into(),
+                        ));
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "blob read page",
+                        ));
+                    }
+                    return Err(application_error("blob read page", error.into()));
+                }
+            };
+            let selected = self.prepare_profile5_live_read(&plan, epoch, fatal)?;
+            let cache = self.prepare_profile5_read_cache(
+                request.blob.clone(),
+                request.offset,
+                plan,
+                selected,
+                fatal,
+            )?;
+            drop(initial_lifecycle);
+            cache
         };
-        if live_blob_read_cancelled(admission, response) {
-            drop(final_lifecycle);
-            return Err(actor_unavailable("blob read page"));
+        let result = self
+            .read_profile5_cached_page(&request, &policy, epoch, &mut cache, admission, response);
+        if result.as_ref().is_ok_and(|page| !page.complete) {
+            self.read_cache = Some(cache);
+        } else {
+            self.record_finished_read_cache(cache);
         }
-        self.require_live_read_authority(
-            &policy,
-            &plan,
-            &selected,
-            first_chunk,
-            range_chunk_count,
-            fatal,
-        )?;
-        let metadata = selected.stored.blob.manifest().metadata();
-        let page = BlobReadPage {
-            publication: BlobPublicationId::from_store(selected.stored.semantic_id),
-            id: BlobId::from_core(selected.stored.blob.blob_id()),
-            publisher: selected.stored.blob.publisher(),
-            publisher_counter: selected.stored.blob.dot().counter,
-            priority: selected.stored.blob.priority(),
-            ttl_ms: selected.stored.blob.ttl_ms(),
-            total_len,
-            media_type: metadata.media_type().map(str::to_owned),
-            schema_id: metadata.schema_id().to_vec(),
-            acceptance_marker: selected.stored.acceptance_marker,
-            offset: request.offset,
-            complete,
-            next_offset,
-            plaintext,
-        };
-        drop(final_lifecycle);
-        Ok(page)
+        result
     }
 
     fn prepare_profile5_live_read(
@@ -5637,9 +4625,12 @@ impl SelectedBlobNode {
         plan: &BlobReadPlan,
         current_epoch: u64,
         fatal: &mut Option<NodeError>,
-    ) -> Result<Option<VerifiedProfile5LiveBlob>, ApplicationError> {
+    ) -> Result<VerifiedProfile5LiveBlob, ApplicationError> {
         let Some(plan_current) = plan.current() else {
-            return Ok(None);
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnauthorizedOrRevoked,
+                "blob read page",
+            ));
         };
         let exact_stored = match self
             .store
@@ -5648,14 +4639,13 @@ impl SelectedBlobNode {
             Ok(stored) => stored,
             Err(error) => return Err(application_error("blob read page", error.into())),
         };
-        let session = match self
-            .store
-            .open_profile5_pack_application_read(exact_stored.variant_id)
-        {
-            Ok(session) => session,
-            Err(StoreError::Blob(BlobStoreError::NotFound)) => return Ok(None),
-            Err(error) => return Err(application_error("blob read page", error.into())),
-        };
+        #[cfg(test)]
+        if std::mem::replace(&mut self.live_selected_load_policy_race_fault, false) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::PolicyUnsettled,
+                "blob read page",
+            ));
+        }
         let mut active = Vec::new();
         for candidate in plan.candidates() {
             let projection = candidate.projection();
@@ -5703,6 +4693,8 @@ impl SelectedBlobNode {
             }
         }
         let projection = plan_current.projection().clone();
+        #[cfg(test)]
+        let mut projection = projection;
         if projection.semantic_id != selected
             || exact_stored.transfer_id != projection.transfer_id
             || exact_stored.semantic_id != projection.semantic_id
@@ -5713,39 +4705,61 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
-        let open = self
+        if self
             .verifier
-            .verify_blob_stream_open(session.authenticated_open())
-            .map_err(|error| application_error("blob read page", error.into()))?;
-        self.verifier
-            .verify_blob_stream_commitment(&open, session.authenticated_commitment())
-            .map_err(|error| application_error("blob read page", error.into()))?;
-        let commitment = session.commitment().clone();
-        let open_value = open.open();
-        if open_value.publisher() != projection.publisher
-            || open_value.topic() != &projection.topic
-            || open_value.scope() != &projection.scope
-            || open_value.content_epoch() != projection.epoch
-            || open_value.total_len() != projection.total_len
-            || commitment.blob_id() != projection.blob_id
-            || commitment.total_len() != projection.total_len
-            || commitment.segment_count() != projection.chunk_count
-            || projection.chunk_size != BLOB_STREAM_SEGMENT_BYTES as u32
-            || session.route_lineage() != &projection.route_lineage
-            || session.physical_lineage() != &projection.physical_lineage
-            || exact_stored.route_lineage != Some(projection.route_lineage)
-            || exact_stored.physical_lineage != Some(projection.physical_lineage)
-            || exact_stored.header.stamp.dot.publisher != open_value.publisher()
-            || exact_stored.header.stamp.dot.counter != open_value.publisher_counter()
-            || exact_stored.header.topic != *open_value.topic()
-            || exact_stored.header.scope != *open_value.scope()
-            || exact_stored.header.priority != open_value.priority()
-            || exact_stored.header.ttl_ms != open_value.ttl_ms()
-            || exact_stored.header.key_epoch != open_value.content_epoch()
-            || self
-                .verifier
-                .blob_stream_authorization_digest(open_value.scope(), open_value.content_epoch())
-                != Some(projection.route_lineage)
+            .blob_stream_authorization_digest(&projection.scope, projection.epoch)
+            != Some(projection.route_lineage)
+            || !self.verifier.is_current_blob_physical_lineage_binding(
+                &projection.scope,
+                &projection.topic,
+                projection.epoch,
+                &projection.physical_lineage,
+            )
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnauthorizedOrRevoked,
+                "blob read page",
+            ));
+        }
+        let session = match self
+            .store
+            .open_profile5_pack_application_read(exact_stored.variant_id)
+        {
+            Ok(session) => session,
+            Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                return Err(incompatible_profile5_storage("blob read page"));
+            }
+            Err(error) => return Err(application_error("blob read page", error.into())),
+        };
+        #[cfg(test)]
+        if std::mem::replace(&mut self.live_pack_projection_coherence_fault, false) {
+            projection.route_lineage[0] ^= 1;
+        }
+        let authority = match self.verify_profile5_stored_source(
+            &exact_stored,
+            &projection,
+            &session,
+            "blob read page",
+        ) {
+            Ok(authority) => authority,
+            Err(_) => {
+                *fatal = Some(NodeError::FatalBlobCoherence(
+                    "live Profile-5 Blob source proof differs from its read plan".into(),
+                ));
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+        };
+        let publication = authority.publication().clone();
+        let physical_open = authority.physical_open().clone();
+        let commitment = authority.physical_commitment().commitment().clone();
+        let open_value = publication.publication().open();
+        if self
+            .verifier
+            .blob_stream_authorization_digest(open_value.scope(), open_value.content_epoch())
+            != Some(projection.route_lineage)
             || !self.verifier.is_current_blob_physical_lineage_binding(
                 open_value.scope(),
                 open_value.topic(),
@@ -5753,23 +4767,21 @@ impl SelectedBlobNode {
                 &projection.physical_lineage,
             )
         {
-            *fatal = Some(NodeError::FatalBlobCoherence(
-                "live Profile-5 Blob source proof differs from its read plan".into(),
-            ));
             return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
+                ApplicationErrorKind::UnauthorizedOrRevoked,
                 "blob read page",
             ));
         }
-        Ok(Some(VerifiedProfile5LiveBlob {
+        Ok(VerifiedProfile5LiveBlob {
             retention: BlobSourceRetention::Completed {
                 acceptance_marker: plan_current.acceptance_marker(),
             },
             stored: exact_stored,
             projection,
-            open,
+            publication,
+            physical_open,
             commitment,
-        }))
+        })
     }
 
     fn require_profile5_live_read_authority(
@@ -5788,23 +4800,11 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
-        self.store
-            .require_blob_read_plan_with_policy(policy, plan)
-            .map_err(|error| application_error("blob read page", error.into()))?;
-        let retained = self
+        let open = selected.publication.publication().open();
+        if self
             .store
-            .blob_source_projection(selected.projection.transfer_id)
+            .is_control_principal_revoked(open.publisher())
             .map_err(|error| application_error("blob read page", error.into()))?
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-            })?;
-        let open = selected.open.open();
-        if retained.source != selected.projection
-            || retained.retention != selected.retention
-            || self
-                .store
-                .is_control_principal_revoked(open.publisher())
-                .map_err(|error| application_error("blob read page", error.into()))?
             || self
                 .verifier
                 .blob_stream_authorization_digest(open.scope(), open.content_epoch())
@@ -5821,27 +4821,205 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
+        self.store
+            .require_blob_read_plan_with_policy(policy, plan)
+            .map_err(|error| application_error("blob read page", error.into()))?;
+        let retained = self
+            .store
+            .blob_source_projection(selected.projection.transfer_id)
+            .map_err(|error| application_error("blob read page", error.into()))?
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+            })?;
+        if retained.source != selected.projection || retained.retention != selected.retention {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnauthorizedOrRevoked,
+                "blob read page",
+            ));
+        }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn read_profile5_page(
-        &mut self,
-        request: BlobReadPageRequest,
-        policy: &ControlPolicySnapshot,
-        plan: &BlobReadPlan,
+    fn prepare_profile5_read_cache(
+        &self,
+        request: BlobReadRequest,
+        offset: u64,
+        plan: BlobReadPlan,
         selected: VerifiedProfile5LiveBlob,
-        admission: &AtomicBool,
-        response: Option<&oneshot::Sender<Result<BlobReadPage, ApplicationError>>>,
         fatal: &mut Option<NodeError>,
-    ) -> Result<BlobReadPage, ApplicationError> {
-        let open = selected.open.open();
+    ) -> Result<LocalBlobReadCache, ApplicationError> {
+        let open = selected.publication.publication().open();
         let total_len = open.total_len();
-        if (total_len == 0 && request.offset != 0)
-            || (total_len != 0 && request.offset >= total_len)
-        {
+        if (total_len == 0 && offset != 0) || (total_len != 0 && offset >= total_len) {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
+                "blob read page",
+            ));
+        }
+        let segment_count = selected.commitment.segment_count();
+        if segment_count != total_len.div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64) {
+            *fatal = Some(NodeError::FatalBlobCoherence(
+                "live Profile-5 Blob commitment has an invalid segment count".into(),
+            ));
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob read page",
+            ));
+        }
+        let first_segment = offset / BLOB_STREAM_SEGMENT_BYTES as u64;
+        let (reader, map_pool) = if segment_count == 0 {
+            (None, None)
+        } else {
+            let reader = self
+                .store
+                .open_profile5_pack_application_read_at_segment(
+                    selected.stored.variant_id,
+                    first_segment,
+                )
+                .map_err(|error| application_error("blob read page", error.into()))?;
+            if reader.authenticated_open() != selected.physical_open.authenticated_bytes()
+                || reader.commitment() != &selected.commitment
+                || reader.route_lineage() != selected.physical_open.open().authorization_digest()
+                || reader.physical_lineage() != &selected.projection.physical_lineage
+            {
+                *fatal = Some(NodeError::FatalBlobCoherence(
+                    "live Profile-5 Blob pack changed before bounded read".into(),
+                ));
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+            let opener = self
+                .verifier
+                .blob_stream_segment_opener(&selected.physical_open)
+                .map_err(|error| application_error("blob read page", error.into()))?;
+            let physical_open = selected.physical_open.open();
+            let stream_id = *physical_open.stream_id().as_bytes();
+            let open_digest = physical_open.digest();
+            let physical_total_len = physical_open.total_len();
+            if physical_total_len != total_len {
+                *fatal = Some(NodeError::FatalBlobCoherence(
+                    "live Profile-5 Blob physical and semantic lengths differ".into(),
+                ));
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+            let pool = FixedPartitionMapPool::new(
+                BLOB_READ_MAP_WORKERS,
+                BLOB_READ_PIPELINE_ITEMS as usize,
+                move |partition| {
+                    let expected_index = partition.index();
+                    let record = partition.into_bytes();
+                    let (prefix, encoded) = record.split_at_checked(4).ok_or_else(|| {
+                        PipelineError::MapFailed("Blob read record is truncated".into())
+                    })?;
+                    let declared = u32::from_be_bytes(
+                        prefix
+                            .try_into()
+                            .map_err(|_| PipelineError::MapFailed("invalid length".into()))?,
+                    ) as usize;
+                    if declared == 0 || declared != encoded.len() {
+                        return Err(PipelineError::MapFailed(
+                            "Blob read record length is invalid".into(),
+                        ));
+                    }
+                    let segment = EncryptedBlobStreamSegment::decode(encoded)
+                        .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+                    let header = segment.header();
+                    if header.index() != expected_index
+                        || header.stream_id() != &stream_id
+                        || header.open_digest() != &open_digest
+                        || header.total_len() != physical_total_len
+                        || header.offset()
+                            != expected_index
+                                .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+                                .ok_or_else(|| {
+                                    PipelineError::MapFailed("Blob read offset overflow".into())
+                                })?
+                    {
+                        return Err(PipelineError::MapFailed(
+                            "Blob read segment identity is invalid".into(),
+                        ));
+                    }
+                    let (plaintext, _) = opener
+                        .open(&segment)
+                        .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+                    if plaintext.len() != header.plaintext_len() as usize {
+                        return Err(PipelineError::MapFailed(
+                            "Blob read plaintext length is invalid".into(),
+                        ));
+                    }
+                    Ok(OpenedBlobReadSegment {
+                        offset: header.offset(),
+                        plaintext,
+                    })
+                },
+            )
+            .map_err(blob_read_pipeline_error)?;
+            (Some(reader), Some(pool))
+        };
+        let mut cache = LocalBlobReadCache {
+            request,
+            plan,
+            selected,
+            reader,
+            map_pool,
+            mapped: BTreeMap::new(),
+            submitted_index: first_segment,
+            next_segment_index: first_segment,
+            segment_count,
+            active_segment: None,
+            active_position: 0,
+            next_offset: offset,
+            #[cfg(test)]
+            opened_segments: 0,
+        };
+        cache.fill_pipeline()?;
+        Ok(cache)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_profile5_cached_page(
+        &mut self,
+        request: &BlobReadPageRequest,
+        policy: &ControlPolicySnapshot,
+        current_epoch: u64,
+        cache: &mut LocalBlobReadCache,
+        admission: &AtomicBool,
+        response: Option<&oneshot::Sender<Result<BlobReadPage, ApplicationError>>>,
+    ) -> Result<BlobReadPage, ApplicationError> {
+        let (
+            total_len,
+            content_epoch,
+            publisher,
+            publisher_counter,
+            priority,
+            ttl_ms,
+            media_type,
+            schema_id,
+        ) = {
+            let open = cache.selected.publication.publication().open();
+            let metadata = open.metadata();
+            (
+                open.total_len(),
+                open.content_epoch(),
+                open.publisher(),
+                open.publisher_counter(),
+                open.priority(),
+                open.ttl_ms(),
+                metadata.media_type().map(str::to_owned),
+                metadata.schema_id().to_vec(),
+            )
+        };
+        if cache.request != request.blob
+            || cache.next_offset != request.offset
+            || content_epoch != current_epoch
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnauthorizedOrRevoked,
                 "blob read page",
             ));
         }
@@ -5856,83 +5034,60 @@ impl SelectedBlobNode {
         let next_offset = request.offset.checked_add(page_len as u64).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob read page")
         })?;
-        self.require_profile5_live_read_authority(policy, plan, &selected)?;
+        self.require_profile5_live_read_authority(policy, &cache.plan, &cache.selected)?;
         if live_blob_read_cancelled(admission, response) {
             return Err(actor_unavailable("blob read page"));
         }
 
         let mut plaintext = Zeroizing::new(vec![0; page_len]);
-        let mut session = None;
-        if page_len != 0 {
-            let first_segment = request.offset / BLOB_STREAM_SEGMENT_BYTES as u64;
-            let last_segment = (next_offset - 1) / BLOB_STREAM_SEGMENT_BYTES as u64;
-            let mut reader = self
-                .store
-                .open_profile5_pack_application_read_at_segment(
-                    selected.stored.variant_id,
-                    first_segment,
-                )
-                .map_err(|error| application_error("blob read page", error.into()))?;
-            if reader.authenticated_open() != selected.open.authenticated_bytes()
-                || reader.commitment() != &selected.commitment
-                || reader.route_lineage() != &selected.projection.route_lineage
-                || reader.physical_lineage() != &selected.projection.physical_lineage
-            {
-                *fatal = Some(NodeError::FatalBlobCoherence(
-                    "live Profile-5 Blob pack changed before bounded read".into(),
-                ));
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-            let opener = self
-                .verifier
-                .blob_stream_segment_opener(&selected.open)
-                .map_err(|error| application_error("blob read page", error.into()))?;
-            let mut copied = 0usize;
-            for expected_index in first_segment..=last_segment {
-                let segment = reader
-                    .next_segment()
-                    .map_err(|error| application_error("blob read page", error.into()))?
+        let mut copied = 0usize;
+        while copied < page_len {
+            if cache.active_segment.is_none() {
+                let opened = cache.next_opened_segment()?;
+                let target = request.offset.checked_add(copied as u64).ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?;
+                let end = opened
+                    .offset
+                    .checked_add(opened.plaintext.len() as u64)
                     .ok_or_else(|| {
                         ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
                     })?;
-                if segment.index() != expected_index {
+                if target < opened.offset || target >= end {
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::Integrity,
                         "blob read page",
                     ));
                 }
-                let segment_offset = segment.offset();
-                let (opened, _) = opener
-                    .open(&segment)
-                    .map_err(|error| blob_core_error("blob read page", error))?;
-                let copy_start = request.offset.max(segment_offset);
-                let copy_end =
-                    next_offset.min(segment_offset.checked_add(opened.len() as u64).ok_or_else(
-                        || ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page"),
-                    )?);
-                let source_start = usize::try_from(copy_start - segment_offset).map_err(|_| {
+                cache.active_position = usize::try_from(target - opened.offset).map_err(|_| {
                     ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
                 })?;
-                let copy_len = usize::try_from(copy_end - copy_start).map_err(|_| {
-                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-                })?;
-                plaintext[copied..copied + copy_len]
-                    .copy_from_slice(&opened[source_start..source_start + copy_len]);
-                copied += copy_len;
+                cache.active_segment = Some(opened);
             }
-            if copied != page_len {
-                *fatal = Some(NodeError::FatalBlobCoherence(
-                    "bounded Profile-5 Blob page decryption was incomplete".into(),
-                ));
+            let active = cache.active_segment.as_ref().expect("active Blob segment");
+            let available = active
+                .plaintext
+                .len()
+                .checked_sub(cache.active_position)
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
+                })?;
+            if available == 0 {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "blob read page",
                 ));
             }
-            session = Some(reader);
+            let copy_len = available.min(page_len - copied);
+            plaintext[copied..copied + copy_len].copy_from_slice(
+                &active.plaintext[cache.active_position..cache.active_position + copy_len],
+            );
+            copied += copy_len;
+            cache.active_position += copy_len;
+            if cache.active_position == active.plaintext.len() {
+                cache.active_segment = None;
+                cache.active_position = 0;
+            }
         }
         if live_blob_read_cancelled(admission, response) {
             return Err(actor_unavailable("blob read page"));
@@ -5946,20 +5101,22 @@ impl SelectedBlobNode {
         let _final_lifecycle = source_route_cache
             .lock_blob_lifecycle()
             .map_err(|error| application_error("blob read page", error))?;
-        self.require_profile5_live_read_authority(policy, plan, &selected)?;
-        drop(session);
-        let metadata = open.metadata();
+        self.require_profile5_live_read_authority(policy, &cache.plan, &cache.selected)?;
+        if live_blob_read_cancelled(admission, response) {
+            return Err(actor_unavailable("blob read page"));
+        }
+        cache.next_offset = next_offset;
         Ok(BlobReadPage {
-            publication: BlobPublicationId::from_store(selected.stored.semantic_id),
-            id: BlobId::from_core(selected.commitment.blob_id()),
-            publisher: open.publisher(),
-            publisher_counter: open.publisher_counter(),
-            priority: open.priority(),
-            ttl_ms: open.ttl_ms(),
+            publication: BlobPublicationId::from_store(cache.selected.stored.semantic_id),
+            id: BlobId::from_core(cache.selected.commitment.blob_id()),
+            publisher,
+            publisher_counter,
+            priority,
+            ttl_ms,
             total_len,
-            media_type: metadata.media_type().map(str::to_owned),
-            schema_id: metadata.schema_id().to_vec(),
-            acceptance_marker: selected.stored.acceptance_marker,
+            media_type,
+            schema_id,
+            acceptance_marker: cache.selected.stored.acceptance_marker,
             offset: request.offset,
             complete: next_offset == total_len,
             next_offset,
@@ -5967,570 +5124,18 @@ impl SelectedBlobNode {
         })
     }
 
-    fn verify_live_read_plan(
-        &mut self,
-        plan: &BlobReadPlan,
-        current_epoch: u64,
-        fatal: &mut Option<NodeError>,
-    ) -> Result<VerifiedLiveBlob, ApplicationError> {
-        let result = self.verify_live_read_plan_inner(plan, current_epoch, fatal);
-        if let Err(error) = &result
-            && fatal.is_none()
-            && matches!(
-                error.kind(),
-                ApplicationErrorKind::Integrity | ApplicationErrorKind::StateUnavailable
-            )
-        {
-            *fatal = Some(NodeError::FatalBlobCoherence(
-                "live Blob read plan lost an exact authenticated authority claim".into(),
-            ));
+    fn finish_read_cache(&mut self) {
+        if let Some(cache) = self.read_cache.take() {
+            self.record_finished_read_cache(cache);
         }
-        result
     }
 
-    fn verify_live_read_plan_inner(
-        &mut self,
-        plan: &BlobReadPlan,
-        current_epoch: u64,
-        fatal: &mut Option<NodeError>,
-    ) -> Result<VerifiedLiveBlob, ApplicationError> {
-        let mut candidates = Vec::with_capacity(plan.candidates().len());
-        for candidate in plan.candidates() {
-            let projection = candidate.projection().clone();
-            if projection.topic != *plan.topic()
-                || projection.scope != *plan.scope()
-                || projection.blob_id != plan.blob_id()
-            {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-            let retention = BlobSourceRetention::Completed {
-                acceptance_marker: candidate.acceptance_marker(),
-            };
-            let current_lineage = match self.source_route_cache.is_current_blob_source_projection(
-                &self.verifier,
-                &projection,
-                retention,
-            ) {
-                Ok(current) => current,
-                Err(error) => {
-                    *fatal = Some(live_blob_coherence_fatal(
-                        "live Blob candidate route claim",
-                        error,
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob read page",
-                    ));
-                }
-            };
-            let revoked = self
-                .store
-                .is_control_principal_revoked(projection.publisher)
-                .map_err(|error| application_error("blob read page", error.into()))?;
-            let policy_active = !revoked && projection.epoch == current_epoch;
-            candidates.push(VerifiedLiveCandidate {
-                semantic_id: projection.semantic_id,
-                transfer_id: projection.transfer_id,
-                projection,
-                retention,
-                disposition: candidate.disposition(),
-                policy_active,
-                current_lineage,
-            });
-        }
-
-        let policy_selected = candidates
-            .iter()
-            .filter(|candidate| candidate.policy_active)
-            .max_by_key(|candidate| candidate.semantic_id)
-            .map(|candidate| candidate.semantic_id);
-        let plan_current = plan.current();
-        if plan_current.map(|candidate| candidate.projection().semantic_id) != policy_selected {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        for candidate in &candidates {
-            let expected = if !candidate.policy_active {
-                None
-            } else if Some(candidate.semantic_id) == policy_selected {
-                Some(BlobPublicationDisposition::Current)
-            } else {
-                Some(BlobPublicationDisposition::Alternate)
-            };
-            if candidate.disposition != expected {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-        }
-        let selected = policy_selected.ok_or_else(|| {
-            ApplicationError::new(
-                ApplicationErrorKind::UnauthorizedOrRevoked,
-                "blob read page",
-            )
-        })?;
-        let plan_current = plan_current.ok_or_else(|| {
-            ApplicationError::new(
-                ApplicationErrorKind::UnauthorizedOrRevoked,
-                "blob read page",
-            )
-        })?;
-        if candidates
-            .iter()
-            .filter(|candidate| candidate.policy_active && candidate.semantic_id == selected)
-            .count()
-            != 1
+    fn record_finished_read_cache(&mut self, cache: LocalBlobReadCache) {
+        #[cfg(test)]
         {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
+            self.last_read_cache_opened_segments = cache.opened_segments;
         }
-        let selected_claim = candidates
-            .into_iter()
-            .find(|candidate| {
-                candidate.semantic_id == selected
-                    && candidate.transfer_id == plan_current.projection().transfer_id
-                    && candidate.disposition == Some(BlobPublicationDisposition::Current)
-            })
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-            })?;
-        if !selected_claim.policy_active || !selected_claim.current_lineage {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::UnauthorizedOrRevoked,
-                "blob read page",
-            ));
-        }
-
-        // Only the exact, structurally selected current source may incur a
-        // content-envelope open or depot scan. Alternates are authenticated by
-        // their exact cached source claims above and never supply plaintext.
-        let selected_load = {
-            #[cfg(test)]
-            if std::mem::replace(&mut self.live_selected_load_policy_race_fault, false) {
-                Err(StoreError::ControlPolicyChanged)
-            } else {
-                self.store
-                    .load_blob_read_candidate_with_policy(plan.control_policy(), plan_current)
-            }
-            #[cfg(not(test))]
-            self.store
-                .load_blob_read_candidate_with_policy(plan.control_policy(), plan_current)
-        };
-        let exact_stored = match selected_load {
-            Ok(stored) => stored,
-            Err(error) => {
-                if live_blob_durable_coherence_error(&error) {
-                    *fatal = Some(live_blob_coherence_fatal(
-                        "live Blob selected source exact load",
-                        error.into(),
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob read page",
-                    ));
-                }
-                return Err(application_error("blob read page", error.into()));
-            }
-        };
-        let stored =
-            self.verify_stored_blob(&exact_stored, None, current_epoch, "blob read page", false)?;
-        let (cache_current, completion) =
-            match self.source_route_cache.verify_completed_blob_source_claim(
-                &self.verifier,
-                &selected_claim.projection,
-                selected_claim.retention,
-                &exact_stored.sealed,
-                stored.blob.blob_id(),
-                stored.blob.manifest().total_len(),
-                stored.blob.manifest().chunk_size(),
-                stored.blob.manifest().chunk_count(),
-                exact_stored.variant_id,
-            ) {
-                Ok(current) => current,
-                Err(error) => {
-                    *fatal = Some(live_blob_coherence_fatal(
-                        "live Blob selected source claim",
-                        error,
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob read page",
-                    ));
-                }
-            };
-        if !cache_current {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::UnauthorizedOrRevoked,
-                "blob read page",
-            ));
-        }
-        Self::require_blob_plan_claims_for(plan, &stored, "blob read page")?;
-        if stored.blob.manifest().total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-            || stored.blob.manifest().chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::ResourceLimit,
-                "blob read page",
-            ));
-        }
-        if !self.verifier.is_current_source_route_lineage(
-            stored.blob.scope(),
-            stored.blob.key_epoch(),
-            stored.blob.route_lineage(),
-        ) || !self.verifier.is_current_blob_physical_lineage(
-            stored.blob.scope(),
-            stored.blob.topic(),
-            stored.blob.key_epoch(),
-            stored.blob.physical_lineage(),
-        ) {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        Ok(VerifiedLiveBlob {
-            stored,
-            projection: selected_claim.projection,
-            retention: selected_claim.retention,
-            completion,
-            sealed: exact_stored.sealed,
-            variant_id: exact_stored.variant_id,
-        })
-    }
-
-    fn require_live_read_authority(
-        &self,
-        policy: &ControlPolicySnapshot,
-        plan: &BlobReadPlan,
-        selected: &VerifiedLiveBlob,
-        first_chunk: u64,
-        range_chunk_count: u64,
-        fatal: &mut Option<NodeError>,
-    ) -> Result<(), ApplicationError> {
-        let result = self.require_live_read_authority_inner(
-            policy,
-            plan,
-            selected,
-            first_chunk,
-            range_chunk_count,
-            fatal,
-        );
-        if let Err(error) = &result
-            && fatal.is_none()
-            && matches!(
-                error.kind(),
-                ApplicationErrorKind::Integrity | ApplicationErrorKind::StateUnavailable
-            )
-        {
-            *fatal = Some(NodeError::FatalBlobCoherence(
-                "live Blob page authority changed around bounded decryption".into(),
-            ));
-        }
-        result
-    }
-
-    fn require_live_read_authority_inner(
-        &self,
-        policy: &ControlPolicySnapshot,
-        plan: &BlobReadPlan,
-        selected: &VerifiedLiveBlob,
-        first_chunk: u64,
-        range_chunk_count: u64,
-        fatal: &mut Option<NodeError>,
-    ) -> Result<(), ApplicationError> {
-        if plan.current().is_none_or(|candidate| {
-            candidate.projection().transfer_id != selected.projection.transfer_id
-                || candidate.projection().semantic_id != selected.stored.semantic_id
-                || candidate.disposition() != Some(BlobPublicationDisposition::Current)
-        }) {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        self.store
-            .require_blob_read_plan_with_policy(policy, plan)
-            .map_err(|error| application_error("blob read page", error.into()))?;
-        let retained = self
-            .store
-            .blob_source_projection(selected.projection.transfer_id)
-            .map_err(|error| application_error("blob read page", error.into()))?
-            .ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
-            })?;
-        if retained.source != selected.projection || retained.retention != selected.retention {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        let (current, completion) =
-            match self.source_route_cache.verify_completed_blob_source_claim(
-                &self.verifier,
-                &retained.source,
-                retained.retention,
-                &selected.sealed,
-                selected.stored.blob.blob_id(),
-                selected.stored.blob.manifest().total_len(),
-                selected.stored.blob.manifest().chunk_size(),
-                selected.stored.blob.manifest().chunk_count(),
-                selected.variant_id,
-            ) {
-                Ok(current) => current,
-                Err(error) => {
-                    *fatal = Some(live_blob_coherence_fatal(
-                        "live Blob final source claim",
-                        error,
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob read page",
-                    ));
-                }
-            };
-        if completion != selected.completion {
-            *fatal = Some(NodeError::FatalBlobCoherence(
-                "live Blob range completion capability changed".into(),
-            ));
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        if range_chunk_count == 0 {
-            if first_chunk != 0
-                || selected.stored.blob.manifest().total_len() != 0
-                || selected.stored.blob.manifest().chunk_count() != 0
-            {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read page",
-                ));
-            }
-        } else if let Err(error) = self
-            .store
-            .blob_depot_for_authenticated_read(&completion)
-            .and_then(|mut depot| {
-                depot.recheck_completion_range(&completion, first_chunk, range_chunk_count)
-            })
-        {
-            *fatal = Some(live_blob_coherence_fatal(
-                "live Blob range completion recheck",
-                error.into(),
-            ));
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read page",
-            ));
-        }
-        if !current
-            || !self.verifier.is_current_source_route_lineage(
-                selected.stored.blob.scope(),
-                selected.stored.blob.key_epoch(),
-                selected.stored.blob.route_lineage(),
-            )
-            || !self.verifier.is_current_blob_physical_lineage(
-                selected.stored.blob.scope(),
-                selected.stored.blob.topic(),
-                selected.stored.blob.key_epoch(),
-                selected.stored.blob.physical_lineage(),
-            )
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::UnauthorizedOrRevoked,
-                "blob read page",
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn require_blob_plan_claims(
-        plan: &BlobReadPlan,
-        verified: &VerifiedStoredBlob,
-    ) -> Result<(), ApplicationError> {
-        Self::require_blob_plan_claims_for(plan, verified, "blob read")
-    }
-
-    fn require_blob_plan_claims_for(
-        plan: &BlobReadPlan,
-        verified: &VerifiedStoredBlob,
-        operation: &'static str,
-    ) -> Result<(), ApplicationError> {
-        if verified.blob.topic() != plan.topic()
-            || verified.blob.scope() != plan.scope()
-            || verified.blob.blob_id() != plan.blob_id()
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                operation,
-            ));
-        }
-        Ok(())
-    }
-
-    fn verify_stored_blob(
-        &mut self,
-        stored: &StoredBlob,
-        expected: Option<&BlobPublicationIntent>,
-        current_epoch: u64,
-        operation: &'static str,
-        verify_completion: bool,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        Self::verify_stored_blob_with(
-            &self.store,
-            self.mission_authority(),
-            &mut self.verifier,
-            stored,
-            expected,
-            current_epoch,
-            operation,
-            verify_completion,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn verify_stored_blob_with(
-        store: &Store,
-        mission_authority: NodeId,
-        verifier: &mut ReferenceEnvelopeSealer,
-        stored: &StoredBlob,
-        expected: Option<&BlobPublicationIntent>,
-        current_epoch: u64,
-        operation: &'static str,
-        verify_completion: bool,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        Self::verify_stored_blob_inner(
-            verify_completion.then_some(store),
-            mission_authority,
-            verifier,
-            stored,
-            expected,
-            current_epoch,
-            operation,
-        )
-    }
-
-    fn verify_stored_blob_without_completion(
-        mission_authority: NodeId,
-        verifier: &mut ReferenceEnvelopeSealer,
-        stored: &StoredBlob,
-        expected: Option<&BlobPublicationIntent>,
-        current_epoch: u64,
-        operation: &'static str,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        Self::verify_stored_blob_inner(
-            None,
-            mission_authority,
-            verifier,
-            stored,
-            expected,
-            current_epoch,
-            operation,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn verify_stored_blob_inner(
-        completion_store: Option<&Store>,
-        mission_authority: NodeId,
-        verifier: &mut ReferenceEnvelopeSealer,
-        stored: &StoredBlob,
-        expected: Option<&BlobPublicationIntent>,
-        current_epoch: u64,
-        operation: &'static str,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        let route = verifier
-            .verify_blob(&stored.sealed)
-            .map_err(|error| application_error(operation, error.into()))?;
-        if route.envelope_id() != *stored.transfer_id.as_bytes()
-            || route.item_id() != *stored.semantic_id.as_bytes()
-            || route.header() != &stored.header
-            || route.blob_id() != stored.blob_id
-            || route.mission_authority_id() != mission_authority
-            || route.key_epoch() > current_epoch
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                operation,
-            ));
-        }
-        if let Some(expected) = expected
-            && (route.publisher() != expected.publisher()
-                || route.topic() != expected.topic()
-                || route.scope() != expected.scope()
-                || route.priority() != expected.priority()
-                || route.blob_id() != expected.blob_id())
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                operation,
-            ));
-        }
-        if !verifier.can_route_blob(route.scope(), route.key_epoch())
-            || !verifier.can_open_blob_content(route.scope(), route.topic(), route.key_epoch())
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                operation,
-            ));
-        }
-        let (blob, manifest_bytes) = match verifier
-            .verify_blob_content(route, &stored.sealed)
-            .map_err(|error| application_error(operation, error.into()))?
-        {
-            BlobContentVerification::ContentVerified {
-                blob,
-                manifest_bytes,
-            } => (blob, manifest_bytes),
-            BlobContentVerification::RouteOnly(_) => {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    operation,
-                ));
-            }
-        };
-        if blob.blob_id() != stored.blob_id
-            || stored.variant_id
-                != BlobVariantId::for_content(
-                    blob.blob_id(),
-                    blob.manifest().content_group(),
-                    blob.manifest().content_epoch(),
-                )
-            || blob.manifest_digest() != &stored.manifest_digest
-            || stored.route_lineage != Some(*blob.route_lineage().binding())
-            || stored.physical_lineage != Some(*blob.physical_lineage().binding())
-            || blob.manifest().chunk_size() != SELECTED_BLOB_CHUNK_SIZE
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                operation,
-            ));
-        }
-        blob.verify_exact_sealed(&stored.sealed)
-            .map_err(|error| application_error(operation, error.into()))?;
-        blob.verify_exact_manifest(&manifest_bytes)
-            .map_err(|error| application_error(operation, error.into()))?;
-        if let Some(store) = completion_store {
-            store
-                .blob_depot()
-                .and_then(|mut depot| depot.completed_blob(&blob, &manifest_bytes))
-                .map_err(|error| application_error(operation, error.into()))?;
-        }
-        Ok(VerifiedStoredBlob {
-            blob,
-            manifest_bytes,
-            semantic_id: stored.semantic_id,
-            acceptance_marker: stored.acceptance_marker,
-        })
+        drop(cache);
     }
 
     fn completed_projection(
@@ -6570,75 +5175,97 @@ impl SelectedBlobNode {
         Ok((retained.source, retained.retention))
     }
 
-    fn verify_publication_retry(
-        &mut self,
+    fn verify_profile5_stored_source(
+        &self,
         stored: &StoredBlob,
-        expected: &BlobPublicationIntent,
-        prepared: &PreparedBlob,
-        current_epoch: u64,
-        live_bounded: bool,
-    ) -> Result<BlobPublishResult, ApplicationError> {
-        let (projection, retention) = self.completed_projection(stored, "blob publish")?;
-        let (current, completion) = self
-            .source_route_cache
-            .verify_completed_blob_source_claim(
-                &self.verifier,
-                &projection,
-                retention,
-                &stored.sealed,
-                prepared.id(),
-                prepared.total_len(),
-                SELECTED_BLOB_CHUNK_SIZE,
-                prepared.chunk_count(),
-                stored.variant_id,
-            )
-            .map_err(|error| application_error("blob publish", error))?;
-        self.store
-            .blob_depot_for_authenticated_read(&completion)
-            .and_then(|mut depot| depot.recheck_completion(&completion))
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        if current && stored.header.key_epoch == current_epoch {
-            let verified = self.verify_stored_blob(
-                stored,
-                Some(expected),
-                current_epoch,
-                "blob publish",
-                false,
-            )?;
-            return Ok(blob_publish_result(&verified, false));
-        }
-        if stored.header.key_epoch > current_epoch
-            || stored.header.stamp.dot.publisher != expected.publisher()
-            || stored.header.topic != *expected.topic()
-            || stored.header.scope != *expected.scope()
-            || stored.header.priority != expected.priority()
-            || stored.blob_id != expected.blob_id()
-            || stored.blob_id != prepared.id()
-            || prepared.total_len() == 0
-            || prepared.chunk_count() == 0
-            || (live_bounded
-                && (prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
-                    || prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES))
+        projection: &BlobSourceProjection,
+        session: &aster_redb_store::Profile5PackReadSession,
+        operation: &'static str,
+    ) -> Result<VerifiedBlobStreamPublicationSource, ApplicationError> {
+        let verified = self
+            .verifier
+            .verify_blob_stream_publication_source(&stored.sealed)
+            .map_err(|error| application_error(operation, error.into()))?;
+        self.require_profile5_stored_source_match(
+            stored, projection, session, &verified, operation,
+        )?;
+        Ok(verified)
+    }
+
+    fn require_profile5_stored_source_match(
+        &self,
+        stored: &StoredBlob,
+        projection: &BlobSourceProjection,
+        session: &aster_redb_store::Profile5PackReadSession,
+        verified: &VerifiedBlobStreamPublicationSource,
+        operation: &'static str,
+    ) -> Result<(), ApplicationError> {
+        let publication = verified.publication().publication();
+        let open = publication.open();
+        let physical_open = verified.physical_open().open();
+        let commitment = verified.physical_commitment().commitment();
+        let sealed_len = u64::try_from(stored.sealed.len())
+            .map_err(|_| ApplicationError::new(ApplicationErrorKind::Integrity, operation))?;
+        let transfer_id = BlobTransferId::new(Sha256::digest(&stored.sealed).into());
+        let semantic_id = BlobSemanticId::new(
+            Sha256::digest(verified.publication().authenticated_bytes()).into(),
+        );
+        let manifest_digest: [u8; 32] = Sha256::digest(commitment.encode()).into();
+        let variant_id = aster_redb_store::BlobVariantId::for_content(
+            commitment.blob_id(),
+            &physical_open.content_group(),
+            physical_open.content_epoch(),
+        );
+        if session.authenticated_open() != verified.source().authenticated_open()
+            || session.authenticated_commitment() != verified.source().authenticated_commitment()
+            || session.open() != physical_open
+            || session.commitment() != commitment
+            || session.route_lineage() != physical_open.authorization_digest()
+            || session.physical_lineage() != publication.physical_lineage()
+            || stored.transfer_id != transfer_id
+            || stored.semantic_id != semantic_id
+            || stored.blob_id != publication.blob_id()
+            || stored.blob_id != commitment.blob_id()
+            || stored.variant_id != variant_id
+            || stored.manifest_digest != manifest_digest
+            || stored.route_lineage != Some(*open.authorization_digest())
+            || stored.physical_lineage != Some(*publication.physical_lineage())
+            || stored.header.stamp.dot.publisher != open.publisher()
+            || stored.header.stamp.dot.counter != open.publisher_counter()
+            || stored.header.stamp.context != *open.causal_context()
+            || stored.header.topic != *open.topic()
+            || stored.header.scope != *open.scope()
+            || stored.header.priority != open.priority()
+            || stored.header.ttl_ms != open.ttl_ms()
+            || stored.header.content_len != sealed_len
+            || stored.header.key_epoch != open.content_epoch()
+            || stored.header.logical_key.as_slice() != commitment.blob_id().as_bytes()
+            || stored.header.blob_route.is_none_or(|route| {
+                route.blob_id() != commitment.blob_id()
+                    || route.chunk_count() != commitment.segment_count()
+                    || route.root() != commitment.ciphertext_root()
+            })
+            || projection.transfer_id != transfer_id
+            || projection.semantic_id != semantic_id
+            || projection.publisher != open.publisher()
+            || projection.topic != *open.topic()
+            || projection.scope != *open.scope()
+            || projection.epoch != open.content_epoch()
+            || projection.sealed_len != sealed_len
+            || projection.route_lineage != *open.authorization_digest()
+            || projection.physical_lineage != *publication.physical_lineage()
+            || projection.manifest_digest != manifest_digest
+            || projection.blob_id != commitment.blob_id()
+            || projection.total_len != open.total_len()
+            || projection.chunk_size != BLOB_STREAM_SEGMENT_BYTES as u32
+            || projection.chunk_count != commitment.segment_count()
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
-                "blob publish",
+                operation,
             ));
         }
-        let metadata = prepared.metadata();
-        Ok(BlobPublishResult {
-            publication_id: None,
-            id: BlobId::from_core(prepared.id()),
-            publisher: stored.header.stamp.dot.publisher,
-            publisher_counter: stored.header.stamp.dot.counter,
-            priority: stored.header.priority,
-            ttl_ms: stored.header.ttl_ms,
-            total_len: prepared.total_len(),
-            media_type: metadata.media_type().map(str::to_owned),
-            schema_id: metadata.schema_id().to_vec(),
-            acceptance_marker: stored.acceptance_marker,
-            inserted: false,
-        })
+        Ok(())
     }
 
     fn active_epoch(
@@ -6689,53 +5316,6 @@ impl SelectedBlobNode {
             Err(error) => Err(application_error(operation, error)),
         }
     }
-
-    fn open_blob(
-        &mut self,
-        sealed: &[u8],
-        operation: &'static str,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        let route = self
-            .verifier
-            .verify_blob(sealed)
-            .map_err(|error| application_error(operation, error.into()))?;
-        match self
-            .verifier
-            .verify_blob_content(route, sealed)
-            .map_err(|error| application_error(operation, error.into()))?
-        {
-            BlobContentVerification::ContentVerified {
-                blob,
-                manifest_bytes,
-            } => Ok(VerifiedStoredBlob {
-                semantic_id: BlobSemanticId::new(blob.item_id()),
-                acceptance_marker: 0,
-                blob,
-                manifest_bytes,
-            }),
-            BlobContentVerification::RouteOnly(_) => Err(ApplicationError::new(
-                ApplicationErrorKind::RequestRejected,
-                operation,
-            )),
-        }
-    }
-}
-
-fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublishResult {
-    let metadata = blob.blob.manifest().metadata();
-    BlobPublishResult {
-        publication_id: None,
-        id: BlobId::from_core(blob.blob.blob_id()),
-        publisher: blob.blob.publisher(),
-        publisher_counter: blob.blob.dot().counter,
-        priority: blob.blob.priority(),
-        ttl_ms: blob.blob.ttl_ms(),
-        total_len: blob.blob.manifest().total_len(),
-        media_type: metadata.media_type().map(str::to_owned),
-        schema_id: metadata.schema_id().to_vec(),
-        acceptance_marker: blob.acceptance_marker,
-        inserted,
-    }
 }
 
 fn live_blob_durable_coherence_error(error: &StoreError) -> bool {
@@ -6754,6 +5334,10 @@ fn live_blob_coherence_fatal(context: &'static str, error: NodeError) -> NodeErr
         NodeError::FatalBlobCoherence(_) => error,
         error => NodeError::FatalBlobCoherence(format!("{context}: {error}")),
     }
+}
+
+fn incompatible_profile5_storage(operation: &'static str) -> ApplicationError {
+    ApplicationError::new(ApplicationErrorKind::LegacyState, operation)
 }
 
 fn finish_live_blob_ledger_command<T>(
@@ -6803,6 +5387,7 @@ fn live_blob_read_cancelled(
     !admission.load(Ordering::Acquire) || response.is_some_and(oneshot::Sender::is_closed)
 }
 
+#[cfg(test)]
 fn blob_prepare_error(error: BlobError) -> ApplicationError {
     match error {
         BlobError::InvalidManifest => {
@@ -6833,52 +5418,19 @@ fn blob_store_application_error(operation: &'static str, error: StoreError) -> A
     application_error(operation, error.into())
 }
 
-fn live_blob_core_attempt_error(
-    error: BlobError,
-    live: &mut Option<&mut LivePublishContext<'_>>,
-    recovery: &BlobAdmissionRecoveryContext,
-) -> BlobPublishAttemptError {
-    let BlobError::Store(adapter) = error else {
-        return BlobPublishAttemptError::Application(blob_core_error("blob publish", error));
-    };
-    match adapter.downcast::<StoreError>() {
-        Ok(error) => {
-            let error = *error;
-            if let Some(context) = live.as_deref_mut()
-                && live_blob_durable_coherence_error(&error)
-            {
-                *context.fatal = Some(NodeError::FatalBlobCoherence(
-                    "live Blob core adapter reported durable coherence loss".into(),
-                ));
-                return BlobPublishAttemptError::Application(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob publish",
-                ));
-            }
-            if blob_capacity_gc_target(&error).is_some() {
-                return BlobPublishAttemptError::Capacity {
-                    error,
-                    context: recovery.clone(),
-                };
-            }
-            BlobPublishAttemptError::Application(ApplicationError::new(
-                store_error_kind(&error),
-                "blob publish",
-            ))
-        }
-        Err(adapter) => {
-            if let Some(context) = live.as_deref_mut() {
-                *context.fatal = Some(NodeError::FatalBlobCoherence(
-                    "live Blob core adapter returned an unexpected error type".into(),
-                ));
-            }
-            let _ = adapter;
-            BlobPublishAttemptError::Application(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob publish",
-            ))
-        }
-    }
+fn terminal_local_profile5_promotion_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::ControlPolicyUnsettled { .. }
+            | StoreError::ControlPolicyChanged
+            | StoreError::Blob(
+                BlobStoreError::PublisherRevoked(_)
+                    | BlobStoreError::KeyEpochStale { .. }
+                    | BlobStoreError::KeyEpochNotActive { .. }
+                    | BlobStoreError::ExpiredOrRetired
+                    | BlobStoreError::ReadPlanChanged
+            )
+    )
 }
 
 fn blob_core_error(operation: &'static str, error: BlobError) -> ApplicationError {
@@ -7012,7 +5564,7 @@ pub(crate) mod tests {
             .expect("stats after elapsed publication");
         assert_eq!(elapsed_stats.publications, 0);
         assert_eq!(elapsed_stats.operations, 0);
-        assert_eq!(elapsed_stats.variants, 1);
+        assert_eq!(elapsed_stats.variants, 0);
 
         let published = node
             .publish_with_options(
@@ -7208,7 +5760,7 @@ pub(crate) mod tests {
     fn stopped_finite_read_never_opens_a_later_page_after_expiry() {
         let root = TestRoot::new("finite-read-page-boundary");
         let mut node = selected_node(&root);
-        node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 1);
+        node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 0);
         let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 11);
         let published = node
             .publish_with_options(
@@ -7217,19 +5769,34 @@ pub(crate) mod tests {
                 &mut Cursor::new(bytes),
             )
             .expect("publish finite boundary Blob");
-        let mut output = Vec::new();
-        let error = node
-            .read_into(
-                BlobReadRequest {
+        let first = node
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
                     id: published.id,
                     topic: blob_topic(),
                     scope: blob_scope(),
                 },
-                &mut output,
-            )
+                offset: 0,
+                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+            })
+            .expect("first page opens before expiry");
+        assert!(!first.complete);
+        assert_eq!(first.as_bytes().len(), MAX_SELECTED_BLOB_PAGE_BYTES);
+        node.custody_clock
+            .set_injected_tick(104)
+            .expect("advance custody clock to exact TTL boundary");
+        let error = node
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: first.next_offset,
+                max_bytes: 11,
+            })
             .expect_err("later page must not open at the exact TTL boundary");
         assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
-        assert_eq!(output.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
     }
 
     #[test]
@@ -7903,7 +6470,7 @@ pub(crate) mod tests {
             cache,
             custody_clock,
         )
-        .expect("open selected Blob finalization pool");
+        .expect("open selected Blob pack promotion pool");
         selected
             .current_policy("blob test open")
             .expect("load selected Blob test policy");
@@ -8004,7 +6571,7 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_stream_blob_returns_one_authorized_terminal_page() {
-        // Break caught: a canonical empty stream publication must expose one
+        // Break caught: a native empty pack publication must expose one
         // authenticated EOF page rather than being permanently unreadable.
         let root = TestRoot::new("empty-stream-read");
         let mut node = selected_node(&root);
@@ -8042,7 +6609,7 @@ pub(crate) mod tests {
     fn cached_blob_reader_rechecks_revocation_epoch_grants_and_lifecycle_each_page() {
         // Break caught: a page-one authorization must not become reusable
         // plaintext authority after any control, selector, lifecycle, or
-        // shutdown transition. Stream-created Blobs use the canonical plan.
+        // shutdown transition. Stream-created Blobs use the native pack plan.
         let bytes = payload(97);
 
         let policy_root = TestRoot::new("page-policy-generation");
@@ -8189,6 +6756,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn live_profile5_pack_projection_mismatch_is_integrity_and_actor_fatal() {
+        let root = TestRoot::new("live-pack-projection-mismatch");
+        let mut node = selected_node(&root);
+        let blob = finish_stream_read_fixture(
+            &mut node,
+            b"blob/read-pack-projection-mismatch",
+            &payload(97),
+            BlobPublishOptions::durable(),
+        );
+        node.live_pack_projection_coherence_fault = true;
+        let (response, received) = oneshot::channel();
+        let admission = AtomicBool::new(true);
+
+        let error = node
+            .execute_live(
+                SelectedBlobCommand::ReadPage {
+                    request: BlobReadPageRequest {
+                        blob,
+                        offset: 0,
+                        max_bytes: 31,
+                    },
+                    response,
+                },
+                &admission,
+            )
+            .expect_err("stored projection/pack mismatch must stop the Blob actor");
+
+        assert!(matches!(error, NodeError::FatalBlobCoherence(_)));
+        assert!(received.blocking_recv().is_err());
+    }
+
+    #[test]
     fn final_blob_read_gate_rechecks_every_authority_dimension_after_decrypt() {
         let bytes = payload(97);
 
@@ -8299,10 +6898,10 @@ pub(crate) mod tests {
         assert!(read_fixture_page(&mut reopened, lifecycle_blob, 0).is_err());
     }
 
-    async fn schedule_stream_finalization_for_test(
+    async fn schedule_stream_pack_promotion_for_test(
         commands: &mpsc::Sender<SelectedApplicationCommand>,
         token: [u8; 32],
-    ) -> Result<BlobFinalizeCompletion, ApplicationError> {
+    ) -> Result<BlobPackPromotionCompletion, ApplicationError> {
         let (response, received) = oneshot::channel();
         commands
             .send(SelectedApplicationCommand::Blob(
@@ -8322,11 +6921,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_upload_finishes_as_canonical_blob_and_exact_retry() {
+    fn stream_upload_finishes_as_native_pack_and_exact_retry() {
         // Break caught: finishing an application upload must enter the ordinary
         // Blob operation, acceptance, subscription, lifecycle, and capacity
         // authorities instead of a parallel stream-publication namespace.
-        let root = TestRoot::new("canonical-stream-upload");
+        let root = TestRoot::new("native-pack-stream-upload");
         let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 7);
         let stream_request = BlobPublishStreamRequest {
             publication: request(b"blob/stream/single-pass"),
@@ -8363,11 +6962,13 @@ pub(crate) mod tests {
             let stored = node
                 .store
                 .blob_for_operation(&operation)
-                .expect("canonical operation lookup")
-                .expect("canonical operation publication");
+                .expect("lifecycle operation lookup")
+                .expect("lifecycle operation publication");
             assert_eq!(stored.blob_id, result.id.into_core());
             assert_eq!(stored.acceptance_marker, result.acceptance_marker);
-            let status = node.transfer_status().expect("canonical lifecycle status");
+            let status = node
+                .transfer_status()
+                .expect("native pack lifecycle status");
             assert_eq!(status.retained_publications, 1);
             assert_eq!(status.retained_pending_transfers, 0);
             let inspection = node
@@ -8376,10 +6977,10 @@ pub(crate) mod tests {
                     topic: blob_topic(),
                     scope: blob_scope(),
                 })
-                .expect("inspect canonical upload");
+                .expect("inspect native pack upload");
             assert_eq!(inspection.phase, BlobPublicationPhase::Available);
             assert_eq!(inspection.blob_id, Some(result.id));
-            let capacity = node.capacity_status().expect("canonical capacity status");
+            let capacity = node.capacity_status().expect("native pack capacity status");
             assert_eq!(capacity.variants, 1);
             assert!(capacity.expected_chunks > 0);
             let page = node
@@ -8388,7 +6989,7 @@ pub(crate) mod tests {
                     delivery_limit: 1,
                     scan_limit: 4,
                 })
-                .expect("poll canonical upload");
+                .expect("poll native pack upload");
             assert_eq!(page.deliveries.len(), 1);
             assert_eq!(content_delivery(&page.deliveries[0]).id, result.id);
             result
@@ -8426,195 +7027,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg(any())]
-    fn stream_upload_finalization_occupies_multiple_chunk_workers() {
-        // Break caught: whole-Blob finalizer threads do not parallelize the
-        // canonical 64-KiB chunks of one large upload.
-        let root = TestRoot::new("stream-finalize-chunk-workers");
-        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES + 19);
-        let mut node = selected_node(&root);
-        let opened = node
-            .open_publish_stream_inner(BlobPublishStreamRequest {
-                publication: request(b"blob/stream/chunk-workers"),
-                options: BlobPublishOptions::durable(),
-                total_len: bytes.len() as u64,
-            })
-            .expect("open chunk-worker upload");
-        for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
-            node.append_publish_stream_inner(
-                opened.token,
-                (offset * 64 * 1024) as u64,
-                Zeroizing::new(chunk.to_vec()),
-            )
-            .expect("append chunk-worker upload");
-        }
-
-        let job = StreamJobId::from_bytes(opened.token[..16].try_into().expect("job ID"));
-        let probe = PipelineTestProbe::install(job);
-        probe.hold_workers_for_test();
-        let (finished, received) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            _ = finished.send(node.finish_publish_stream_inner(opened.token));
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while probe.peak_active_workers() < 2 && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        let peak = probe.peak_active_workers();
-        probe.release_workers_for_test();
-        let result = received
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("finalization completes after worker release");
-        worker.join().expect("join chunk-worker finalization");
-        result.expect("chunk-worker finalization succeeds");
-        assert!(peak > 1, "one Blob occupied only {peak} map worker");
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn stream_upload_finalization_is_one_pass_bounded_and_canonical() {
-        let root = TestRoot::new("stream-finalize-measurements");
-        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES + 19);
-        let publication = request(b"blob/stream/finalize-measurements");
-        let serial = prepare_blob(
-            &mut Cursor::new(bytes.clone()),
-            SELECTED_BLOB_CHUNK_SIZE,
-            CoreBlobMetadata::new(
-                publication.media_type.clone(),
-                publication.schema_id.clone(),
-            )
-            .expect("canonical reference metadata"),
-        )
-        .expect("canonical serial reference");
-        let mut node = selected_node(&root);
-        let serial_publication = node
-            .publish(
-                request(b"blob/stream/finalize-measurements-serial"),
-                &mut Cursor::new(bytes.clone()),
-            )
-            .expect("publish canonical serial reference");
-        let opened = node
-            .open_publish_stream_inner(BlobPublishStreamRequest {
-                publication,
-                options: BlobPublishOptions::durable(),
-                total_len: bytes.len() as u64,
-            })
-            .expect("open measured stream");
-        for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
-            node.append_publish_stream_inner(
-                opened.token,
-                (index * 64 * 1024) as u64,
-                Zeroizing::new(chunk.to_vec()),
-            )
-            .expect("append measured stream");
-        }
-        let job = StreamJobId::from_bytes(opened.token[..16].try_into().expect("job ID"));
-        let probe = PipelineTestProbe::install(job);
-        let result = node
-            .finish_publish_stream_inner(opened.token)
-            .expect("finish measured stream");
-        let measured = node.finalize_pool.last_report_for_test();
-        let chunks = (bytes.len() as u64).div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE));
-        let segments = (bytes.len() as u64).div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64);
-
-        assert_eq!(result.id.into_core(), serial.id());
-        assert_eq!(result.id, serial_publication.id);
-        assert_eq!(measured.pipeline.accepted_items(), segments);
-        assert_eq!(measured.pipeline.completed_items(), segments);
-        assert_eq!(
-            measured.pipeline.worker_count(),
-            BLOB_FINALIZE_CHUNK_WORKERS
-        );
-        assert!(measured.pipeline.peak_in_flight_items() <= BLOB_FINALIZE_MAX_IN_FLIGHT_SEGMENTS);
-        assert!(measured.pipeline.peak_reorder_items() <= BLOB_FINALIZE_MAX_IN_FLIGHT_SEGMENTS);
-        assert!(measured.pipeline.peak_owned_bytes() <= BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB);
-        assert!(
-            measured.observed_worker_buffer_peak_bytes >= 2 * BLOB_STREAM_SEGMENT_BYTES,
-            "worker observation must include the concurrently live encoded and opened segment"
-        );
-        assert!(
-            measured.observed_publication_buffer_peak_bytes >= 3 * measured.retained_manifest_bytes,
-            "publication observation must include retained, sealed, and opened manifest buffers"
-        );
-        assert!(measured.observed_buffer_peak_bytes >= measured.observed_worker_buffer_peak_bytes);
-        assert!(
-            measured.observed_buffer_peak_bytes >= measured.observed_publication_buffer_peak_bytes
-        );
-        assert!(measured.observed_buffer_peak_bytes <= measured.conservative_owned_byte_bound);
-        assert_eq!(measured.plaintext_bytes_read, bytes.len() as u64);
-        assert!(probe.finalizer_provisional_decrypts() > 1);
-        assert_eq!(
-            probe.finalizer_provisional_decrypts_on_map_workers(),
-            probe.finalizer_provisional_decrypts(),
-            "every provisional segment decrypt must run inside the bounded map worker set"
-        );
-        assert_eq!(
-            measured.provisional_segment_reads,
-            (bytes.len() as u64).div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64)
-        );
-        assert_eq!(
-            measured.encrypted_bytes,
-            bytes.len() as u64 + chunks * BLOB_FINALIZE_AEAD_TAG_BYTES as u64
-        );
-        assert_eq!(measured.depot_operations, 4 * chunks + 2);
-        assert_eq!(measured.store_boundary_operations, 10);
-        assert_eq!(
-            measured.store_boundary_trace,
-            expected_finalize_store_trace(true)
-        );
-        let measurement = blob_finalize_measurement_json(bytes.len() as u64, &measured);
-        assert_eq!(
-            measurement["depot_operations"],
-            serde_json::json!(4 * chunks + 2),
-            "the instrumented BlobStore boundary must expose operation growth"
-        );
-        assert!(measurement.get("store_phase_calls").is_none());
-        assert!(measurement.get("store_operations").is_none());
-        assert!(measurement.get("peak_owned_bytes").is_none());
-        assert_eq!(
-            measurement["store_boundary_operations"],
-            serde_json::json!(10)
-        );
-        assert_eq!(
-            measurement["observed_buffer_peak_bytes"],
-            serde_json::json!(measured.observed_buffer_peak_bytes)
-        );
-        assert_eq!(
-            measurement["conservative_owned_byte_bound"],
-            serde_json::json!(measured.conservative_owned_byte_bound)
-        );
-        assert_eq!(
-            measured.pipeline.stage(PipelineStage::Admission).items,
-            segments
-        );
-        assert_eq!(measured.pipeline.stage(PipelineStage::Map).items, segments);
-        assert_eq!(
-            measured.pipeline.stage(PipelineStage::Reorder).items,
-            segments
-        );
-        assert_eq!(measured.pipeline.stage(PipelineStage::Sink).items, segments);
-        assert_eq!(
-            BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES,
-            BLOB_FINALIZE_WORKERS
-                * BLOB_FINALIZE_MAX_IN_FLIGHT_SEGMENTS
-                * BLOB_FINALIZE_SEGMENT_OWNED_BYTES
-        );
-        assert_eq!(
-            BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES,
-            BLOB_FINALIZE_WORKERS
-                * (BLOB_FINALIZE_MAX_DIGEST_BYTES
-                    + BLOB_FINALIZE_CHUNK_WORKERS * BLOB_FINALIZE_WORKER_PEAK_OWNED_BYTES
-                    + 4 * MAX_BLOB_MANIFEST_BYTES as usize
-                    + BLOB_FINALIZE_MAX_ROUTE_BYTES
-                    + BLOB_FINALIZE_MAX_PUBLICATION_OVERHEAD_BYTES
-                    + BLOB_FINALIZE_MAX_METADATA_BYTES)
-        );
-        assert_eq!(BLOB_FINALIZE_CPU_BUDGET, 4);
-    }
-
-    #[test]
-    fn stream_upload_finalization_promotes_native_pack_without_second_data_pass() {
-        let root = TestRoot::new("stream-finalize-native-pack");
+    fn stream_upload_promotes_native_pack_without_second_data_pass() {
+        let root = TestRoot::new("stream-promote-native-pack");
         let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES + 19);
         let stream_request = BlobPublishStreamRequest {
             publication: request(b"blob/stream/native-pack"),
@@ -8636,17 +7050,17 @@ pub(crate) mod tests {
         let result = node
             .finish_publish_stream_inner(opened.token)
             .expect("promote native pack");
-        let measured = node.finalize_pool.last_report_for_test();
+        let measured = node.pack_promotion_pool.last_report_for_test();
         assert_eq!(
             measured.segment_count,
             (bytes.len() as u64).div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64)
         );
         assert_eq!(measured.plaintext_bytes_reprocessed, 0);
         assert_eq!(measured.ciphertext_bytes_rewritten, 0);
-        assert_eq!(measured.store_boundary_operations, 7);
+        assert_eq!(measured.store_boundary_operations, 9);
         assert_eq!(
             measured.store_boundary_trace,
-            expected_finalize_store_trace()
+            expected_native_pack_promotion_store_trace()
         );
 
         let owner = BlobOperationOwner::new(
@@ -8675,31 +7089,31 @@ pub(crate) mod tests {
         assert_eq!(session.open().total_len(), bytes.len() as u64);
     }
 
-    fn expected_finalize_store_trace() -> Vec<BlobFinalizeStoreOperation> {
+    fn expected_native_pack_promotion_store_trace() -> Vec<BlobPackPromotionStoreOperation> {
         vec![
-            BlobFinalizeStoreOperation::ReplayAuthority,
-            BlobFinalizeStoreOperation::ReadControlHead,
-            BlobFinalizeStoreOperation::RefreshPolicy,
-            BlobFinalizeStoreOperation::ReserveProfile5Upload,
-            BlobFinalizeStoreOperation::CheckpointProfile5Pack,
-            BlobFinalizeStoreOperation::CompleteProfile5Pack,
-            BlobFinalizeStoreOperation::CommitProfile5Publication,
+            BlobPackPromotionStoreOperation::ReplayAuthority,
+            BlobPackPromotionStoreOperation::ReadControlHead,
+            BlobPackPromotionStoreOperation::RefreshPolicy,
+            BlobPackPromotionStoreOperation::ReserveProfile5Upload,
+            BlobPackPromotionStoreOperation::CheckpointProfile5Pack,
+            BlobPackPromotionStoreOperation::CompleteProfile5Pack,
+            BlobPackPromotionStoreOperation::ReadProfile5PackBinding,
+            BlobPackPromotionStoreOperation::CommitProfile5Publication,
+            BlobPackPromotionStoreOperation::CacheProfile5Publication,
         ]
     }
 
     #[test]
-    fn finalizer_job_construction_requires_non_escaping_store_facade() {
+    fn native_pack_promotion_job_requires_non_escaping_store_facade() {
         type Constructor = fn(
-            UnprotectedReferenceMission,
-            BlobFinalizeStore,
-            NodeCustodyClock,
+            BlobPackPromotionAuthority,
             BlobUploadReservation,
             aster_redb_store::BlobUploadCheckpoint,
             VerifiedBlobStreamOpen,
             BlobPackWriter,
-        ) -> BlobFinalizeJob;
+        ) -> BlobPackPromotionJob;
 
-        fn take_owned_store(job: BlobFinalizeJob) -> BlobFinalizeStore {
+        fn take_owned_store(job: BlobPackPromotionJob) -> BlobPackPromotionStore {
             job.store
         }
 
@@ -8721,123 +7135,20 @@ pub(crate) mod tests {
         impl<T: ?Sized> AmbiguousIfArcStoreAsRef<()> for T {}
         impl<T: ?Sized + AsRef<Arc<Store>>> AmbiguousIfArcStoreAsRef<u8> for T {}
 
-        let _: Constructor = BlobFinalizeJob::new;
-        let _: fn(BlobFinalizeJob) -> BlobFinalizeStore = take_owned_store;
-        let _ = <BlobFinalizeStore as AmbiguousIfStoreDeref<_>>::assert_not_store_deref;
-        let _ = <BlobFinalizeStore as AmbiguousIfStoreAsRef<_>>::assert_not_store_as_ref;
-        let _ = <BlobFinalizeStore as AmbiguousIfArcStoreAsRef<_>>::assert_not_arc_store_as_ref;
+        let _: Constructor = BlobPackPromotionJob::new;
+        let _: fn(BlobPackPromotionJob) -> BlobPackPromotionStore = take_owned_store;
+        let _ = <BlobPackPromotionStore as AmbiguousIfStoreDeref<_>>::assert_not_store_deref;
+        let _ = <BlobPackPromotionStore as AmbiguousIfStoreAsRef<_>>::assert_not_store_as_ref;
+        let _ =
+            <BlobPackPromotionStore as AmbiguousIfArcStoreAsRef<_>>::assert_not_arc_store_as_ref;
     }
 
-    #[test]
-    #[cfg(any())]
-    fn stream_upload_finalization_map_failure_joins_and_zeroizes_then_retries() {
-        stream_upload_finalization_failure_retries(false);
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn stream_upload_finalization_sink_failure_joins_and_zeroizes_then_retries() {
-        stream_upload_finalization_failure_retries(true);
-    }
-
-    #[cfg(any())]
-    fn stream_upload_finalization_failure_retries(fail_sink: bool) {
-        let label = if fail_sink { "sink" } else { "map" };
-        let root = TestRoot::new(&format!("stream-finalize-{label}-failure"));
-        let bytes = payload(3 * BLOB_STREAM_SEGMENT_BYTES + 29);
-        let operation = format!("blob/stream/finalize-{label}-failure");
-        let request = BlobPublishStreamRequest {
-            publication: request(operation.as_bytes()),
-            options: BlobPublishOptions::durable(),
-            total_len: bytes.len() as u64,
-        };
-        let mut node = selected_node(&root);
-        let opened = node
-            .open_publish_stream_inner(request.clone())
-            .expect("open failure stream");
-        for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
-            node.append_publish_stream_inner(
-                opened.token,
-                (index * 64 * 1024) as u64,
-                Zeroizing::new(chunk.to_vec()),
-            )
-            .expect("append failure stream");
-        }
-        let job = StreamJobId::from_bytes(opened.token[..16].try_into().expect("job ID"));
-        let probe = PipelineTestProbe::install(job);
-        if fail_sink {
-            probe.inject_finalizer_sink_failure(0);
-        } else {
-            probe.inject_finalizer_map_failure(2);
-        }
-        let error = node
-            .finish_publish_stream_inner(opened.token)
-            .expect_err("injected pipeline failure");
-        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
-        assert!(probe.cleanup_observed());
-        assert!(probe.cancellation_signalled());
-        assert!(probe.channels_closed());
-        assert_eq!(probe.active_workers(), 0);
-        assert_eq!(probe.worker_exits(), BLOB_FINALIZE_CHUNK_WORKERS);
-        assert_eq!(probe.joined_workers(), BLOB_FINALIZE_CHUNK_WORKERS);
-        assert!(
-            probe.mapped_ciphertext_zeroizations() > 0,
-            "mapped ciphertext was not observed dropping after {label} failure"
-        );
-        drop(probe);
-        drop(node);
-
-        let mut reopened = selected_node(&root);
-        let resumed = reopened
-            .open_publish_stream_inner(request)
-            .expect("resume failed finalization");
-        assert_eq!(resumed.progress.durable_offset, bytes.len() as u64);
-        reopened
-            .finish_publish_stream_inner(resumed.token)
-            .expect("retry converges after joined failure");
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn stream_upload_finalization_rejects_corrupt_digest_artifact() {
-        let root = TestRoot::new("stream-finalize-corrupt-digests");
-        let bytes = payload(3 * SELECTED_BLOB_CHUNK_SIZE as usize + 7);
-        let mut node = selected_node(&root);
-        let (token, _) =
-            prepare_ready_stream(&mut node, b"blob/stream/finalize-corrupt-digests", &bytes);
-        let upload_id = *node
-            .publish_streams
-            .get(&token)
-            .expect("open corrupt-digest stream")
-            .reservation
-            .pack_identity()
-            .upload_id()
-            .as_bytes();
-        let upload = upload_id
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let digests = root
-            .depot_path()
-            .join("stream-packs-v2")
-            .join(upload)
-            .join("canonical-digests-v1.bin");
-        let mut artifact = fs::read(&digests).expect("read canonical digest artifact");
-        *artifact.last_mut().expect("nonempty digest artifact") ^= 0x80;
-        fs::write(digests, artifact).expect("corrupt canonical digest artifact");
-
-        let error = node
-            .finish_publish_stream_inner(token)
-            .expect_err("digest commitment mismatch fails closed");
-        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
-    }
-
-    fn blob_finalize_measurement_json(
+    fn blob_pack_promotion_measurement_json(
         total_len: u64,
-        measured: &BlobFinalizeMetrics,
+        measured: &BlobPackPromotionMetrics,
     ) -> serde_json::Value {
         serde_json::json!({
-            "schema": "aster.local_blob_finalization.measurement.v3",
+            "schema": "aster.local_blob_pack_promotion.measurement.v1",
             "requested_plaintext_bytes": total_len,
             "segments": measured.segment_count,
             "plaintext_bytes_reprocessed": measured.plaintext_bytes_reprocessed,
@@ -8846,7 +7157,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn run_stream_finalization_measurement_gate(label: &str, total_len: u64) {
+    fn run_stream_pack_promotion_measurement_gate(label: &str, total_len: u64) {
         let root = TestRoot::new(label);
         persist_member_mission(&root);
         let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
@@ -8879,102 +7190,36 @@ pub(crate) mod tests {
         }
         node.finish_publish_stream_inner(opened.token)
             .expect("finish measurement stream");
-        let measured = node.finalize_pool.last_report_for_test();
-        println!("{}", blob_finalize_measurement_json(total_len, &measured));
+        let measured = node.pack_promotion_pool.last_report_for_test();
+        println!(
+            "{}",
+            blob_pack_promotion_measurement_json(total_len, &measured)
+        );
     }
 
     #[test]
     #[ignore = "exact-size local performance gate; run on an authorized measurement host"]
-    fn stream_upload_finalization_measurement_800_mib() {
-        run_stream_finalization_measurement_gate(
-            "blob/stream/finalization-measurement-800-mib",
+    fn stream_upload_pack_promotion_measurement_800_mib() {
+        run_stream_pack_promotion_measurement_gate(
+            "blob/stream/pack-promotion-measurement-800-mib",
             800 * 1024 * 1024,
         );
     }
 
     #[test]
     #[ignore = "exact-size local performance gate; run on an authorized measurement host"]
-    fn stream_upload_finalization_measurement_1_gib() {
-        run_stream_finalization_measurement_gate(
-            "blob/stream/finalization-measurement-1-gib",
+    fn stream_upload_pack_promotion_measurement_1_gib() {
+        run_stream_pack_promotion_measurement_gate(
+            "blob/stream/pack-promotion-measurement-1-gib",
             1024 * 1024 * 1024,
         );
     }
 
     #[test]
-    #[cfg(any())]
-    fn stream_upload_prefers_canonical_result_over_residual_cleanup_authority() {
-        // Break caught: a committed canonical operation must win over a
-        // residual provisional row left by a cleanup crash.
-        let root = TestRoot::new("stream-upload-cleanup-gap");
-        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 13);
-        let stream_request = BlobPublishStreamRequest {
-            publication: request(b"blob/stream/cleanup-gap"),
-            options: BlobPublishOptions::durable(),
-            total_len: bytes.len() as u64,
-        };
-        let (publication_id, original) = {
-            let mut node = selected_node(&root);
-            let opened = node
-                .open_publish_stream_inner(stream_request.clone())
-                .expect("open cleanup-gap upload");
-            for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
-                node.append_publish_stream_inner(
-                    opened.token,
-                    (offset * 64 * 1024) as u64,
-                    Zeroizing::new(chunk.to_vec()),
-                )
-                .expect("append cleanup-gap bytes");
-            }
-            let (result, measured) = node
-                .finish_publish_stream_without_cleanup_for_test(opened.token)
-                .expect("commit before injected cleanup crash");
-            let measured = measured.expect("new upload has a finalization measurement");
-            assert_eq!(measured.store_boundary_operations, 9);
-            assert_eq!(
-                measured.store_boundary_trace,
-                expected_finalize_store_trace(false)
-            );
-            let owner = BlobOperationOwner::new(
-                node.identity(),
-                BlobOperationKey::new(stream_request.publication.operation_key.clone())
-                    .expect("cleanup-gap operation"),
-            );
-            assert!(
-                node.store
-                    .resume_blob_upload(&owner)
-                    .expect("inspect residual upload")
-                    .is_some()
-            );
-            (result.publication_id.expect("publication id"), result)
-        };
-
-        let mut reopened = selected_node(&root);
-        let inspection = reopened
-            .inspect_publication(BlobPublicationInspectionRequest {
-                publication_id,
-                topic: blob_topic(),
-                scope: blob_scope(),
-            })
-            .expect("inspect canonical result across cleanup gap");
-        assert_eq!(inspection.phase, BlobPublicationPhase::Available);
-        assert_eq!(inspection.blob_id, Some(original.id));
-        let opened = reopened
-            .open_publish_stream_inner(stream_request)
-            .expect("exact retry converges cleanup gap");
-        assert_eq!(opened.progress.durable_offset, bytes.len() as u64);
-        let replay = reopened
-            .finish_publish_stream_inner(opened.token)
-            .expect("return canonical result");
-        assert_eq!(replay.id, original.id);
-        assert!(!replay.inserted);
-    }
-
-    #[test]
     fn selected_blob_publish_stream_promotes_and_replays_exact_operation() {
-        // Preserve the focused PR 95 contract gate while the canonical test
+        // Preserve the focused PR 95 contract gate while the native pack test
         // name records the repaired authority model.
-        stream_upload_finishes_as_canonical_blob_and_exact_retry();
+        stream_upload_finishes_as_native_pack_and_exact_retry();
     }
 
     #[test]
@@ -9090,8 +7335,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_upload_handles_empty_exact_chunk_and_maximum_boundaries() {
-        // Break caught: empty canonical publication must settle without data,
+    fn stream_upload_handles_empty_exact_segment_and_maximum_boundaries() {
+        // Break caught: empty native pack publication must settle without data,
         // replay exactly, and leave no provisional capacity behind.
         let root = TestRoot::new("stream-upload-boundaries");
         let mut node = selected_node(&root);
@@ -9121,6 +7366,21 @@ pub(crate) mod tests {
         let empty_result = node
             .finish_publish_stream_inner(opened.token)
             .expect("finish empty stream without data");
+        let empty_status = node
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: empty_result
+                    .publication_id
+                    .expect("empty publication identity"),
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .expect("inspect empty publication");
+        assert_eq!(empty_status.phase, BlobPublicationPhase::Available);
+        assert_eq!(empty_status.plaintext_total_bytes, 0);
+        assert_eq!(empty_status.transfer_total_bytes, 0);
+        assert_eq!(empty_status.durable_transfer_bytes, 0);
+        assert_eq!(empty_status.total_units, 0);
+        assert_eq!(empty_status.blob_id, Some(empty_result.id));
         let before_retry = node.capacity_status().expect("capacity after empty finish");
         assert_eq!(before_retry.pending_sources, 0);
         assert_eq!(before_retry.network_staging_bytes, 0);
@@ -9134,20 +7394,20 @@ pub(crate) mod tests {
         assert!(!replay.inserted);
         assert_eq!(node.capacity_status().unwrap(), before_retry);
 
-        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize);
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES);
         let exact = BlobPublishStreamRequest {
-            publication: request(b"blob/stream/exact-canonical-chunk"),
+            publication: request(b"blob/stream/exact-native-segment"),
             options: BlobPublishOptions::durable(),
             total_len: bytes.len() as u64,
         };
         let opened = node
             .open_publish_stream_inner(exact)
-            .expect("open exact canonical chunk");
+            .expect("open exact native segment");
         node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(bytes.clone()))
-            .expect("write exact canonical chunk");
+            .expect("write exact native segment");
         let result = node
             .finish_publish_stream_inner(opened.token)
-            .expect("finish exact canonical chunk");
+            .expect("finish exact native segment");
         let mut restored = Vec::new();
         node.read_into(
             BlobReadRequest {
@@ -9157,7 +7417,7 @@ pub(crate) mod tests {
             },
             &mut restored,
         )
-        .expect("ordinary canonical read");
+        .expect("ordinary native pack read");
         assert_eq!(restored, bytes);
 
         drop(node);
@@ -9189,16 +7449,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn stream_finalize_worker_does_not_block_unrelated_application_command() {
-        // Break caught: canonical preparation/encryption on the actor prevents
+    async fn stream_pack_promotion_worker_does_not_block_unrelated_application_command() {
+        // Break caught: native pack promotion on the actor prevents
         // unrelated application commands from being serviced.
-        let root = TestRoot::new("stream-finalize-worker");
+        let root = TestRoot::new("stream-pack-promotion-worker");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
         let mut node = selected_node(&root);
         let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
         let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        node.set_stream_finalize_gate_for_test(reached_tx, finished_tx, Arc::clone(&release));
+        node.set_stream_pack_promotion_gate_for_test(reached_tx, finished_tx, Arc::clone(&release));
         let identity = node.identity();
         let mission_authority = node.mission_authority();
         let admission = Arc::new(AtomicBool::new(true));
@@ -9208,15 +7468,15 @@ pub(crate) mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
-                    panic!("finalize responsiveness test received another application class");
+                    panic!("pack promotion responsiveness test received another application class");
                 };
                 node.execute_live(command, &worker_admission)
-                    .expect("execute finalize responsiveness command");
+                    .expect("execute pack promotion responsiveness command");
             }
         });
         let mut stream = handle
             .open_publish_stream(BlobPublishStreamRequest {
-                publication: request(b"blob/stream/finalize-worker"),
+                publication: request(b"blob/stream/pack-promotion-worker"),
                 options: BlobPublishOptions::durable(),
                 total_len: bytes.len() as u64,
             })
@@ -9229,16 +7489,18 @@ pub(crate) mod tests {
                 .expect("write live upload");
         }
         let finishing = tokio::spawn(async move { stream.finish().await });
-        tokio::task::spawn_blocking(move || reached_rx.recv().expect("finalizer reached gate"))
-            .await
-            .expect("join gate observer");
+        tokio::task::spawn_blocking(move || {
+            reached_rx.recv().expect("promotion worker reached gate")
+        })
+        .await
+        .expect("join gate observer");
         tokio::time::timeout(std::time::Duration::from_secs(1), handle.capacity_status())
             .await
-            .expect("actor services capacity command while finalizer is held")
+            .expect("actor services capacity command while promotion worker is held")
             .expect("capacity status");
         {
             let (released, wake) = &*release;
-            *released.lock().expect("finalizer release lock") = true;
+            *released.lock().expect("promotion worker release lock") = true;
             wake.notify_all();
         }
         finishing
@@ -9250,18 +7512,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stream_finalize_pool_bounds_active_and_queued_jobs_and_retry_after_saturation() {
+    async fn stream_pack_promotion_pool_bounds_active_and_queued_jobs_and_retry_after_saturation() {
         // Break caught: delegating each finish to Tokio's global blocking pool
-        // admits an unbounded number of expensive canonical finalizations.
-        let root = TestRoot::new("stream-finalize-saturation");
-        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 29);
+        // admits an unbounded number of expensive native pack promotions.
+        let root = TestRoot::new("stream-pack-promotion-saturation");
         let (mut node, ready) = tokio::task::block_in_place(|| {
             let mut node = selected_node(&root);
             let mut ready = Vec::new();
             for index in 0..5 {
+                // Distinct content keeps this worker-capacity test independent
+                // from same-content physical-lineage conflict policy.
+                let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 29 + index);
                 ready.push(prepare_ready_stream(
                     &mut node,
-                    format!("blob/stream/finalize-saturation-{index}").as_bytes(),
+                    format!("blob/stream/pack-promotion-saturation-{index}").as_bytes(),
                     &bytes,
                 ));
             }
@@ -9270,7 +7534,7 @@ pub(crate) mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
         let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(8);
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
+        node.set_stream_pack_promotion_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
         let identity = node.identity();
         let mission_authority = node.mission_authority();
         let admission = Arc::new(AtomicBool::new(true));
@@ -9281,66 +7545,66 @@ pub(crate) mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
-                    panic!("finalize saturation test received another application class");
+                    panic!("pack promotion saturation test received another application class");
                 };
                 node.execute_live(command, &worker_admission)
-                    .expect("execute finalize saturation command");
+                    .expect("execute pack promotion saturation command");
             }
         });
 
         let mut completions = Vec::new();
         completions.push(
-            schedule_stream_finalization_for_test(&direct, ready[0].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[0].0)
                 .await
-                .expect("admit first active finalizer"),
+                .expect("admit first active promotion worker"),
         );
         completions.push(
-            schedule_stream_finalization_for_test(&direct, ready[1].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[1].0)
                 .await
-                .expect("admit second active finalizer"),
+                .expect("admit second active promotion worker"),
         );
         tokio::task::spawn_blocking(move || {
-            started_rx.recv().expect("first finalizer started");
-            started_rx.recv().expect("second finalizer started");
+            started_rx.recv().expect("first promotion worker started");
+            started_rx.recv().expect("second promotion worker started");
         })
         .await
-        .expect("observe bounded active finalizers");
+        .expect("observe bounded active promotion workers");
         completions.push(
-            schedule_stream_finalization_for_test(&direct, ready[2].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[2].0)
                 .await
-                .expect("admit first queued finalizer"),
+                .expect("admit first queued promotion job"),
         );
         completions.push(
-            schedule_stream_finalization_for_test(&direct, ready[3].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[3].0)
                 .await
-                .expect("admit second queued finalizer"),
+                .expect("admit second queued promotion job"),
         );
-        let saturated = schedule_stream_finalization_for_test(&direct, ready[4].0)
+        let saturated = schedule_stream_pack_promotion_for_test(&direct, ready[4].0)
             .await
-            .expect_err("fifth finalizer exceeds two workers plus two queued jobs");
+            .expect_err("fifth promotion job exceeds two workers plus two queued jobs");
         assert_eq!(saturated.kind(), ApplicationErrorKind::ResourceLimit);
         tokio::time::timeout(std::time::Duration::from_secs(1), handle.capacity_status())
             .await
-            .expect("actor remains responsive while finalization pool is saturated")
+            .expect("actor remains responsive while pack promotion pool is saturated")
             .expect("capacity status while saturated");
 
         {
             let (released, wake) = &*release;
-            *released.lock().expect("finalizer release lock") = true;
+            *released.lock().expect("promotion worker release lock") = true;
             wake.notify_all();
         }
         for completion in completions {
             tokio::time::timeout(std::time::Duration::from_secs(10), completion)
                 .await
-                .expect("admitted finalizer completes")
+                .expect("admitted promotion job completes")
                 .expect("completion sender retained")
-                .expect("canonical finalization succeeds");
+                .expect("native pack promotion succeeds");
         }
         let retry = handle
             .open_publish_stream(ready[4].1.clone())
             .await
             .expect("saturated upload remains retry-safe");
-        assert_eq!(retry.durable_offset(), bytes.len() as u64);
+        assert_eq!(retry.durable_offset(), ready[4].1.total_len);
         assert!(
             retry
                 .finish()
@@ -9355,19 +7619,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_finalize_closed_pool_leaves_sealed_upload_retry_safe() {
+    fn stream_pack_promotion_closed_pool_leaves_sealed_upload_retry_safe() {
         // Break caught: closed admission must not consume the durable upload
         // reservation after the actor seals and removes the in-memory stream.
-        let root = TestRoot::new("stream-finalize-closed-pool");
+        let root = TestRoot::new("stream-pack-promotion-closed-pool");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 31);
         let mut node = selected_node(&root);
         let (token, request) =
-            prepare_ready_stream(&mut node, b"blob/stream/finalize-closed-pool", &bytes);
-        node.finalize_pool.shutdown();
+            prepare_ready_stream(&mut node, b"blob/stream/pack-promotion-closed-pool", &bytes);
+        node.pack_promotion_pool.shutdown();
 
         let error = node
             .finish_publish_stream_inner(token)
-            .expect_err("closed finalization pool rejects admission");
+            .expect_err("closed pack promotion pool rejects admission");
         assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
         drop(node);
 
@@ -9379,27 +7643,27 @@ pub(crate) mod tests {
         assert!(
             reopened
                 .finish_publish_stream_inner(retry.token)
-                .expect("reopened pool finalizes retained upload")
+                .expect("reopened pool promotes retained upload")
                 .inserted
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn stream_finalize_survives_caller_drop_after_scheduling_ack() {
+    async fn stream_pack_promotion_survives_caller_drop_after_scheduling_ack() {
         // Break caught: returning the owned job through the response lets a
         // cancelled finish future drop it after the actor removed the stream.
-        let root = TestRoot::new("stream-finalize-caller-drop");
+        let root = TestRoot::new("stream-pack-promotion-caller-drop");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 37);
         let (mut node, (token, request)) = tokio::task::block_in_place(|| {
             let mut node = selected_node(&root);
             let ready =
-                prepare_ready_stream(&mut node, b"blob/stream/finalize-caller-drop", &bytes);
+                prepare_ready_stream(&mut node, b"blob/stream/pack-promotion-caller-drop", &bytes);
             (node, ready)
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
+        node.set_stream_pack_promotion_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
         let identity = node.identity();
         let mission_authority = node.mission_authority();
         let admission = Arc::new(AtomicBool::new(true));
@@ -9417,12 +7681,12 @@ pub(crate) mod tests {
             }
         });
 
-        let completion = schedule_stream_finalization_for_test(&direct, token)
+        let completion = schedule_stream_pack_promotion_for_test(&direct, token)
             .await
-            .expect("actor schedules finalizer before acknowledging");
-        tokio::task::spawn_blocking(move || started_rx.recv().expect("finalizer started"))
+            .expect("actor schedules promotion before acknowledging");
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("promotion worker started"))
             .await
-            .expect("observe retained finalizer");
+            .expect("observe retained promotion job");
         drop(completion);
         drop(handle);
         drop(direct);
@@ -9431,20 +7695,20 @@ pub(crate) mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut worker)
                 .await
                 .is_err(),
-            "actor shutdown joins rather than abandons the accepted finalizer"
+            "actor shutdown joins rather than abandons the accepted promotion job"
         );
         {
             let (released, wake) = &*release;
-            *released.lock().expect("finalizer release lock") = true;
+            *released.lock().expect("promotion worker release lock") = true;
             wake.notify_all();
         }
         tokio::time::timeout(std::time::Duration::from_secs(10), &mut worker)
             .await
-            .expect("joined shutdown completes after finalizer release")
+            .expect("joined shutdown completes after promotion worker release")
             .expect("join caller-drop application actor");
-        tokio::task::spawn_blocking(move || finished_rx.recv().expect("finalizer completed"))
+        tokio::task::spawn_blocking(move || finished_rx.recv().expect("promotion job completed"))
             .await
-            .expect("join retained finalizer observation");
+            .expect("join retained promotion job observation");
 
         let publication_id = BlobStreamPublicationId::from_bytes(token).expect("publication id");
         let (available, before_retry, replay, after_retry) = tokio::task::block_in_place(|| {
@@ -9475,21 +7739,21 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn stream_finalize_worker_panics_resolve_completions_and_reclaim_both_slots() {
-        // Break caught: an unwound finalizer must not strand its completion or
+    async fn stream_pack_promotion_worker_panics_resolve_completions_and_reclaim_both_slots() {
+        // Break caught: an unwound promotion worker must not strand its completion or
         // permanently consume one of the two application-owned worker slots.
-        let root = TestRoot::new("stream-finalize-worker-panic");
+        let root = TestRoot::new("stream-pack-promotion-worker-panic");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 41);
         let (mut node, first, second) = tokio::task::block_in_place(|| {
             let mut node = selected_node(&root);
             let first = prepare_ready_stream(
                 &mut node,
-                b"blob/stream/finalize-worker-panic-first",
+                b"blob/stream/pack-promotion-worker-panic-first",
                 &bytes,
             );
             let second = prepare_ready_stream(
                 &mut node,
-                b"blob/stream/finalize-worker-panic-second",
+                b"blob/stream/pack-promotion-worker-panic-second",
                 &bytes,
             );
             (node, first, second)
@@ -9497,8 +7761,8 @@ pub(crate) mod tests {
         let (started_tx, _started_rx) = std::sync::mpsc::sync_channel(2);
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(2);
         let release = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
-        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, release);
-        node.panic_stream_finalizations_for_test(2);
+        node.set_stream_pack_promotion_gate_for_test(started_tx, finished_tx, release);
+        node.panic_stream_pack_promotions_for_test(2);
         let identity = node.identity();
         let mission_authority = node.mission_authority();
         let admission = Arc::new(AtomicBool::new(true));
@@ -9509,19 +7773,19 @@ pub(crate) mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
-                    panic!("finalizer panic test received another application class");
+                    panic!("promotion panic test received another application class");
                 };
                 node.execute_live(command, &worker_admission)
-                    .expect("execute finalizer panic command");
+                    .expect("execute promotion-worker panic command");
             }
         });
 
-        let first_completion = schedule_stream_finalization_for_test(&direct, first.0)
+        let first_completion = schedule_stream_pack_promotion_for_test(&direct, first.0)
             .await
-            .expect("schedule first panicking finalizer");
-        let second_completion = schedule_stream_finalization_for_test(&direct, second.0)
+            .expect("schedule first panicking promotion job");
+        let second_completion = schedule_stream_pack_promotion_for_test(&direct, second.0)
             .await
-            .expect("schedule second panicking finalizer");
+            .expect("schedule second panicking promotion job");
         for completion in [first_completion, second_completion] {
             let error = completion
                 .await
@@ -9539,7 +7803,7 @@ pub(crate) mod tests {
         let retry = handle
             .open_publish_stream(first.1)
             .await
-            .expect("panicked finalizer leaves exact upload retry-safe");
+            .expect("panicked promotion job leaves exact upload retry-safe");
         assert!(
             retry
                 .finish()
@@ -9601,6 +7865,10 @@ pub(crate) mod tests {
         assert_eq!(available.phase, BlobPublicationPhase::Available);
         assert_eq!(available.blob_id, Some(result.id));
         assert_eq!(available.plaintext_total_bytes, bytes.len() as u64);
+        let wire_len = crate::stream_transfer::blob_pack_wire_len(bytes.len() as u64)
+            .expect("native pack wire length");
+        assert_eq!(available.transfer_total_bytes, wire_len);
+        assert_eq!(available.durable_transfer_bytes, wire_len);
     }
 
     #[test]
@@ -9717,6 +7985,16 @@ pub(crate) mod tests {
         }
 
         let mut restarted = selected_node(&root);
+        let mut changed = bytes.clone();
+        changed[17] ^= 0x80;
+        let error = restarted
+            .publish(
+                stream_request.publication.clone(),
+                &mut Cursor::new(changed),
+            )
+            .expect_err("changed one-shot source cannot reuse a durable prefix");
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(error.operation(), "blob publish");
         let opened = restarted
             .open_publish_stream_inner(stream_request)
             .expect("resume stream");
@@ -9767,60 +8045,33 @@ pub(crate) mod tests {
         }
     }
 
-    enum RetryRewindAction {
-        Replace(Vec<u8>),
-        Fail,
-    }
-
-    struct StatefulRetrySource {
+    struct GrowingReadCursor {
         inner: Cursor<Vec<u8>>,
-        action: Option<RetryRewindAction>,
-        start_zero_seeks: u8,
+        grew: bool,
     }
 
-    impl StatefulRetrySource {
-        fn replacing(initial: Vec<u8>, replacement: Vec<u8>) -> Self {
-            assert_eq!(initial.len(), replacement.len());
-            Self {
-                inner: Cursor::new(initial),
-                action: Some(RetryRewindAction::Replace(replacement)),
-                start_zero_seeks: 0,
-            }
-        }
-
-        fn failing(bytes: Vec<u8>) -> Self {
+    impl GrowingReadCursor {
+        fn new(bytes: Vec<u8>) -> Self {
             Self {
                 inner: Cursor::new(bytes),
-                action: Some(RetryRewindAction::Fail),
-                start_zero_seeks: 0,
+                grew: false,
             }
         }
     }
 
-    impl Read for StatefulRetrySource {
+    impl Read for GrowingReadCursor {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-            self.inner.read(output)
+            let read = self.inner.read(output)?;
+            if read != 0 && !self.grew {
+                self.inner.get_mut().push(0xff);
+                self.grew = true;
+            }
+            Ok(read)
         }
     }
 
-    impl Seek for StatefulRetrySource {
+    impl Seek for GrowingReadCursor {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-            if matches!(position, SeekFrom::Start(0)) {
-                self.start_zero_seeks = self.start_zero_seeks.saturating_add(1);
-                if self.start_zero_seeks == 3 {
-                    match self.action.take() {
-                        Some(RetryRewindAction::Replace(replacement)) => {
-                            self.inner = Cursor::new(replacement);
-                        }
-                        Some(RetryRewindAction::Fail) => {
-                            return Err(std::io::Error::other(
-                                "injected stopped Blob retry rewind failure",
-                            ));
-                        }
-                        None => {}
-                    }
-                }
-            }
             self.inner.seek(position)
         }
     }
@@ -10442,6 +8693,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn sequential_live_blob_pages_open_each_profile5_segment_once() {
+        let root = TestRoot::new("live-page-pipeline-reuse");
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES * 2 + 19);
+        let mut node = selected_node(&root);
+        let published = node
+            .publish(
+                request(b"blob/live-page-pipeline-reuse"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish sequential read fixture");
+
+        let mut restored = Vec::new();
+        let result = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut restored,
+            )
+            .expect("read sequential pages through one pipeline");
+
+        assert_eq!(restored, bytes);
+        assert_eq!(result.total_len, bytes.len() as u64);
+        assert_eq!(result.verified_chunks, 5);
+        assert_eq!(node.last_read_cache_opened_segments, 3);
+        assert!(node.read_cache.is_none());
+    }
+
+    #[test]
     fn live_blob_commands_reject_exactly_when_closed_or_saturated() {
         let request = BlobReadPageRequest {
             blob: BlobReadRequest {
@@ -10621,7 +8903,11 @@ pub(crate) mod tests {
             .execute_live(command, &admission)
             .expect_err("cache poison must escape the worker as actor-fatal");
         assert!(matches!(&error, NodeError::FatalBlobCoherence(_)));
-        assert!(error.to_string().contains("lifecycle lock is poisoned"));
+        assert!(
+            error
+                .to_string()
+                .contains("live native Blob publication failed a durable invariant")
+        );
         assert!(received.blocking_recv().is_err());
         assert_eq!(
             node.store
@@ -10731,43 +9017,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn live_blob_corrupt_exact_retry_is_actor_fatal_and_drops_response() {
-        let root = TestRoot::new("live-corrupt-retry-fatal");
-        let source_path = root.path().join("live-corrupt-retry.bin");
-        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
-        fs::write(&source_path, &bytes).expect("write corrupt-retry source");
-        let request = request(b"blob/live-corrupt-retry");
-        let mut node = selected_node(&root);
-        node.publish_live(
-            request.clone(),
-            fs::File::open(&source_path).expect("open initial live source"),
-        )
-        .expect("publish corrupt-retry fixture");
-
-        let chunk = first_chunk_file(&root.depot_path());
-        let mut encoded = fs::read(&chunk).expect("read corrupt-retry chunk");
-        *encoded.last_mut().expect("nonempty corrupt-retry chunk") ^= 0x80;
-        fs::write(&chunk, encoded).expect("corrupt exact committed chunk");
-
-        let admission = AtomicBool::new(true);
-        let (response, received) = oneshot::channel();
-        let command = SelectedBlobCommand::Publish {
-            request,
-            options: BlobPublishOptions::durable(),
-            source: fs::File::open(&source_path).expect("open retry live source"),
-            response,
-        };
-        let error = node
-            .execute_live(command, &admission)
-            .expect_err("corrupt exact retry must stop its Blob worker");
-        assert!(matches!(error, NodeError::FatalBlobCoherence(_)));
-        assert!(
-            received.blocking_recv().is_err(),
-            "fatal exact retry must drop its application response"
-        );
-    }
-
-    #[test]
     fn live_blob_depot_quota_is_ordinary_resource_limit() {
         let root = TestRoot::new("live-depot-quota-ordinary");
         persist_member_mission(&root);
@@ -10832,18 +9081,16 @@ pub(crate) mod tests {
                 )
                 .expect_err("routine cleanup alone cannot authorize the retry");
                 assert_eq!(
-                    node.last_live_publish_source_bytes_read,
-                    u64::try_from(plaintext.len()).expect("source length"),
-                    "the pre-encryption depot rejection performs one preparation pass",
+                    node.last_live_publish_source_bytes_read, 0,
+                    "a failed reservation cannot consume the live source",
                 );
             } else {
                 let mut source = CountingCursor::new(plaintext.clone());
                 node.publish(request(b"blob/stopped-capacity-gc-success"), &mut source)
                     .expect_err("routine cleanup alone cannot authorize the retry");
                 assert_eq!(
-                    source.bytes_read,
-                    u64::try_from(plaintext.len()).expect("source length"),
-                    "the pre-encryption depot rejection performs one preparation pass",
+                    source.bytes_read, 0,
+                    "a failed reservation cannot consume the stopped source",
                 );
             }
             assert_eq!(node.capacity_gc_attempts, 1);
@@ -10859,10 +9106,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blob_pressure_recovery_evicts_completed_cache_before_one_retry() {
+    fn blob_pressure_recovery_evicts_completed_native_pack_before_one_retry() {
         // Break caught: local publication cannot merely run ordinary GC and
         // retry while a lower-priority live variant still owns the rejected
-        // depot partition and an authenticated in-memory serving claim.
+        // depot partition.
         let root = TestRoot::new("local-pressure-completed-cache");
         persist_member_mission(&root);
         let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
@@ -10885,10 +9132,6 @@ pub(crate) mod tests {
             .into_iter()
             .next()
             .expect("low-priority transfer");
-        assert!(
-            node.source_route_cache.has_blob_claim_for_test(evicted),
-            "completed fixture starts with an authenticated cache claim"
-        );
         prime_blob_policy_for_pressure(&node);
         let attempts_before = node.publish_attempts;
         let mut incoming = request(b"blob/local-pressure/high");
@@ -10900,8 +9143,11 @@ pub(crate) mod tests {
         assert_eq!(node.publish_attempts - attempts_before, 2);
         assert_eq!(node.capacity_gc_attempts, 1);
         assert!(
-            !node.source_route_cache.has_blob_claim_for_test(evicted),
-            "the evicted completed transfer cannot remain serveable from memory"
+            !node
+                .store
+                .blob_inventory()
+                .expect("post-pressure inventory")
+                .contains(&evicted)
         );
         assert_eq!(
             node.store
@@ -10909,54 +9155,6 @@ pub(crate) mod tests {
                 .expect("post-pressure inventory")
                 .len(),
             1
-        );
-    }
-
-    #[test]
-    fn blob_pressure_uses_the_exact_rejected_chunk_not_the_whole_manifest() {
-        // Break caught: after the first chunk of a two-chunk import commits,
-        // the failing atomic admission is only the second chunk. Charging the
-        // whole manifest makes a one-chunk eviction look insufficient and
-        // incorrectly suppresses the sole retry.
-        let root = TestRoot::new("local-pressure-exact-rejected-chunk");
-        persist_member_mission(&root);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(64 * 1024 * 1024, 2, 2)
-                    .expect("two-chunk pressure limits"),
-            },
-        )
-        .expect("open exact-chunk pressure node");
-        let mut low = request(b"blob/local-pressure/exact-chunk-low");
-        low.priority = Priority::Routine;
-        node.publish(low, &mut Cursor::new(vec![0x33; 128]))
-            .expect("publish one-chunk lower-priority fixture");
-        let evicted = node.store.blob_inventory().expect("low inventory")[0];
-        prime_blob_policy_for_pressure(&node);
-        let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/local-pressure/exact-chunk-high");
-        incoming.priority = Priority::Flash;
-        let incoming_bytes = vec![0x34; SELECTED_BLOB_CHUNK_SIZE as usize + 1];
-
-        node.publish(incoming, &mut Cursor::new(incoming_bytes))
-            .expect("one evicted chunk exactly satisfies the rejected chunk admission");
-
-        assert_eq!(node.publish_attempts - attempts_before, 2);
-        assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
-        let stats = node.store.blob_stats().expect("post-exact-chunk stats");
-        assert_eq!(stats.publications, 1);
-        let admitted = node.store.blob_inventory().expect("admitted inventory")[0];
-        assert_eq!(
-            node.store
-                .blob_source_projection(admitted)
-                .expect("admitted projection lookup")
-                .expect("admitted projection")
-                .source
-                .chunk_count,
-            2
         );
     }
 
@@ -10988,7 +9186,13 @@ pub(crate) mod tests {
 
         assert_eq!(node.publish_attempts - attempts_before, 2);
         assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
+        assert!(
+            !node
+                .store
+                .blob_inventory()
+                .expect("post-pressure inventory")
+                .contains(&evicted)
+        );
         assert_eq!(
             node.store
                 .blob_inventory()
@@ -11031,203 +9235,66 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blob_pressure_retry_rejects_changed_stateful_source_identity() {
-        // Break caught: the eviction proof for the first prepared Blob must
-        // never authorize a different same-length Blob returned after rewind.
-        let root = TestRoot::new("local-pressure-stateful-source-change");
+    fn blob_pressure_retry_reads_source_once_after_reservation_succeeds() {
+        // Reservation and pressure recovery complete before the native pack
+        // consumes plaintext, so the sole successful reservation reads once.
+        let root = TestRoot::new("local-pressure-single-read");
         persist_member_mission(&root);
         let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
             root.path(),
             root.mission_path(),
             SelectedBlobOptions {
                 depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
-                    .expect("one-variant stateful pressure limits"),
+                    .expect("one-variant pressure limits"),
             },
         )
-        .expect("open stateful pressure node");
-        let mut low = request(b"blob/local-pressure/stateful-low");
+        .expect("open pressure node");
+        let mut low = request(b"blob/local-pressure/single-read-low");
         low.priority = Priority::Routine;
         node.publish(low, &mut Cursor::new(vec![0x35; 128]))
-            .expect("publish stateful lower-priority fixture");
-        let low = node.store.blob_inventory().expect("stateful low inventory")[0];
+            .expect("publish lower-priority fixture");
+        let low = node.store.blob_inventory().expect("low inventory")[0];
         prime_blob_policy_for_pressure(&node);
         let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/local-pressure/stateful-incoming");
+        let mut incoming = request(b"blob/local-pressure/single-read-incoming");
         incoming.priority = Priority::Flash;
-        let mut source = StatefulRetrySource::replacing(vec![0x36; 129], vec![0x37; 129]);
+        let plaintext = vec![0x36; 129];
+        let mut source = CountingCursor::new(plaintext.clone());
 
-        let error = node
-            .publish(incoming, &mut source)
-            .expect_err("pressure proof for the first identity cannot admit the replacement");
+        node.publish(incoming, &mut source)
+            .expect("capacity recovery reserves before consuming plaintext");
 
-        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(source.bytes_read, plaintext.len() as u64);
         assert_eq!(node.publish_attempts - attempts_before, 2);
         assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(!node.source_route_cache.has_blob_claim_for_test(low));
         assert!(
-            node.store
+            !node
+                .store
                 .blob_inventory()
-                .expect("no replacement inventory")
-                .is_empty()
+                .expect("single admitted inventory")
+                .contains(&low)
         );
-    }
-
-    #[test]
-    fn blob_retry_rewind_failure_precedes_stopped_pressure_mutation() {
-        // Break caught: a failed retry rewind after eviction destroys useful
-        // state even though the promised retry can never be attempted.
-        let root = TestRoot::new("local-pressure-stopped-rewind-failure");
-        persist_member_mission(&root);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
-                    .expect("one-variant rewind limits"),
-            },
-        )
-        .expect("open stopped rewind node");
-        let mut low = request(b"blob/local-pressure/stopped-rewind-low");
-        low.priority = Priority::Routine;
-        node.publish(low, &mut Cursor::new(vec![0x38; 128]))
-            .expect("publish stopped rewind fixture");
-        let low = node
-            .store
-            .blob_inventory()
-            .expect("stopped rewind inventory")[0];
-        let recoveries_before = node.capacity_gc_attempts;
-        let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/local-pressure/stopped-rewind-incoming");
-        incoming.priority = Priority::Flash;
-        let mut source = StatefulRetrySource::failing(vec![0x39; 129]);
-
-        let error = node
-            .publish(incoming, &mut source)
-            .expect_err("failed rewind returns the original capacity rejection");
-
-        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-        assert_eq!(node.publish_attempts - attempts_before, 1);
-        assert_eq!(node.capacity_gc_attempts, recoveries_before);
-        assert!(node.source_route_cache.has_blob_claim_for_test(low));
-        assert_eq!(
-            node.store.blob_inventory().expect("preserved inventory"),
-            [low]
-        );
-    }
-
-    #[test]
-    fn live_blob_pressure_retry_rejects_same_length_file_change() {
-        // Break caught: a live file can change bytes without changing length
-        // between preparation attempts; the original eviction proof remains
-        // bound to the original Blob identity.
-        let root = TestRoot::new("live-pressure-same-length-change");
-        persist_member_mission(&root);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(8 * 1024 * 1024, 4, 1)
-                    .expect("one-variant live identity limits"),
-            },
-        )
-        .expect("open live identity node");
-        let mut low = request(b"blob/live-pressure/identity-low");
-        low.priority = Priority::Routine;
-        node.publish(low, &mut Cursor::new(vec![0x3a; 128]))
-            .expect("publish live identity fixture");
-        let low = node
-            .store
-            .blob_inventory()
-            .expect("live identity inventory")[0];
-        prime_blob_policy_for_pressure(&node);
-        let source_path = root.path().join("live-pressure-change.bin");
-        let bytes = vec![0x3b; SELECTED_BLOB_CHUNK_SIZE as usize + 17];
-        fs::write(&source_path, &bytes).expect("write live pressure source");
-        let source = fs::File::open(&source_path).expect("open live pressure source");
-        let (reached_sender, reached_receiver) = std::sync::mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
-        node.set_live_publish_pass_two_gate(reached_sender, release_receiver);
-        let mutate_path = source_path.clone();
-        let changed_offset = u64::from(SELECTED_BLOB_CHUNK_SIZE) + 7;
-        let mutator = std::thread::spawn(move || {
-            reached_receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("live pressure retry reaches pass-two mutation gate");
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(mutate_path)
-                .expect("open live retry mutation handle");
-            file.seek(SeekFrom::Start(changed_offset))
-                .expect("seek live retry mutation");
-            file.write_all(&[0x3c]).expect("mutate live retry source");
-            file.sync_data().expect("sync live retry mutation");
-            release_sender
-                .send(())
-                .expect("release live pressure pass-two retry");
-        });
-        let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/live-pressure/identity-incoming");
-        incoming.priority = Priority::Flash;
-
-        let error = node
-            .publish_live(incoming, source)
-            .expect_err("pressure proof cannot admit changed live-file content");
-        mutator.join().expect("join live retry mutator");
-
-        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
-        assert_eq!(node.publish_attempts - attempts_before, 2);
-        assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(!node.source_route_cache.has_blob_claim_for_test(low));
-        assert!(
-            node.store
-                .blob_inventory()
-                .expect("no changed live inventory")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn live_blob_retry_rewind_failure_precedes_pressure_mutation() {
-        let root = TestRoot::new("live-pressure-rewind-failure");
-        persist_member_mission(&root);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
-                    .expect("one-variant live rewind limits"),
-            },
-        )
-        .expect("open live rewind node");
-        let mut low = request(b"blob/live-pressure/rewind-low");
-        low.priority = Priority::Routine;
-        node.publish(low, &mut Cursor::new(vec![0x3d; 128]))
-            .expect("publish live rewind fixture");
-        let low = node.store.blob_inventory().expect("live rewind inventory")[0];
-        let source_path = root.path().join("live-pressure-rewind.bin");
-        fs::write(&source_path, vec![0x3e; 129]).expect("write live rewind source");
-        let source = fs::File::open(&source_path).expect("open live rewind source");
-        node.inject_live_publish_retry_rewind_failure();
-        let recoveries_before = node.capacity_gc_attempts;
-        let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/live-pressure/rewind-incoming");
-        incoming.priority = Priority::Flash;
-
-        let error = node
-            .publish_live(incoming, source)
-            .expect_err("live rewind failure returns the original capacity rejection");
-
-        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-        assert_eq!(node.publish_attempts - attempts_before, 1);
-        assert_eq!(node.capacity_gc_attempts, recoveries_before);
-        assert!(node.source_route_cache.has_blob_claim_for_test(low));
         assert_eq!(
             node.store
                 .blob_inventory()
-                .expect("preserved live inventory"),
-            [low]
+                .expect("single admitted inventory")
+                .len(),
+            1
         );
+    }
+
+    #[test]
+    fn blob_native_one_pass_rejects_source_growth_during_read() {
+        let root = TestRoot::new("native-source-growth");
+        let mut node = selected_node(&root);
+        let mut source = GrowingReadCursor::new(vec![0x37; 129]);
+
+        let error = node
+            .publish(request(b"blob/native-source-growth"), &mut source)
+            .expect_err("source growth during the native read must conflict");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert!(node.store.blob_inventory().expect("inventory").is_empty());
     }
 
     #[test]
@@ -11268,68 +9335,11 @@ pub(crate) mod tests {
         assert_eq!(node.publish_attempts - attempts_before, 1);
         assert_eq!(node.capacity_gc_attempts, 1);
         assert!(
-            node.source_route_cache.has_blob_claim_for_test(retained),
-            "insufficient recovery preserves the unrelated equal-priority route"
-        );
-    }
-
-    #[test]
-    fn blob_shared_variant_with_equal_priority_root_is_not_partially_evicted() {
-        let root = TestRoot::new("local-pressure-shared-variant");
-        persist_member_mission(&root);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
-                    .expect("one shared-variant pressure limit"),
-            },
-        )
-        .expect("open shared-variant pressure node");
-        let shared = vec![0x51; 128];
-        let mut low = request(b"blob/local-pressure/shared-low");
-        low.priority = Priority::Routine;
-        node.publish(low, &mut Cursor::new(shared.clone()))
-            .expect("publish lower-priority shared source");
-        let low = node.store.blob_inventory().expect("low shared inventory")[0];
-        let mut retained = request(b"blob/local-pressure/shared-retained");
-        retained.priority = Priority::Flash;
-        node.publish(retained, &mut Cursor::new(shared))
-            .expect("publish equal-content retained source");
-        let retained = node
-            .store
-            .blob_inventory()
-            .expect("shared inventory")
-            .into_iter()
-            .find(|transfer| *transfer != low)
-            .expect("retained shared transfer");
-        let attempts_before = node.publish_attempts;
-        let mut incoming = request(b"blob/local-pressure/shared-blocked");
-        incoming.priority = Priority::Flash;
-
-        let error = node
-            .publish(incoming, &mut Cursor::new(vec![0x52; 129]))
-            .expect_err("shared retained variant leaves the exact deficit unproven");
-
-        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-        assert_eq!(node.publish_attempts - attempts_before, 1);
-        assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(node.source_route_cache.has_blob_claim_for_test(low));
-        assert!(node.source_route_cache.has_blob_claim_for_test(retained));
-        let mut expected = vec![low, retained];
-        expected.sort_unstable();
-        assert_eq!(
             node.store
-                .blob_inventory()
-                .expect("post-shared-pressure inventory"),
-            expected
-        );
-        assert_eq!(
-            node.store
-                .blob_stats()
-                .expect("post-shared-pressure stats")
-                .variants,
-            1
+                .get_blob(retained)
+                .expect("retained native publication lookup")
+                .is_some(),
+            "insufficient recovery preserves the unrelated equal-priority publication"
         );
     }
 
@@ -11344,7 +9354,7 @@ pub(crate) mod tests {
             root.path(),
             root.mission_path(),
             SelectedBlobOptions {
-                depot_limits: BlobDepotLimits::new(400, 4, 4)
+                depot_limits: BlobDepotLimits::new(70_000, 4, 4)
                     .expect("byte-constrained physical-failure limits"),
             },
         )
@@ -11357,7 +9367,7 @@ pub(crate) mod tests {
             .store
             .blob_inventory()
             .expect("physical-failure inventory")[0];
-        let variant_directory = first_chunk_file(&root.depot_path())
+        let variant_directory = first_profile5_pack_file(&root.depot_path())
             .parent()
             .expect("physical-failure variant directory")
             .to_path_buf();
@@ -11393,14 +9403,19 @@ pub(crate) mod tests {
         assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(node.publish_attempts - attempts_before, 1);
         assert_eq!(node.capacity_gc_attempts, 1);
-        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
+        assert!(
+            !node
+                .store
+                .blob_inventory()
+                .expect("retired inventory")
+                .contains(&evicted)
+        );
         let status = node
             .store
             .blob_gc_status(None)
             .expect("physical-failure GC status");
         assert!(status.retry_attempts > 0);
         assert!(status.last_failure.is_some());
-        assert!(status.deletion_pending_files > 0);
     }
 
     #[test]
@@ -11434,9 +9449,8 @@ pub(crate) mod tests {
                     )
                     .expect_err("live tiny depot remains exhausted");
                 assert_eq!(
-                    node.last_live_publish_source_bytes_read,
-                    2 * u64::try_from(plaintext.len()).expect("source length"),
-                    "one failed attempt performs exactly prepare/encrypt",
+                    node.last_live_publish_source_bytes_read, 0,
+                    "unrecoverable reservation pressure cannot consume the live source",
                 );
                 error
             } else {
@@ -11448,9 +9462,8 @@ pub(crate) mod tests {
                     )
                     .expect_err("stopped tiny depot remains exhausted");
                 assert_eq!(
-                    source.bytes_read,
-                    2 * u64::try_from(plaintext.len()).expect("source length"),
-                    "one failed attempt performs exactly prepare/encrypt",
+                    source.bytes_read, 0,
+                    "unrecoverable reservation pressure cannot consume the stopped source",
                 );
                 error
             };
@@ -11876,34 +9889,12 @@ pub(crate) mod tests {
             .expect_err("pre-seeked live file must fail");
         assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
 
-        let mut source = fs::OpenOptions::new()
-            .read(true)
+        fs::OpenOptions::new()
             .write(true)
             .open(&source_path)
-            .expect("open growing source");
-        source
-            .set_len(MAX_SELECTED_LIVE_BLOB_BYTES)
-            .expect("set bounded sparse length");
-        let grower = source.try_clone().expect("clone growing source");
-        grower
+            .expect("open growing source")
             .set_len(MAX_SELECTED_LIVE_BLOB_BYTES + 1)
             .expect("grow sparse source past live ceiling");
-        let admission = AtomicBool::new(true);
-        let mut admitted = AdmittedFile {
-            file: &mut source,
-            admission: &admission,
-            max_len: MAX_SELECTED_LIVE_BLOB_BYTES,
-            pass_two_gate: None,
-            expected_len: MAX_SELECTED_LIVE_BLOB_BYTES,
-            total_bytes_read: 0,
-            fail_retry_rewind: false,
-            start_zero_seeks: 0,
-        };
-        let error = admitted
-            .seek(std::io::SeekFrom::End(0))
-            .expect_err("growth past live ceiling must fail before hashing");
-        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
-        drop(admitted);
         let oversized = fs::File::open(&source_path).expect("reopen oversized live source");
         let error = node
             .publish_live(request(b"blob/live-oversized"), oversized)
@@ -11918,96 +9909,6 @@ pub(crate) mod tests {
             )),
         );
         assert_eq!(streamed_growth.kind(), ApplicationErrorKind::ResourceLimit);
-    }
-
-    #[test]
-    fn live_blob_second_pass_change_leaves_only_bounded_unfinalized_staging() {
-        let root = TestRoot::new("live-second-pass-change");
-        persist_member_mission(&root);
-        let limits = BlobDepotLimits::new(1_000_000, 4, 1).expect("bounded test depot limits");
-        let options = SelectedBlobOptions {
-            depot_limits: limits,
-        };
-        let source_path = root.path().join("source.bin");
-        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 31);
-        fs::write(&source_path, &bytes).expect("write mutable live source");
-        let source = fs::File::open(&source_path).expect("open mutable live source");
-        let (reached_sender, reached_receiver) = std::sync::mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
-        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            options,
-        )
-        .expect("open bounded live Blob node");
-        node.set_live_publish_pass_two_gate(reached_sender, release_receiver);
-
-        let mutate_path = source_path.clone();
-        let changed_offset = u64::from(SELECTED_BLOB_CHUNK_SIZE) + 17;
-        let changed_byte = bytes[usize::try_from(changed_offset).expect("mutation offset")] ^ 0x80;
-        let mutator = std::thread::spawn(move || {
-            reached_receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("live publish reaches pass-two mutation gate");
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(mutate_path)
-                .expect("open second-pass mutation handle");
-            file.seek(std::io::SeekFrom::Start(changed_offset))
-                .expect("seek second-pass mutation");
-            file.write_all(&[changed_byte])
-                .expect("mutate later plaintext chunk");
-            file.sync_data().expect("sync later plaintext mutation");
-            release_sender
-                .send(())
-                .expect("release live publish pass-two retry");
-        });
-
-        let error = node
-            .publish_live(request(b"blob/live-second-pass-change"), source)
-            .expect_err("second-pass source mutation must fail closed");
-        mutator.join().expect("join second-pass mutator");
-        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
-        assert_eq!(error.operation(), "blob publish");
-
-        let staged = node.store.blob_stats().expect("abandoned staging stats");
-        assert_eq!(staged.publications, 0);
-        assert_eq!(staged.acceptance_markers, 0);
-        assert_eq!(staged.operations, 0);
-        assert_eq!(staged.variants, 1);
-        assert_eq!(staged.finalized_variants, 0);
-        assert_eq!(staged.committed_chunks, 1);
-        assert!(staged.committed_file_bytes <= limits.max_bytes());
-        assert!(staged.reserved_file_bytes <= limits.max_bytes());
-        assert!(staged.committed_chunks <= limits.max_chunks());
-        assert!(staged.variants <= limits.max_variants());
-        assert!(
-            node.store
-                .blob_inventory()
-                .expect("empty inventory")
-                .is_empty()
-        );
-        drop(node);
-
-        let reopened = SelectedBlobNode::open_unprotected_reference_with_options(
-            root.path(),
-            root.mission_path(),
-            options,
-        )
-        .expect("reopen bounded staging");
-        assert_eq!(
-            reopened.store.blob_stats().expect("reopened staging stats"),
-            staged,
-            "restart preserves charged, unfinalized staging without making it visible"
-        );
-        assert!(
-            reopened
-                .store
-                .blob_inventory()
-                .expect("reopened empty inventory")
-                .is_empty()
-        );
     }
 
     #[test]
@@ -12032,7 +9933,10 @@ pub(crate) mod tests {
             assert_eq!(first_stats.publications, 1);
             assert_eq!(first_stats.variants, 1);
             assert_eq!(first_stats.finalized_variants, 1);
-            assert_eq!(first_stats.committed_chunks, 5);
+            assert_eq!(
+                first_stats.committed_chunks,
+                bytes.len().div_ceil(BLOB_STREAM_SEGMENT_BYTES) as u64
+            );
 
             let replay = node
                 .publish(first_request.clone(), &mut Cursor::new(bytes.clone()))
@@ -12355,7 +10259,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blob_chunk_tamper_fails_stream_and_reopen_and_writer_lock_is_shared() {
+    fn blob_pack_tamper_fails_stream_and_reopen_and_writer_lock_is_shared() {
         let root = TestRoot::new("tamper");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 23);
         let mut node = selected_node(&root);
@@ -12369,11 +10273,11 @@ pub(crate) mod tests {
             };
         assert_eq!(locked.kind(), ApplicationErrorKind::StateUnavailable);
 
-        let chunk = first_chunk_file(&root.depot_path());
-        let mut ciphertext = fs::read(&chunk).expect("read committed chunk file");
-        let last = ciphertext.last_mut().expect("nonempty chunk file");
+        let pack = first_profile5_pack_file(&root.depot_path());
+        let mut ciphertext = fs::read(&pack).expect("read committed native pack");
+        let last = ciphertext.last_mut().expect("nonempty native pack");
         *last ^= 0x80;
-        fs::write(&chunk, ciphertext).expect("tamper committed chunk file");
+        fs::write(&pack, ciphertext).expect("tamper committed native pack");
         let mut output = Vec::new();
         let error = node
             .read_into(
@@ -12415,7 +10319,7 @@ pub(crate) mod tests {
                 .blob_stats()
                 .expect("epoch-one stats");
         assert_eq!(before_rekey.variants, 1);
-        assert_eq!(before_rekey.committed_chunks, 2);
+        assert_eq!(before_rekey.committed_chunks, 1);
 
         apply_epoch_two_rekey(&root, &mut services);
         let mut node =
@@ -12456,7 +10360,7 @@ pub(crate) mod tests {
         let current_stats = node.store.blob_stats().expect("epoch-two stats");
         assert_eq!(current_stats.publications, 2);
         assert_eq!(current_stats.variants, 2);
-        assert_eq!(current_stats.committed_chunks, 4);
+        assert_eq!(current_stats.committed_chunks, 2);
 
         let mut output = Vec::new();
         let read = node
@@ -12471,37 +10375,6 @@ pub(crate) mod tests {
             .expect("read current-epoch Blob");
         assert_eq!(output, bytes);
         assert_eq!(read.publisher_counter, current.publisher_counter);
-
-        let policy = node
-            .current_policy("blob inactive candidate")
-            .expect("policy");
-        let plan = node
-            .store
-            .prepare_blob_read_with_policy(
-                &policy,
-                &blob_topic(),
-                &blob_scope(),
-                first.id.into_core(),
-            )
-            .expect("mixed-epoch read plan");
-        let candidate = plan
-            .candidates()
-            .iter()
-            .find(|candidate| candidate.disposition().is_none())
-            .expect("inactive epoch-one source publication");
-        let mut tampered = node
-            .store
-            .load_blob_read_candidate_with_policy(&policy, candidate)
-            .expect("exact-load inactive source publication");
-        *tampered
-            .sealed
-            .last_mut()
-            .expect("nonempty inactive source envelope") ^= 0x40;
-        let error = match node.verify_stored_blob(&tampered, None, 2, "blob read", false) {
-            Ok(_) => panic!("tampered inactive candidate passed fresh source verification"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
     }
 
     #[test]
@@ -12645,64 +10518,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blob_verified_candidate_must_match_every_exact_read_plan_claim() {
-        let root = TestRoot::new("plan-claims");
-        let mut node = selected_node(&root);
-        let first = node
-            .publish(
-                request(b"blob/plan-claims/first"),
-                &mut Cursor::new(vec![1, 2, 3]),
-            )
-            .expect("publish first plan fixture");
-        let second = node
-            .publish(
-                request(b"blob/plan-claims/second"),
-                &mut Cursor::new(vec![4, 5, 6]),
-            )
-            .expect("publish mismatched plan fixture");
-        assert_ne!(first.id, second.id);
-
-        let policy = node.current_policy("blob plan claims").expect("policy");
-        let plan = node
-            .store
-            .prepare_blob_read_with_policy(
-                &policy,
-                &blob_topic(),
-                &blob_scope(),
-                first.id.into_core(),
-            )
-            .expect("first Blob read plan");
-        let mismatched = node
-            .store
-            .blob_inventory()
-            .expect("Blob inventory")
-            .into_iter()
-            .find_map(|transfer| {
-                node.store
-                    .get_blob(transfer)
-                    .expect("load Blob publication")
-                    .filter(|stored| stored.blob_id == second.id.into_core())
-            })
-            .expect("second Blob publication");
-        let mut wrong_variant = mismatched.clone();
-        let mut variant_bytes = *wrong_variant.variant_id.as_bytes();
-        variant_bytes[0] ^= 0x80;
-        wrong_variant.variant_id = BlobVariantId::from_bytes(variant_bytes);
-        assert_ne!(wrong_variant.variant_id, mismatched.variant_id);
-        let error = match node.verify_stored_blob(&wrong_variant, None, 1, "blob read", false) {
-            Ok(_) => panic!("persisted variant identity escaped authenticated content binding"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
-        let verified = node
-            .verify_stored_blob(&mismatched, None, 1, "blob read", false)
-            .expect("freshly verify source-valid mismatched candidate");
-        let error = SelectedBlobNode::require_blob_plan_claims(&plan, &verified)
-            .expect_err("source-valid wrong-key candidate must not enter plan authority");
-        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
-    }
-
-    #[test]
     fn blob_publisher_revocation_closes_retained_and_reopened_facades() {
         let root = TestRoot::new("revocation");
         let mut services = persist_rekey_mission(&root);
@@ -12770,21 +10585,20 @@ pub(crate) mod tests {
         assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
     }
 
-    fn first_chunk_file(depot: &Path) -> PathBuf {
-        let mut chunks = Vec::new();
-        for variant in fs::read_dir(depot).expect("read depot") {
-            let variant = variant.expect("variant entry").path();
-            if !variant.is_dir() {
+    fn first_profile5_pack_file(depot: &Path) -> PathBuf {
+        let pack_root = depot.join("stream-packs-v2");
+        let mut packs = Vec::new();
+        for publication in fs::read_dir(pack_root).expect("read native pack root") {
+            let publication = publication.expect("native pack entry").path();
+            if !publication.is_dir() {
                 continue;
             }
-            for entry in fs::read_dir(variant).expect("read variant") {
-                let entry = entry.expect("chunk entry").path();
-                if entry.extension().and_then(|extension| extension.to_str()) == Some("chunk") {
-                    chunks.push(entry);
-                }
+            let pack = publication.join("segments.pack");
+            if pack.is_file() {
+                packs.push(pack);
             }
         }
-        chunks.sort();
-        chunks.into_iter().next().expect("committed chunk file")
+        packs.sort();
+        packs.into_iter().next().expect("committed native pack")
     }
 }

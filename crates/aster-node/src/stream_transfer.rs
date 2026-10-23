@@ -6,18 +6,7 @@ use zeroize::Zeroize;
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
-const CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1";
 pub(crate) const PROFILE5_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
-pub(crate) const PROFILE5_CANONICAL_PLAINTEXT_CHUNK_BYTES: usize =
-    aster_mesh::MAX_BLOB_CHUNK_SIZE as usize;
-pub(crate) const PROFILE5_CANONICAL_CARRIER_RECORD_BYTES: usize =
-    aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES;
-/// Target encoded batch ceiling. Stream framing retains its independently
-/// bounded maximum so the sender can negotiate a smaller carrier batch.
-pub(crate) const PROFILE5_CANONICAL_EXTENT_BYTES: usize =
-    aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize;
-pub(crate) const CANONICAL_BLOB_EXTENT_HEADER_BYTES: usize =
-    aster_mesh::PROFILE5_CANONICAL_EXTENT_HEADER_BYTES as usize;
 pub(crate) const PROFILE5_PACK_RECORD_PREFIX_BYTES: usize = 4;
 /// Maximum exact length-prefixed ASTRBS02 record size.
 pub(crate) const PROFILE5_PACK_SEGMENT_RECORD_BYTES: usize =
@@ -26,6 +15,12 @@ pub(crate) const PROFILE5_PACK_SEGMENT_RECORD_BYTES: usize =
 /// transfer keeps the record intact instead of emitting a tiny tail frame.
 pub(crate) const PROFILE5_PACK_TRANSPORT_FRAME_BYTES: usize =
     PROFILE5_PACK_RECORD_PREFIX_BYTES + PROFILE5_PACK_SEGMENT_RECORD_BYTES;
+pub(crate) const PROFILE5_MAX_PACK_SEGMENTS: usize =
+    aster_mesh::MAX_BLOB_STREAM_BYTES as usize / aster_mesh::BLOB_STREAM_SEGMENT_BYTES;
+pub(crate) const PROFILE5_MAX_PACK_WIRE_BYTES: u64 = aster_mesh::MAX_BLOB_STREAM_BYTES
+    + PROFILE5_MAX_PACK_SEGMENTS as u64
+        * (PROFILE5_PACK_RECORD_PREFIX_BYTES as u64
+            + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64);
 /// No authenticated protocol progress for this long is a retryable stall.
 pub(crate) const PROFILE5_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Legacy pack paths retain their bounded attempt while profile-5 canonical
@@ -44,14 +39,15 @@ pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
 pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 /// Signed canonical source envelope, including the maximum 8-GiB Blob's
 /// bounded ~9-MiB manifest plus route and signature material.
-pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize =
+    aster_mesh::MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdd;
 
 pub(crate) fn profile5_receive_limit(total: u64, durable: u64, checkpoint_batch: u32) -> u64 {
-    let extent = PROFILE5_CANONICAL_EXTENT_BYTES as u64;
-    // Extent boundaries need not align with the byte batch. Admit the one
-    // whole maximum-size extent that can cross the checkpoint threshold.
-    let window = u64::from(checkpoint_batch).saturating_add(extent.saturating_sub(1));
+    let record = PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u64;
+    // Record boundaries need not align with the byte batch. Admit the one
+    // whole maximum-size native pack record that can cross the threshold.
+    let window = u64::from(checkpoint_batch).saturating_add(record.saturating_sub(1));
     total.min(durable.saturating_add(window))
 }
 
@@ -59,23 +55,23 @@ pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), Stre
     let extents = if bytes == 0 {
         0
     } else {
-        usize::try_from(bytes.min(aster_mesh::MAX_BLOB_CHUNKS))
+        usize::try_from(bytes.min(PROFILE5_MAX_PACK_SEGMENTS as u64))
             .map_err(|_| StreamError::invalid("extent count overflow"))?
     };
     profile5_attempt_bounds_for_extents(bytes, extents)
 }
 
-/// Bounds one attempt with an authenticated canonical ABX1 extent count.
-/// Each extent pays the complete ASD1 prefix/protected-header ceiling plus a
-/// conservative transport-accounting allowance; callers with a verified plan
-/// pass its exact canonical wire-shape count.
+/// Bounds one attempt with its authenticated native pack-record count. Each
+/// record pays the complete ASD1 prefix/protected-header ceiling plus a
+/// conservative transport-accounting allowance; callers with a verified open
+/// pass its exact segment count.
 pub(crate) fn profile5_attempt_bounds_for_extents(
     bytes: u64,
     extents: usize,
 ) -> Result<(usize, usize), StreamError> {
-    if extents > aster_mesh::MAX_BLOB_CHUNKS as usize || (bytes == 0) != (extents == 0) {
+    if extents > PROFILE5_MAX_PACK_SEGMENTS || (bytes == 0) != (extents == 0) {
         return Err(StreamError::invalid(
-            "canonical extent count is out of bounds",
+            "native pack record count is out of bounds",
         ));
     }
     let data = usize::try_from(bytes)
@@ -136,180 +132,25 @@ impl Display for StreamError {
 }
 impl std::error::Error for StreamError {}
 
-fn canonical_carrier_is_empty(bytes: &[u8]) -> bool {
-    bytes.is_empty()
-}
-
-/// One ordered batch of complete, byte-identical canonical encrypted carriers.
-/// Manifest records arrive authenticated in the bounded SOURCE phase; the
-/// receiver indexes these carriers against that verified manifest.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalBlobExtentV1 {
-    pub first_chunk_index: u64,
-    pub carriers: Vec<Vec<u8>>,
-}
-
-impl CanonicalBlobExtentV1 {
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, StreamError> {
-        if self.carriers.is_empty()
-            || self
-                .first_chunk_index
-                .checked_add(self.carriers.len() as u64)
-                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
-        {
-            return Err(StreamError::invalid(
-                "canonical Blob extent index range is invalid",
-            ));
-        }
-        let mut encoded_len = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
-        for carrier in &self.carriers {
-            if carrier.is_empty() || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
-                return Err(StreamError::invalid("canonical carrier length is invalid"));
-            }
-            encoded_len = encoded_len
-                .checked_add(4)
-                .and_then(|length| length.checked_add(carrier.len()))
-                .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?;
-        }
-        if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
-            return Err(StreamError::invalid(
-                "canonical Blob extent exceeds profile-5 bound",
-            ));
-        }
-        let mut output = Vec::with_capacity(encoded_len);
-        output.extend_from_slice(CANONICAL_BLOB_EXTENT_MAGIC);
-        output.extend_from_slice(&self.first_chunk_index.to_be_bytes());
-        output.extend_from_slice(
-            &u32::try_from(self.carriers.len())
-                .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?
-                .to_be_bytes(),
-        );
-        for carrier in &self.carriers {
-            output.extend_from_slice(
-                &u32::try_from(carrier.len())
-                    .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?
-                    .to_be_bytes(),
-            );
-            output.extend_from_slice(carrier);
-        }
-        Ok(output)
+pub(crate) fn inspect_native_pack_record(
+    bytes: &[u8],
+) -> Result<aster_mesh::EncryptedBlobStreamSegmentHeader, StreamError> {
+    let encoded_len = bytes
+        .get(..PROFILE5_PACK_RECORD_PREFIX_BYTES)
+        .and_then(|prefix| prefix.try_into().ok())
+        .map(u32::from_be_bytes)
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or_else(|| StreamError::invalid("native pack record prefix is truncated"))?;
+    if encoded_len == 0
+        || encoded_len > PROFILE5_PACK_SEGMENT_RECORD_BYTES
+        || bytes.len() != PROFILE5_PACK_RECORD_PREFIX_BYTES + encoded_len
+    {
+        return Err(StreamError::invalid("native pack record length is invalid"));
     }
-
-    pub(crate) fn encode_carriers<'a>(
-        first_chunk_index: u64,
-        carriers: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
-    ) -> Result<Vec<u8>, StreamError> {
-        if carriers.len() == 0
-            || first_chunk_index
-                .checked_add(carriers.len() as u64)
-                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
-        {
-            return Err(StreamError::invalid(
-                "canonical Blob extent index range is invalid",
-            ));
-        }
-        let mut encoded_len = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
-        for carrier in carriers.clone() {
-            if canonical_carrier_is_empty(carrier)
-                || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES
-            {
-                return Err(StreamError::invalid("canonical carrier length is invalid"));
-            }
-            encoded_len = encoded_len
-                .checked_add(4)
-                .and_then(|length| length.checked_add(carrier.len()))
-                .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?;
-        }
-        if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
-            return Err(StreamError::invalid(
-                "canonical Blob extent exceeds profile-5 bound",
-            ));
-        }
-        let mut output = Vec::with_capacity(encoded_len);
-        output.extend_from_slice(CANONICAL_BLOB_EXTENT_MAGIC);
-        output.extend_from_slice(&first_chunk_index.to_be_bytes());
-        output.extend_from_slice(
-            &u32::try_from(carriers.len())
-                .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?
-                .to_be_bytes(),
-        );
-        for carrier in carriers {
-            output.extend_from_slice(
-                &u32::try_from(carrier.len())
-                    .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?
-                    .to_be_bytes(),
-            );
-            output.extend_from_slice(carrier);
-        }
-        Ok(output)
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StreamError> {
-        if bytes.len() < CANONICAL_BLOB_EXTENT_HEADER_BYTES
-            || bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES
-            || &bytes[..4] != CANONICAL_BLOB_EXTENT_MAGIC
-        {
-            return Err(StreamError::invalid(
-                "canonical Blob extent framing is invalid",
-            ));
-        }
-        let first_chunk_index = u64::from_be_bytes(
-            bytes[4..12]
-                .try_into()
-                .map_err(|_| StreamError::invalid("canonical Blob extent is truncated"))?,
-        );
-        let count =
-            usize::try_from(u32::from_be_bytes(bytes[12..16].try_into().map_err(
-                |_| StreamError::invalid("canonical Blob extent is truncated"),
-            )?))
-            .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?;
-        if count == 0
-            || first_chunk_index
-                .checked_add(count as u64)
-                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
-        {
-            return Err(StreamError::invalid(
-                "canonical Blob extent length or range is invalid",
-            ));
-        }
-        let mut carriers = Vec::with_capacity(count);
-        let mut offset = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
-        for _ in 0..count {
-            let length_end = offset
-                .checked_add(4)
-                .ok_or_else(|| StreamError::invalid("canonical carrier extent overflows"))?;
-            let length = usize::try_from(u32::from_be_bytes(
-                bytes
-                    .get(offset..length_end)
-                    .ok_or_else(|| StreamError::invalid("canonical carrier extent is truncated"))?
-                    .try_into()
-                    .map_err(|_| StreamError::invalid("canonical carrier extent is truncated"))?,
-            ))
-            .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?;
-            if length == 0 || length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
-                return Err(StreamError::invalid("canonical carrier length is invalid"));
-            }
-            let end = length_end
-                .checked_add(length)
-                .ok_or_else(|| StreamError::invalid("canonical carrier extent overflows"))?;
-            carriers.push(
-                bytes
-                    .get(length_end..end)
-                    .ok_or_else(|| StreamError::invalid("canonical carrier extent is truncated"))?
-                    .to_vec(),
-            );
-            offset = end;
-        }
-        if offset != bytes.len() {
-            return Err(StreamError::invalid(
-                "canonical carrier extent has trailing bytes",
-            ));
-        }
-        Ok(Self {
-            first_chunk_index,
-            carriers,
-        })
-    }
+    aster_mesh::EncryptedBlobStreamSegment::inspect_encoded(
+        &bytes[PROFILE5_PACK_RECORD_PREFIX_BYTES..],
+    )
+    .map_err(|error| StreamError::invalid(format!("native ASTRBS02 record is invalid: {error}")))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,11 +347,11 @@ fn validate_authenticated_open(bytes: &[u8]) -> Result<(), StreamError> {
     validate_authenticated_open_with_max(bytes, MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
 }
 fn validate_profile5_wire_len(bytes: u64) -> Result<(), StreamError> {
-    if bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES {
+    if bytes <= PROFILE5_MAX_PACK_WIRE_BYTES {
         Ok(())
     } else {
         Err(StreamError::invalid(
-            "canonical ABX1 wire length exceeds profile 5",
+            "native Profile-5 pack wire length exceeds profile 5",
         ))
     }
 }
@@ -1545,7 +1386,7 @@ fn model_fuzz_transcript(frames: &[StreamFrame]) -> bool {
     let mut durable = 0_u64;
     let mut generation = open.checkpoint_generation;
     let mut limit = open.total_len;
-    let max_extent = MAX_STREAM_EXTENT_BYTES as u32;
+    let mut max_extent = MAX_STREAM_EXTENT_BYTES as u32;
     let mut result: Option<StreamResultV1> = None;
     let mut expected_ack: Option<StreamResultAckV1> = None;
 
@@ -1568,12 +1409,14 @@ fn model_fuzz_transcript(frames: &[StreamFrame]) -> bool {
                     || value.durable_offset != 0
                     || value.checkpoint_generation != generation
                     || value.absolute_receive_limit != limit
-                    || value.max_extent_bytes != max_extent
+                    || value.max_extent_bytes == 0
+                    || value.max_extent_bytes > max_extent
                     || value.checkpoint_batch_bytes == 0
                     || value.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES
                 {
                     return false;
                 }
+                max_extent = value.max_extent_bytes;
                 control_sequence = 1;
                 phase = Phase::Data;
             }
@@ -1667,13 +1510,23 @@ fn drive_fuzz_transcript(frames: &[StreamFrame]) -> bool {
     let Some(StreamFrame::Open(open)) = frames.first() else {
         return false;
     };
+    let max_extent = frames
+        .iter()
+        .find_map(|frame| match frame {
+            StreamFrame::Accept(value) => Some(value.max_extent_bytes),
+            _ => None,
+        })
+        .unwrap_or(MAX_STREAM_EXTENT_BYTES as u32);
+    if max_extent == 0 || max_extent as usize > MAX_STREAM_EXTENT_BYTES {
+        return false;
+    }
     let receive_limit = open.total_len;
     let Ok(mut receiver) = StreamReceiverState::new(
         open,
         0,
         open.checkpoint_generation,
         receive_limit,
-        MAX_STREAM_EXTENT_BYTES as u32,
+        max_extent,
     ) else {
         return false;
     };
@@ -1778,48 +1631,6 @@ fn drive_fuzz_transcript(frames: &[StreamFrame]) -> bool {
 }
 
 #[cfg(feature = "fuzzing")]
-fn assert_checked_in_composite_carriers(input: &[u8], extent: &CanonicalBlobExtentV1) {
-    const NORMAL_LENGTHS: &[u32] = &[17];
-    const MAXIMUM_LENGTHS: &[u32] = &[
-        65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424,
-        65_424, 65_424, 65_424, 65_424, 63_184,
-    ];
-    let expected_lengths = if input
-        == include_bytes!(
-            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
-        ) {
-        Some(NORMAL_LENGTHS)
-    } else if input
-        == include_bytes!(
-            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
-        )
-    {
-        Some(MAXIMUM_LENGTHS)
-    } else {
-        None
-    };
-    let Some(expected_lengths) = expected_lengths else {
-        return;
-    };
-    assert_eq!(extent.carriers.len(), expected_lengths.len());
-    for (index, carrier) in extent.carriers.iter().enumerate() {
-        let index = u64::try_from(index).expect("fixture carrier index");
-        assert!(aster_mesh::fuzz_verify_profile5_carrier(
-            carrier,
-            index,
-            expected_lengths
-        ));
-        let mut malformed = carrier.clone();
-        *malformed.last_mut().expect("fixture carrier ciphertext") ^= 1;
-        assert!(!aster_mesh::fuzz_verify_profile5_carrier(
-            &malformed,
-            index,
-            expected_lengths
-        ));
-    }
-}
-
-#[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode(input: &[u8]) {
     if input.starts_with(b"AST1") {
         if let Some((_seed_expectation, frames)) = decode_fuzz_transcript(input) {
@@ -1832,20 +1643,14 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
     }
     if input.starts_with(COMPOSITE_DATA_MAGIC) {
         if let Ok(data) = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(input)
-            && let Ok(extent) = CanonicalBlobExtentV1::decode(&data.bytes)
+            && inspect_native_pack_record(&data.bytes).is_ok()
         {
-            let body = data.bytes.as_slice();
-            assert_checked_in_composite_carriers(input, &extent);
-            let encoded = extent
-                .encode()
-                .expect("accepted ABX1 extent must re-encode");
-            assert_eq!(encoded, body);
-            if !encoded.is_empty() {
-                assert!(CanonicalBlobExtentV1::decode(&encoded[..encoded.len() - 1]).is_err());
+            if !data.bytes.is_empty() {
+                assert!(inspect_native_pack_record(&data.bytes[..data.bytes.len() - 1]).is_err());
             }
-            let mut trailing = encoded;
+            let mut trailing = data.bytes;
             trailing.push(0);
-            assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
+            assert!(inspect_native_pack_record(&trailing).is_err());
         }
         return;
     }
@@ -1864,7 +1669,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
     assert!(StreamFrame::decode_for_context(9, 5, &trailing).is_err());
 
     if let StreamFrame::Data(data) = &decoded {
-        let _ = CanonicalBlobExtentV1::decode(&data.bytes);
+        let _ = inspect_native_pack_record(&data.bytes);
         if !data.bytes.is_empty() {
             let overflow = StreamFrame::Data(StreamDataV1 {
                 offset: u64::MAX,
@@ -1887,7 +1692,7 @@ mod stream_frame_codec {
 
     #[test]
     fn profile5_checkpoint_policy_and_native_record_bounds_are_independent() {
-        assert_eq!(PROFILE5_CANONICAL_EXTENT_BYTES, 1_048_576);
+        assert_eq!(aster_mesh::BLOB_STREAM_SEGMENT_BYTES, 1_048_576);
         assert_eq!(PROFILE5_PACK_SEGMENT_RECORD_BYTES, 1_048_706);
         assert_eq!(PROFILE5_PACK_TRANSPORT_FRAME_BYTES, 1_048_710);
         assert_eq!(MAX_STREAM_EXTENT_BYTES, PROFILE5_PACK_TRANSPORT_FRAME_BYTES);
@@ -1900,46 +1705,42 @@ mod stream_frame_codec {
                 + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES
         );
         let total = 8 * 1024 * 1024 * 1024_u64;
-        let extents = total.div_ceil(PROFILE5_CANONICAL_EXTENT_BYTES as u64);
+        let extents = total.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
         let (_, control_bytes) = profile5_attempt_bounds(total).expect("attempt bounds");
         assert!(control_bytes >= usize::try_from(extents).expect("extents") * 192 + 8192);
     }
 
     #[test]
-    fn maximum_canonical_shape_attempt_budget_cannot_undercount_frames() {
-        let chunks = aster_mesh::MAX_BLOB_CHUNKS as usize;
-        let carrier = PROFILE5_CANONICAL_CARRIER_RECORD_BYTES as u64;
-        let wire = chunks as u64 * (CANONICAL_BLOB_EXTENT_HEADER_BYTES as u64 + 4 + carrier);
+    fn maximum_native_pack_attempt_budget_cannot_undercount_frames() {
+        let segments = PROFILE5_MAX_PACK_SEGMENTS;
+        let wire = PROFILE5_MAX_PACK_WIRE_BYTES;
         let (data, control) =
-            profile5_attempt_bounds_for_extents(wire, chunks).expect("maximum attempt bound");
-        let composite = wire as usize + chunks * (8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES);
+            profile5_attempt_bounds_for_extents(wire, segments).expect("maximum attempt bound");
+        let composite =
+            wire as usize + segments * (8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192);
         assert!(data >= composite + MAX_STREAM_AUTHENTICATED_OPEN_BYTES);
-        assert!(control >= chunks * 192);
+        assert!(control >= segments * 192);
     }
 
     #[test]
-    fn profile5_extent_batches_complete_canonical_carriers() {
-        // Mutations caught: splitting a canonical carrier at an extent edge or
-        // accepting a noncanonical/trailing extent encoding.
-        assert_eq!(PROFILE5_CANONICAL_PLAINTEXT_CHUNK_BYTES, 64 * 1024);
-        const {
-            assert!(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES > 64 * 1024);
-            assert!(PROFILE5_CANONICAL_EXTENT_BYTES > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES);
-        }
+    fn profile5_data_body_is_one_complete_native_pack_record() {
+        let bytes = include_bytes!(
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+        );
+        let (_, record) = split_composite_data_record(bytes).expect("ASD1 seed");
+        let header = inspect_native_pack_record(record).expect("native pack record");
+        assert_eq!(header.index(), 0);
+        assert_eq!(header.offset(), 0);
+        assert_eq!(header.total_len(), 17);
+        assert_eq!(header.plaintext_len(), 17);
+        assert_eq!(header.ciphertext_len(), 33);
 
-        let extent = CanonicalBlobExtentV1 {
-            first_chunk_index: 17,
-            carriers: vec![vec![0x11; 65_000], vec![0x22; 66_000]],
-        };
-        let encoded = extent.encode().expect("encode canonical extent");
-        assert_eq!(CanonicalBlobExtentV1::decode(&encoded).unwrap(), extent);
-
-        for split in 0..encoded.len() {
-            assert!(CanonicalBlobExtentV1::decode(&encoded[..split]).is_err());
+        for split in 0..record.len() {
+            assert!(inspect_native_pack_record(&record[..split]).is_err());
         }
-        let mut trailing = encoded;
+        let mut trailing = record.to_vec();
         trailing.push(0);
-        assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
+        assert!(inspect_native_pack_record(&trailing).is_err());
     }
 
     #[test]
@@ -1947,9 +1748,9 @@ mod stream_frame_codec {
         let source = StreamSourceV1 {
             transfer_id: [0x31; 32],
             attempt_nonce: [0x32; 32],
-            sequence: 3,
-            offset: PROFILE5_SOURCE_CHUNK_BYTES as u32,
-            total_len: (PROFILE5_SOURCE_CHUNK_BYTES + 7) as u32,
+            sequence: 1,
+            offset: 7,
+            total_len: 14,
             bytes: vec![0x33; 7],
         };
         let frame = StreamFrame::Source(source.clone());
@@ -1981,7 +1782,7 @@ mod stream_frame_codec {
                     durable_offset: 0,
                     checkpoint_generation: 0,
                     absolute_receive_limit: 0,
-                    max_extent_bytes: PROFILE5_CANONICAL_EXTENT_BYTES as u32,
+                    max_extent_bytes: PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u32,
                     checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
                 })
                 .expect("accept empty stream"),
@@ -2260,7 +2061,7 @@ mod stream_frame_codec {
 
     #[test]
     fn production_composite_seeds_are_structurally_bounded() {
-        assert_eq!(MAX_COMPOSITE_STREAM_DATA_BYTES, 1_050_632);
+        assert_eq!(MAX_COMPOSITE_STREAM_DATA_BYTES, 1_050_766);
         for bytes in [
             include_bytes!(
                 "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
@@ -2274,29 +2075,36 @@ mod stream_frame_codec {
             assert!(bytes.len() <= MAX_COMPOSITE_STREAM_DATA_BYTES);
             let (header, body) = split_composite_data_record(bytes).expect("ASD1 seed");
             assert!(header.starts_with(b"ASTRFR01"));
-            let extent = CanonicalBlobExtentV1::decode(body).expect("ABX1 extent");
-            assert!(!extent.carriers.is_empty());
+            let segment = inspect_native_pack_record(body).expect("native ASTRBS02 pack record");
+            assert_eq!(segment.index(), 0);
+            assert_eq!(segment.offset(), 0);
         }
     }
 
     #[cfg(feature = "fuzzing")]
     #[test]
-    fn production_composite_seeds_open_and_every_carrier_authenticates() {
-        for bytes in [
-            include_bytes!(
-                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
-            )
-            .as_slice(),
-            include_bytes!(
-                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
-            )
-            .as_slice(),
-        ] {
-            let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
-                .expect("production MissionBlobRecordCodec opens seed");
-            let extent = CanonicalBlobExtentV1::decode(&data.bytes).expect("ABX1 extent");
-            assert_checked_in_composite_carriers(bytes, &extent);
-        }
+    fn production_composite_valid_seed_opens_and_segment_authenticates() {
+        let bytes = include_bytes!(
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+        );
+        let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
+            .expect("production MissionBlobRecordCodec opens seed");
+        let encoded = data
+            .bytes
+            .get(PROFILE5_PACK_RECORD_PREFIX_BYTES..)
+            .expect("length-prefixed segment");
+        let opener = aster_mesh::BlobStreamSegmentOpener::from_test_key(
+            [0x10; 32], [0x20; 32], 7, [0x30; 32], [0x40; 12],
+        );
+        let (header, plaintext, _) = opener
+            .open_encoded(encoded)
+            .expect("authenticated ASTRBS02 seed");
+        assert_eq!(header.index(), 0);
+        assert_eq!(plaintext.as_slice(), &[0x5a; 17]);
+
+        let mut malformed = encoded.to_vec();
+        *malformed.last_mut().expect("segment tag") ^= 1;
+        assert!(opener.open_encoded(&malformed).is_err());
     }
 
     #[cfg(feature = "fuzzing")]
@@ -2322,10 +2130,18 @@ mod stream_frame_codec {
                 "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-reject-terminal-change.bin"
             ),
         ];
-        for seed in seeds {
+        for (seed_index, seed) in seeds.into_iter().enumerate() {
             let (expected, frames) = decode_fuzz_transcript(seed).expect("decode transcript seed");
-            assert_eq!(model_fuzz_transcript(&frames), expected);
-            assert_eq!(drive_fuzz_transcript(&frames), expected);
+            assert_eq!(
+                model_fuzz_transcript(&frames),
+                expected,
+                "seed {seed_index}"
+            );
+            assert_eq!(
+                drive_fuzz_transcript(&frames),
+                expected,
+                "seed {seed_index}"
+            );
         }
     }
     #[test]
@@ -2343,13 +2159,17 @@ mod stream_frame_codec {
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect::<Vec<_>>();
             let decoded = StreamFrame::decode_for_context(9, 5, &wire);
+            let valid = decoded.as_ref().is_ok_and(|frame| match frame {
+                StreamFrame::Data(data) => inspect_native_pack_record(&data.bytes).is_ok(),
+                _ => true,
+            });
             assert_eq!(
-                decoded.is_ok(),
+                valid,
                 fields[0] == "ACCEPT",
                 "vector disposition differs: {}",
                 fields[1]
             );
-            if let Ok(frame) = decoded {
+            if valid && let Ok(frame) = decoded {
                 assert_eq!(frame.encode_for_context(9, 5).unwrap(), wire);
                 accepted_tags.insert(wire[4]);
             }
@@ -2403,7 +2223,7 @@ mod stream_frame_codec {
 
     #[test]
     fn authenticated_source_enforces_the_production_bound_with_a_small_fixture() {
-        assert_eq!(MAX_STREAM_AUTHENTICATED_OPEN_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_STREAM_AUTHENTICATED_OPEN_BYTES, 401_902);
         assert!(validate_authenticated_open_with_max(&[], 4).is_err());
         assert!(validate_authenticated_open_with_max(&[0; 4], 4).is_ok());
         assert!(validate_authenticated_open_with_max(&[0; 5], 4).is_err());

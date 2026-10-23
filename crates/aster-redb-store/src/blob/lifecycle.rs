@@ -3220,6 +3220,36 @@ pub(crate) fn admit_publication_row(
     set_lifecycle_counter(write, BLOB_PUBLICATION_ROWS, required_rows)
 }
 
+/// Reserves publication-lifecycle headroom before a new upload is admitted.
+///
+/// Provisional uploads do not increment the live-publication counter, but
+/// every one can promote into exactly one publication. Counting those rows in
+/// the preflight prevents a caller from consuming a source only to discover at
+/// promotion that lifecycle capacity was already exhausted.
+pub(crate) fn require_publication_reservation_capacity(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+) -> Result<(), StoreError> {
+    if !admission_schema_is_current(write)? {
+        return Ok(());
+    }
+    let current = lifecycle_counter(write, BLOB_PUBLICATION_ROWS)?;
+    let provisional = write.open_table(super::BLOB_UPLOADS)?.len()?;
+    let required_rows = current
+        .checked_add(provisional)
+        .and_then(|rows| rows.checked_add(1))
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if required_rows > limits.max_publication_rows() {
+        return Err(StoreError::Blob(
+            BlobStoreError::PublicationLifecycleCapacity {
+                required_rows,
+                max_rows: limits.max_publication_rows(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn require_publication_row(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     if admission_schema_is_current(write)? && lifecycle_counter(write, BLOB_PUBLICATION_ROWS)? == 0
     {

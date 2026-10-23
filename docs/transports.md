@@ -67,16 +67,19 @@ selected Blob profile and map-unit contract is machine checked:
   "surface": "transports",
   "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
   "semantic_v9_profile": "5:BlobStreamV1",
-  "map_unit": "65536-byte canonical plaintext chunk",
-  "record": "ASTRBT01, at most 66215 bytes",
-  "extent": "ABX1, at most 1048576 bytes"
+  "map_unit": "1048576-byte native plaintext segment",
+  "record": "ASTRBS02, at most 1048706 bytes",
+  "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes"
 }
 ```
 <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 65,536-byte canonical plaintext chunks into complete ASTRBT01 records of at most 66,215 bytes and batches them in ABX1 extents of at most 1,048,576 bytes.
+Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
-Profile 5 uses receiver-authoritative resume. Profile 4 remains the
+Profile 5 resumes from lifecycle-owned provisional source or upload state plus
+the native pack checkpoint journal. Atomic promotion precedes RESULT;
+RESULT_ACK or EOF settles only the attempt and owns no durable resume state.
+Profile 4 remains the
 compatibility path for peer-neutral contiguous carrier ranges of at most 16 KiB;
 v7 is durable-only,
 while v8 also implements

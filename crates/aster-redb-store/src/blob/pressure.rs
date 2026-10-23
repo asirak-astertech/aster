@@ -3726,15 +3726,13 @@ fn build_pressure_image(
         let (key, value) = row?;
         if let Some((variant, total_len)) =
             super::pack_lifecycle::pressure_projection(value.value())?
-        {
-            if key.value() != variant.as_bytes()
+            && (key.value() != variant.as_bytes()
                 || import_facts.contains_key(&variant)
-                || pack_facts.insert(variant, total_len).is_some()
-            {
-                return Err(pressure_corruption(
-                    "Blob pressure Profile-5 pack identity is contradictory",
-                ));
-            }
+                || pack_facts.insert(variant, total_len).is_some())
+        {
+            return Err(pressure_corruption(
+                "Blob pressure Profile-5 pack identity is contradictory",
+            ));
         }
     }
     let mut committed = BTreeMap::<BlobVariantId, u64>::new();

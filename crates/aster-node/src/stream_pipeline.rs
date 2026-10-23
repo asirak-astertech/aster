@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -74,19 +72,6 @@ impl StreamPartition {
         self.accounted_bytes == 0
     }
 
-    /// Constructs a small control partition whose pipeline occupancy is
-    /// charged to the bytes the map stage will materialize.
-    pub(crate) fn new_accounted(index: u64, bytes: Vec<u8>, accounted_bytes: usize) -> Self {
-        Self {
-            index,
-            source_end: 0,
-            accounted_bytes,
-            bytes,
-            #[cfg(test)]
-            zeroize_observer: None,
-        }
-    }
-
     pub fn into_bytes(mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
@@ -118,13 +103,6 @@ impl Drop for StreamPartition {
 }
 
 #[cfg(test)]
-struct SenderSendGate {
-    entered: Arc<Semaphore>,
-    release: Arc<Semaphore>,
-    claimed: bool,
-}
-
-#[cfg(test)]
 #[derive(Default)]
 struct PipelineTestProbeInner {
     cleanup_observed: AtomicBool,
@@ -141,41 +119,14 @@ struct PipelineTestProbeInner {
     hold_workers: AtomicBool,
     peak_reorder_items: std::sync::atomic::AtomicUsize,
     current_reorder_items: std::sync::atomic::AtomicUsize,
-    mapped_ciphertext_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
-    sender_extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
-    sender_prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
-    sender_encoded_header_creations: Arc<std::sync::atomic::AtomicUsize>,
-    sender_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    sender_peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    prepared_sender_carriers: std::sync::atomic::AtomicUsize,
-    sender_producer_starts: std::sync::atomic::AtomicUsize,
-    sender_producer_exits: std::sync::atomic::AtomicUsize,
-    sender_producer_joins: std::sync::atomic::AtomicUsize,
-    sender_partition_channel_closed: AtomicBool,
-    received_extents: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
     fail_spawn_at: std::sync::atomic::AtomicUsize,
-    sender_sink_failure: std::sync::atomic::AtomicUsize,
-    finalizer_map_failure: AtomicU64,
-    finalizer_sink_failure: AtomicU64,
-    finalizer_provisional_decrypts: std::sync::atomic::AtomicUsize,
-    finalizer_provisional_decrypts_on_map_workers: std::sync::atomic::AtomicUsize,
-    sender_send_gate: Mutex<Option<SenderSendGate>>,
 }
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct PipelineTestProbe(Arc<PipelineTestProbeInner>);
-
-#[cfg(test)]
-pub(crate) struct SenderOwnershipObservers {
-    pub(crate) extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) encoded_header_creations: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) live_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
-}
 
 #[cfg(test)]
 static PIPELINE_TEST_PROBES: std::sync::LazyLock<
@@ -202,229 +153,8 @@ impl PipelineTestProbe {
             .map(Self)
     }
 
-    pub(crate) fn mapped_ciphertext_observer_for_job(
-        job: StreamJobId,
-    ) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
-        Self::for_job(job).map(|probe| Arc::clone(&probe.0.mapped_ciphertext_zeroizations))
-    }
-
-    pub(crate) fn mapped_ciphertext_zeroizations(&self) -> usize {
-        self.0.mapped_ciphertext_zeroizations.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn inject_finalizer_map_failure(&self, index: u64) {
-        self.0
-            .finalizer_map_failure
-            .store(index.saturating_add(1), Ordering::SeqCst);
-    }
-
-    pub(crate) fn inject_finalizer_sink_failure(&self, index: u64) {
-        self.0
-            .finalizer_sink_failure
-            .store(index.saturating_add(1), Ordering::SeqCst);
-    }
-
-    pub(crate) fn finalizer_map_failure_for_job(job: StreamJobId, index: u64) -> bool {
-        Self::for_job(job).is_some_and(|probe| {
-            probe.0.finalizer_map_failure.load(Ordering::SeqCst) == index.saturating_add(1)
-        })
-    }
-
-    pub(crate) fn finalizer_sink_failure_for_job(job: StreamJobId, index: u64) -> bool {
-        Self::for_job(job).is_some_and(|probe| {
-            probe.0.finalizer_sink_failure.load(Ordering::SeqCst) == index.saturating_add(1)
-        })
-    }
-
-    pub(crate) fn observe_finalizer_provisional_decrypt(job: StreamJobId) {
-        if let Some(probe) = Self::for_job(job) {
-            probe
-                .0
-                .finalizer_provisional_decrypts
-                .fetch_add(1, Ordering::SeqCst);
-            if std::thread::current()
-                .name()
-                .is_some_and(|name| name.starts_with("aster-stream-map-"))
-            {
-                probe
-                    .0
-                    .finalizer_provisional_decrypts_on_map_workers
-                    .fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }
-
-    pub(crate) fn finalizer_provisional_decrypts(&self) -> usize {
-        self.0.finalizer_provisional_decrypts.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn finalizer_provisional_decrypts_on_map_workers(&self) -> usize {
-        self.0
-            .finalizer_provisional_decrypts_on_map_workers
-            .load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn sender_ownership_observers_for_job(
-        job: StreamJobId,
-    ) -> Option<SenderOwnershipObservers> {
-        Self::for_job(job).map(|probe| SenderOwnershipObservers {
-            extent_body_zeroizations: Arc::clone(&probe.0.sender_extent_body_zeroizations),
-            prefix_header_zeroizations: Arc::clone(&probe.0.sender_prefix_header_zeroizations),
-            encoded_header_creations: Arc::clone(&probe.0.sender_encoded_header_creations),
-            live_bytes: Arc::clone(&probe.0.sender_live_bytes),
-            peak_live_bytes: Arc::clone(&probe.0.sender_peak_live_bytes),
-        })
-    }
-
-    pub(crate) fn sender_extent_body_zeroizations(&self) -> usize {
-        self.0
-            .sender_extent_body_zeroizations
-            .load(Ordering::SeqCst)
-    }
-    pub(crate) fn sender_prefix_header_zeroizations(&self) -> usize {
-        self.0
-            .sender_prefix_header_zeroizations
-            .load(Ordering::SeqCst)
-    }
-    pub(crate) fn sender_encoded_header_creations(&self) -> usize {
-        self.0
-            .sender_encoded_header_creations
-            .load(Ordering::SeqCst)
-    }
-    pub(crate) fn sender_live_bytes(&self) -> usize {
-        self.0.sender_live_bytes.load(Ordering::SeqCst)
-    }
-    pub(crate) fn sender_peak_live_bytes(&self) -> usize {
-        self.0.sender_peak_live_bytes.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn observe_received_extent(job: StreamJobId) {
-        if let Some(probe) = Self::for_job(job) {
-            probe.0.received_extents.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    pub(crate) fn observe_prepared_sender_carrier(job: StreamJobId) {
-        if let Some(probe) = Self::for_job(job) {
-            probe
-                .0
-                .prepared_sender_carriers
-                .fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    pub(crate) fn prepared_sender_carriers(&self) -> usize {
-        self.0.prepared_sender_carriers.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn sender_producer_exits(&self) -> usize {
-        self.0.sender_producer_exits.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn sender_producer_starts(&self) -> usize {
-        self.0.sender_producer_starts.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn sender_producer_joins(&self) -> usize {
-        self.0.sender_producer_joins.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn sender_partition_channel_closed(&self) -> bool {
-        self.0
-            .sender_partition_channel_closed
-            .load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn observe_sender_producer_started(job: StreamJobId) {
-        if let Some(probe) = Self::for_job(job) {
-            probe
-                .0
-                .sender_producer_starts
-                .fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    pub(crate) fn observe_sender_producer_joined(job: StreamJobId) {
-        if let Some(probe) = Self::for_job(job) {
-            probe.0.sender_producer_exits.fetch_add(1, Ordering::SeqCst);
-            probe.0.sender_producer_joins.fetch_add(1, Ordering::SeqCst);
-            probe
-                .0
-                .sender_partition_channel_closed
-                .store(true, Ordering::SeqCst);
-        }
-    }
-
-    pub(crate) fn received_extents(&self) -> usize {
-        self.0.received_extents.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn inject_sender_sink_failure(&self, failure: usize) {
-        self.0.sender_sink_failure.store(failure, Ordering::SeqCst);
-    }
-
-    pub(crate) fn sender_sink_failure_for_job(job: StreamJobId) -> usize {
-        Self::for_job(job).map_or(0, |probe| {
-            probe.0.sender_sink_failure.load(Ordering::SeqCst)
-        })
-    }
-
-    pub(crate) fn block_sender_send_for_test(&self) {
-        *self.0.sender_send_gate.lock().expect("sender send gate") = Some(SenderSendGate {
-            entered: Arc::new(Semaphore::new(0)),
-            release: Arc::new(Semaphore::new(0)),
-            claimed: false,
-        });
-    }
-
-    pub(crate) async fn wait_sender_send_entered(&self) {
-        let entered = Arc::clone(
-            &self
-                .0
-                .sender_send_gate
-                .lock()
-                .expect("sender send gate")
-                .as_ref()
-                .expect("sender send gate installed")
-                .entered,
-        );
-        entered
-            .acquire()
-            .await
-            .expect("sender send barrier remains open")
-            .forget();
-    }
-
-    pub(crate) fn release_sender_send(&self) {
-        self.0
-            .sender_send_gate
-            .lock()
-            .expect("sender send gate")
-            .as_ref()
-            .expect("sender send gate installed")
-            .release
-            .add_permits(1);
-    }
-
-    pub(crate) fn sender_send_gate_for_job(
-        job: StreamJobId,
-    ) -> Option<(Arc<Semaphore>, Arc<Semaphore>)> {
-        Self::for_job(job).and_then(|probe| {
-            let mut gate = probe.0.sender_send_gate.lock().expect("sender send gate");
-            let gate = gate.as_mut()?;
-            if gate.claimed {
-                return None;
-            }
-            gate.claimed = true;
-            Some((Arc::clone(&gate.entered), Arc::clone(&gate.release)))
-        })
-    }
-
     pub(crate) fn hold_workers_for_test(&self) {
         self.0.hold_workers.store(true, Ordering::SeqCst);
-    }
-    pub(crate) fn release_workers_for_test(&self) {
-        self.0.hold_workers.store(false, Ordering::SeqCst);
     }
     pub(crate) fn peak_active_workers(&self) -> usize {
         self.0.peak_active_workers.load(Ordering::SeqCst)
@@ -601,17 +331,6 @@ impl PipelineReport {
     }
     pub const fn peak_encoding_bytes(&self) -> usize {
         self.peak_encoding_bytes
-    }
-    pub(crate) fn include_owned_bytes(
-        mut self,
-        peak_owned_bytes: usize,
-        peak_encoding_bytes: usize,
-    ) -> Self {
-        // An adapter with explicit ownership accounting replaces the generic
-        // admission estimate with its observed allocation lifetime peak.
-        self.peak_owned_bytes = peak_owned_bytes;
-        self.peak_encoding_bytes = peak_encoding_bytes;
-        self
     }
     pub const fn peak_reorder_items(&self) -> usize {
         self.peak_reorder_items
@@ -1132,16 +851,22 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     }
 
     pub(crate) fn recv_mapped_blocking(&mut self) -> Result<MappedPartition<T>, PipelineError> {
-        self.result_receiver
-            .blocking_recv()
-            .ok_or(PipelineError::WorkerPanicked)?
-            .map(|pending| pending.mapped)
-    }
-
-    fn recv_pending_blocking(&mut self) -> Result<Pending<T>, PipelineError> {
-        self.result_receiver
-            .blocking_recv()
-            .ok_or(PipelineError::WorkerPanicked)?
+        loop {
+            match self.result_receiver.try_recv() {
+                Ok(result) => return result.map(|pending| pending.mapped),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // The public file-publish API is synchronous and may be
+                    // called by an application already inside a Tokio runtime.
+                    // Tokio's `blocking_recv` panics in that context; mapper
+                    // workers are independent OS threads, so a short parked
+                    // poll waits without entering or nesting the runtime.
+                    std::thread::park_timeout(std::time::Duration::from_micros(50));
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(PipelineError::WorkerPanicked);
+                }
+            }
+        }
     }
 
     fn peak_active_workers(&self) -> usize {
@@ -1333,180 +1058,6 @@ impl PartitionSource for ChannelPartitionSource {
     ) -> Pin<Box<dyn Future<Output = Result<Option<StreamPartition>, PipelineError>> + Send + '_>>
     {
         Box::pin(async move { self.receiver.recv().await.transpose() })
-    }
-}
-
-/// Synchronous fixed-worker partition/map/reorder/sink runner for owned local
-/// storage jobs. Admission is bounded by `max_in_flight_items`; map results may
-/// arrive out of order, but the sink observes exactly increasing indices.
-pub(crate) fn run_ordered_blocking_pipeline<I, T, Map, MappedBytes, Sink>(
-    job_id: StreamJobId,
-    partitions: I,
-    limits: PipelineLimits,
-    map: Map,
-    mapped_bytes: MappedBytes,
-    mut sink: Sink,
-) -> Result<PipelineReport, PipelineError>
-where
-    I: IntoIterator<Item = Result<StreamPartition, PipelineError>>,
-    T: Send + 'static,
-    Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
-    MappedBytes: Fn(&T) -> usize,
-    Sink: FnMut(MappedPartition<T>) -> Result<(), PipelineError>,
-{
-    #[cfg(test)]
-    let probe = PipelineTestProbe::for_job(job_id);
-    #[cfg(not(test))]
-    let probe = None;
-    let mut pool = FixedPartitionMapPool::new_with_probe(
-        limits.workers,
-        limits.max_in_flight_items,
-        map,
-        probe,
-    )?;
-    let outcome = (|| {
-        let mut source = partitions.into_iter();
-        let mut source_done = false;
-        let mut reorder = BTreeMap::<u64, Pending<T>>::new();
-        let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
-        let mut accepted_items = 0_u64;
-        let mut completed_items = 0_u64;
-        let mut next_index = 0_u64;
-        let mut in_flight = 0_usize;
-        let mut live_owned_bytes = 0_usize;
-        let mut peak_items = 0_usize;
-        let mut peak_bytes = 0_usize;
-        let mut peak_owned_bytes = 0_usize;
-        let mut peak_encoding_bytes = 0_usize;
-        let mut peak_reorder = 0_usize;
-
-        loop {
-            while !source_done && in_flight < limits.max_in_flight_items {
-                let Some(partition) = source.next() else {
-                    source_done = true;
-                    break;
-                };
-                let partition = partition?;
-                if partition.is_empty() {
-                    return Err(PipelineError::EmptyPartition);
-                }
-                if partition.len() > limits.max_in_flight_bytes {
-                    return Err(PipelineError::PartitionTooLarge);
-                }
-                if live_owned_bytes.saturating_add(partition.len()) > limits.max_in_flight_bytes {
-                    return Err(PipelineError::PartitionTooLarge);
-                }
-                if partition.index() != accepted_items {
-                    return Err(PipelineError::NonContiguousIndex {
-                        expected: accepted_items,
-                        actual: partition.index(),
-                    });
-                }
-                let bytes = partition.len();
-                let admitted = Instant::now();
-                pool.submit_unbudgeted(partition)?;
-                add_observation(
-                    &mut stages,
-                    PipelineStage::Admission,
-                    bytes,
-                    Duration::ZERO,
-                    admitted.elapsed(),
-                    Duration::ZERO,
-                );
-                accepted_items += 1;
-                in_flight += 1;
-                live_owned_bytes = live_owned_bytes.saturating_add(bytes);
-                peak_items = peak_items.max(in_flight);
-                peak_bytes = peak_bytes.max(live_owned_bytes);
-                peak_owned_bytes = peak_owned_bytes.max(live_owned_bytes);
-            }
-
-            if in_flight == 0 {
-                if source_done {
-                    break;
-                }
-                continue;
-            }
-
-            let pending = pool.recv_pending_blocking()?;
-            let index = pending.mapped.index;
-            let input_bytes = pending.mapped.input_bytes;
-            let output_bytes = mapped_bytes(&pending.mapped.value);
-            live_owned_bytes = live_owned_bytes
-                .saturating_sub(input_bytes)
-                .saturating_add(output_bytes);
-            peak_encoding_bytes = peak_encoding_bytes.max(output_bytes);
-            peak_owned_bytes = peak_owned_bytes.max(live_owned_bytes);
-            let reorder_started = Instant::now();
-            if index < next_index
-                || (index != next_index && reorder.len() >= limits.max_reorder_items)
-                || reorder.insert(index, pending).is_some()
-            {
-                return Err(PipelineError::NonContiguousIndex {
-                    expected: next_index,
-                    actual: index,
-                });
-            }
-            let buffered_out_of_order = reorder
-                .len()
-                .saturating_sub(usize::from(reorder.contains_key(&next_index)));
-            peak_reorder = peak_reorder.max(buffered_out_of_order);
-            add_observation(
-                &mut stages,
-                PipelineStage::Reorder,
-                input_bytes,
-                Duration::ZERO,
-                reorder_started.elapsed(),
-                Duration::ZERO,
-            );
-
-            while let Some(pending) = reorder.remove(&next_index) {
-                let bytes = pending.mapped.input_bytes;
-                let output_bytes = mapped_bytes(&pending.mapped.value);
-                add_observation(
-                    &mut stages,
-                    PipelineStage::Map,
-                    bytes,
-                    pending.queue_wait,
-                    pending.map_time,
-                    pending.mapped_at.elapsed(),
-                );
-                let sink_started = Instant::now();
-                sink(pending.mapped)?;
-                add_observation(
-                    &mut stages,
-                    PipelineStage::Sink,
-                    bytes,
-                    Duration::ZERO,
-                    sink_started.elapsed(),
-                    Duration::ZERO,
-                );
-                live_owned_bytes = live_owned_bytes.saturating_sub(output_bytes);
-                completed_items += 1;
-                next_index += 1;
-                in_flight -= 1;
-            }
-        }
-
-        Ok(PipelineReport {
-            job_id,
-            accepted_items,
-            completed_items,
-            peak_in_flight_items: peak_items,
-            peak_in_flight_bytes: peak_bytes,
-            peak_owned_bytes,
-            peak_encoding_bytes,
-            peak_reorder_items: peak_reorder,
-            worker_count: limits.workers,
-            peak_active_workers: pool.peak_active_workers(),
-            stages,
-        })
-    })();
-    let worker_panicked = pool.shutdown().is_err();
-    if worker_panicked && outcome.is_ok() {
-        Err(PipelineError::WorkerPanicked)
-    } else {
-        outcome
     }
 }
 

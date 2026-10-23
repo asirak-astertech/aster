@@ -110,6 +110,8 @@ message PublishBlobAccepted {
   uint64 accepted_offset = 1;
   uint64 durable_offset = 2;
   uint32 canonical_frame_bytes = 3;
+  // Stable opaque identity for status inspection before upload completion.
+  bytes publication_id = 4;
 }
 
 message PublishBlobCheckpoint {

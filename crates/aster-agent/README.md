@@ -113,8 +113,8 @@ whose safe destination-file publication still requires Linux and a qualifying
 filesystem.
 
 The machine-checked capability block above is authoritative for publication,
-status, and download behavior. Node-to-node profile-5 receipt resume remains a
-separate protocol mechanism.
+status, and download behavior. Node-to-node profile-5 native-pack checkpoint
+resume remains a separate protocol mechanism.
 
 ```sh
 TOKEN_FILE=/run/aster/client.token
@@ -159,18 +159,26 @@ retry the identical file bytes and publication options with
 committed, the retry recovers it with `inserted: false`; if it did not, the
 retry may insert the publication and return `inserted: true`.
 
+At the RPC level, `PublishBlobAccepted.publication_id` is a stable nonzero
+32-byte identity returned before data byte zero. Native clients should persist
+it immediately, may inspect provisional durable progress with that ID, and
+must reject a terminal receipt carrying a different ID. The CLI emits the same
+identity in its single terminal result. Status transfer-byte counters are exact
+length-prefixed `ASTRBS02` pack payload bytes rather than Blob-depot reservation
+or filesystem byte counts.
+
 Text output renders the original signed TTL as exactly `TTL: durable` or
 `TTL: 60000 ms`. Finite JSON renders exactly `"ttlMs": "60000"`; durable JSON
 omits `ttlMs`. These values are the original lifetime, not remaining time.
 
 The CLI and wire fields use checked `u64` lengths. The semantic-v9/profile-5
 stream admits at most 8 GiB per Blob and uses bounded 512-KiB application
-frames. Node-to-node DATA carries canonical 64-KiB chunks as complete records
-inside at-most-1-MiB `ABX1` extents; checkpoint batches are at most 128 MiB.
-The exact maxima are 65,536 plaintext bytes, 66,215 encoded-record bytes,
-1,048,576 batched-extent bytes, and 134,217,728 checkpoint bytes. Provisional
-uploads, pending receipts, and completed variants all use the configured
-canonical Blob depot limits; there is no independent stream pool.
+frames. Node-to-node DATA carries one complete length-prefixed native
+`ASTRBS02` pack record per message; checkpoint batches are at most 128 MiB.
+The exact maxima are 1,048,576 plaintext segment bytes, 1,048,706 encoded
+record bytes, 1,048,710 DATA-body bytes, and 134,217,728 checkpoint bytes.
+Provisional uploads, pending native packs, and completed variants all use the
+configured Blob depot limits; there is no independent stream pool.
 Its two-minute authenticated-progress timeout is the shorter stall bound. The
 sender derives the hard deadline from exact canonical wire bytes; because PLAN
 does not disclose size, the receiver opens transport before authenticated OPEN

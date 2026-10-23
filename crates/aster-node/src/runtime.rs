@@ -58,8 +58,8 @@ use aster_mesh::{
     ReferenceEnvelopeSealer, ReferenceProvisioner, RouteVerifiedEventEnvelope,
     RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope, ScopeRekeyRecipient,
     SourceRouteLineage, StateContentVerification, Topic, VerifiedBlobContentCompletion,
-    VerifiedBlobTransferPlan, VerifiedControlEnvelope, VerifiedControlKind, VerifiedCustodyClaims,
-    engine::EnvelopeError,
+    VerifiedBlobStreamPublicationSource, VerifiedBlobTransferPlan, VerifiedControlEnvelope,
+    VerifiedControlKind, VerifiedCustodyClaims, engine::EnvelopeError,
 };
 use aster_negentropy::{
     DEFAULT_FRAME_SIZE_LIMIT, Difference, Initiator, InitiatorStep, MAX_CARDINALITY_LIMIT,
@@ -90,7 +90,7 @@ use aster_redb_store::{
     ReservedNumberedEventCommit, RetainedBlobSource, RouteCacheOutcome,
     ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
     StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
-    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredBlob, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
     StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
@@ -100,7 +100,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tokio::{
-    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch},
+    sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch},
     task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, Sleep, sleep, timeout},
 };
@@ -172,7 +172,6 @@ use crate::{
 use aster_mesh::{ReferenceSessionInitiator, ReferenceSessionResponder, UnprotectedProvisioning};
 #[cfg(test)]
 use aster_redb_store::{
-    BlobDeliveryAck, BlobSubscriptionKey, BlobSubscriptionPollSelection, BlobSubscriptionSpec,
     CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE,
     DEFAULT_MAX_TOTAL_PAYLOAD_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
 };
@@ -497,6 +496,46 @@ const MUTABLE_V8_CONTACT_RESERVE_BYTES: usize = MUTABLE_V5_CONTACT_RESERVE_BYTES
 const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct AuthenticatedContactProgress {
+    generation: AtomicU64,
+    changed: Notify,
+}
+
+tokio::task_local! {
+    static AUTHENTICATED_CONTACT_PROGRESS: Arc<AuthenticatedContactProgress>;
+}
+
+pub(super) fn record_authenticated_contact_progress() {
+    _ = AUTHENTICATED_CONTACT_PROGRESS.try_with(|progress| {
+        progress.generation.fetch_add(1, Ordering::Release);
+        progress.changed.notify_one();
+    });
+}
+
+async fn with_authenticated_contact_progress_deadline<T>(
+    future: impl Future<Output = T>,
+) -> Result<T, ()> {
+    let progress = Arc::new(AuthenticatedContactProgress::default());
+    AUTHENTICATED_CONTACT_PROGRESS
+        .scope(Arc::clone(&progress), async move {
+            tokio::pin!(future);
+            loop {
+                let observed = progress.generation.load(Ordering::Acquire);
+                tokio::select! {
+                    result = &mut future => return Ok(result),
+                    _ = progress.changed.notified() => {},
+                    _ = sleep(CONTACT_DEADLINE) => {
+                        if progress.generation.load(Ordering::Acquire) == observed {
+                            return Err(());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+}
 const DEMO_MISSION_BUNDLE_FILE: &str = "mission.unprotected-reference.bundle";
 const DEMO_SIGNED_REGISTRY_FILE: &str = "signed-public-rekey-registry.bin";
 const DEMO_SCOPE: &str = "demo/mesh";
@@ -7655,6 +7694,26 @@ struct AuthenticatedBlobRouteClaim {
     depot_completion: Option<BlobDepotCompletion>,
 }
 
+/// Compact capability for one authenticated native Profile-5 publication.
+///
+/// Native packs deliberately do not manufacture a legacy manifest/depot
+/// capability. This parallel cache claim preserves lifecycle serialization
+/// and current-lineage checks without projecting 1-MiB `ASTRBS02` records into
+/// the retired 64-KiB BlobRanges representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedProfile5BlobRouteClaim {
+    mission_authority: NodeId,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+    authority: VerifiedBlobStreamPublicationSource,
+}
+
+enum Profile5BlobSourceAuthentication {
+    Legacy,
+    Unavailable,
+    Authenticated(Box<AuthenticatedProfile5BlobRouteClaim>),
+}
+
 impl AuthenticatedBlobRouteClaim {
     fn from_verified(
         store: &Store,
@@ -8120,6 +8179,7 @@ struct AuthenticatedEventRouteCacheInner {
     claims: BTreeMap<EventTransferId, AuthenticatedEventRouteClaim>,
     mutable_claims: BTreeMap<MutableTransferId, AuthenticatedMutableRouteClaim>,
     blob_claims: BTreeMap<BlobTransferId, AuthenticatedBlobRouteClaim>,
+    profile5_blob_claims: BTreeMap<BlobTransferId, AuthenticatedProfile5BlobRouteClaim>,
     pending_blob_completions: BTreeMap<BlobTransferId, PendingBlobCompletionMemo>,
 }
 
@@ -8360,6 +8420,7 @@ impl AuthenticatedEventRouteCache {
                 claims: BTreeMap::new(),
                 mutable_claims: BTreeMap::new(),
                 blob_claims: BTreeMap::new(),
+                profile5_blob_claims: BTreeMap::new(),
                 pending_blob_completions: BTreeMap::new(),
             }),
             capacity: MAX_CARDINALITY_LIMIT,
@@ -8674,6 +8735,90 @@ impl AuthenticatedEventRouteCache {
         Ok(())
     }
 
+    fn replace_profile5_blobs(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claims: BTreeMap<BlobTransferId, AuthenticatedProfile5BlobRouteClaim>,
+    ) -> Result<(), NodeError> {
+        if claims.len() > self.blob_capacity {
+            return Err(NodeError::Protocol(
+                "authenticated Profile-5 Blob route cache exceeds its selected durable bounds"
+                    .into(),
+            ));
+        }
+        if claims.iter().any(|(id, claim)| {
+            *id != claim.projection.transfer_id
+                || claim.mission_authority != verifier.mission_authority_id()
+        }) {
+            return Err(NodeError::Protocol(
+                "authenticated Profile-5 Blob route cache claim differs from its verifier or key"
+                    .into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        inner.profile5_blob_claims = claims;
+        Ok(())
+    }
+
+    fn insert_profile5_blob(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: AuthenticatedProfile5BlobRouteClaim,
+    ) -> Result<(), NodeError> {
+        if claim.mission_authority != verifier.mission_authority_id() {
+            return Err(NodeError::Protocol(
+                "authenticated Profile-5 Blob route cache insertion belongs to another verifier"
+                    .into(),
+            ));
+        }
+        let transfer_id = claim.projection.transfer_id;
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        if inner.blob_claims.contains_key(&transfer_id) {
+            return Err(NodeError::Protocol(
+                "one Blob transfer has both legacy and native route-cache claims".into(),
+            ));
+        }
+        if let Some(existing) = inner.profile5_blob_claims.get(&transfer_id) {
+            return if existing == &claim {
+                Ok(())
+            } else {
+                Err(NodeError::Protocol(
+                    "authenticated Profile-5 Blob route cache has conflicting exact claims".into(),
+                ))
+            };
+        }
+        if inner
+            .blob_claims
+            .len()
+            .checked_add(inner.profile5_blob_claims.len())
+            .is_none_or(|count| count >= self.blob_capacity)
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Blob route cache exhausted before durable class caps".into(),
+            ));
+        }
+        inner.profile5_blob_claims.insert(transfer_id, claim);
+        Ok(())
+    }
+
     fn get_blob(
         &self,
         verifier: &ReferenceEnvelopeSealer,
@@ -8957,6 +9102,7 @@ impl AuthenticatedEventRouteCache {
         }
         for transfer_id in exact {
             inner.blob_claims.remove(&transfer_id);
+            inner.profile5_blob_claims.remove(&transfer_id);
             inner.pending_blob_completions.remove(&transfer_id);
         }
         Ok(())
@@ -8964,20 +9110,21 @@ impl AuthenticatedEventRouteCache {
 
     #[cfg(test)]
     fn blob_claim_count(&self) -> usize {
-        self.inner
+        let inner = self
+            .inner
             .read()
-            .expect("authenticated Blob route cache test lock")
-            .blob_claims
-            .len()
+            .expect("authenticated Blob route cache test lock");
+        inner.blob_claims.len() + inner.profile5_blob_claims.len()
     }
 
     #[cfg(test)]
     pub(crate) fn has_blob_claim_for_test(&self, transfer_id: BlobTransferId) -> bool {
-        self.inner
+        let inner = self
+            .inner
             .read()
-            .expect("authenticated Blob route cache test lock")
-            .blob_claims
-            .contains_key(&transfer_id)
+            .expect("authenticated Blob route cache test lock");
+        inner.blob_claims.contains_key(&transfer_id)
+            || inner.profile5_blob_claims.contains_key(&transfer_id)
     }
 
     #[cfg(test)]
@@ -9046,6 +9193,45 @@ impl AuthenticatedEventRouteCache {
         ))
     }
 
+    /// Returns the immutable source authority captured when this exact native
+    /// publication was authenticated. Historical operation retries may use
+    /// this capability after a provider-lineage replacement; plaintext reads
+    /// still require the separate current-lineage check below.
+    pub(crate) fn authenticated_profile5_blob_source(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+    ) -> Result<VerifiedBlobStreamPublicationSource, NodeError> {
+        let inner = self.inner.read().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        let claim = inner
+            .profile5_blob_claims
+            .get(&projection.transfer_id)
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "native Profile-5 Blob source lacks its authenticated route claim".into(),
+                )
+            })?;
+        if claim.mission_authority != verifier.mission_authority_id()
+            || claim.projection != *projection
+            || claim.retention != retention
+        {
+            return Err(NodeError::Protocol(
+                "native Profile-5 Blob source differs from its authenticated route claim".into(),
+            ));
+        }
+        Ok(claim.authority.clone())
+    }
+
     /// Requires one exact completed Blob projection to have a previously
     /// authenticated cache claim, and reports whether both of its opaque
     /// provider lineages remain current. A false result may support an exact
@@ -9056,6 +9242,42 @@ impl AuthenticatedEventRouteCache {
         projection: &BlobSourceProjection,
         retention: BlobSourceRetention,
     ) -> Result<bool, NodeError> {
+        let native = {
+            let inner = self.inner.read().map_err(|_| {
+                NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+            })?;
+            if inner.verifier_identity != verifier.identity()
+                || inner.mission_authority != verifier.mission_authority_id()
+            {
+                return Err(NodeError::Protocol(
+                    "authenticated Event route cache belongs to another verifier".into(),
+                ));
+            }
+            inner
+                .profile5_blob_claims
+                .get(&projection.transfer_id)
+                .cloned()
+        };
+        if let Some(native) = native {
+            if native.mission_authority != verifier.mission_authority_id()
+                || native.projection != *projection
+                || native.retention != retention
+            {
+                return Err(NodeError::Protocol(
+                    "native Profile-5 Blob source differs from its authenticated route claim"
+                        .into(),
+                ));
+            }
+            return Ok(verifier
+                .blob_stream_authorization_digest(&projection.scope, projection.epoch)
+                == Some(projection.route_lineage)
+                && verifier.is_current_blob_physical_lineage_binding(
+                    &projection.scope,
+                    &projection.topic,
+                    projection.epoch,
+                    &projection.physical_lineage,
+                ));
+        }
         let claim = self
             .get_blob(verifier, projection.transfer_id)?
             .ok_or_else(|| {
@@ -10384,49 +10606,51 @@ fn authenticate_blob_source(
     )
 }
 
-/// Authenticates a lifecycle-owned Profile-5 source directly from its signed
-/// stream open and final commitment. `None` means the retained source uses the
-/// legacy envelope/depot representation; `Some(false)` means this verifier
-/// generation cannot yet authenticate the Profile-5 authority during control
-/// replay.
+/// Authenticates the signed semantic publication and the independently signed
+/// physical Profile-5 pack it references. `None` means the retained source
+/// uses the legacy envelope/depot representation; `Some(false)` means this
+/// verifier generation cannot authenticate the current publication or pack
+/// authority during control replay.
 fn try_authenticate_profile5_blob_source(
     store: &Store,
     verifier: &ReferenceEnvelopeSealer,
     projection: &BlobSourceProjection,
     retention: BlobSourceRetention,
-) -> Result<Option<bool>, NodeError> {
+) -> Result<Profile5BlobSourceAuthentication, NodeError> {
     if !matches!(retention, BlobSourceRetention::Completed { .. }) {
-        return Ok(None);
+        return Ok(Profile5BlobSourceAuthentication::Legacy);
     }
     let stored = store.get_blob(projection.transfer_id)?.ok_or_else(|| {
         NodeError::Protocol("completed Blob projection lost its source row".into())
     })?;
     let session = match store.open_profile5_pack_application_read(stored.variant_id) {
         Ok(session) => session,
-        Err(StoreError::Blob(BlobStoreError::NotFound)) => return Ok(None),
+        Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+            return Ok(Profile5BlobSourceAuthentication::Legacy);
+        }
         Err(error) => return Err(error.into()),
     };
-    let verified_open = match verifier.verify_blob_stream_open(session.authenticated_open()) {
-        Ok(open) => open,
-        Err(_) => return Ok(Some(false)),
+    let authority = match verifier.verify_blob_stream_publication_source(&stored.sealed) {
+        Ok(authority) => authority,
+        Err(_) => return Ok(Profile5BlobSourceAuthentication::Unavailable),
     };
-    if verifier
-        .verify_blob_stream_commitment(&verified_open, session.authenticated_commitment())
-        .is_err()
+    let source = authority.source();
+    let verified_publication = authority.publication();
+    if session.authenticated_open() != source.authenticated_open()
+        || session.authenticated_commitment() != source.authenticated_commitment()
     {
-        return Ok(Some(false));
+        return Err(NodeError::Protocol(
+            "retained Profile-5 publication references a different physical pack".into(),
+        ));
     }
-    let open = verified_open.open();
+    let open = verified_publication.publication().open();
+    let physical_open = authority.physical_open().open();
     let commitment = session.commitment();
+    let publication = verified_publication.publication();
     let sealed_len = u64::try_from(stored.sealed.len())
         .map_err(|_| NodeError::Protocol("Profile-5 source length overflow".into()))?;
-    let mut semantic = Sha256::new();
-    semantic.update(b"aster/blob-profile5-semantic/v1\0");
-    semantic.update(open.publisher());
-    semantic.update(open.publisher_counter().to_be_bytes());
-    semantic.update(open.digest());
-    semantic.update(commitment.encode());
-    let semantic_id = BlobSemanticId::new(semantic.finalize().into());
+    let semantic_id =
+        BlobSemanticId::new(Sha256::digest(verified_publication.authenticated_bytes()).into());
     let manifest_digest: [u8; 32] = Sha256::digest(commitment.encode()).into();
     let source_transfer = BlobTransferId::new(Sha256::digest(&stored.sealed).into());
     if stored.transfer_id != projection.transfer_id
@@ -10434,13 +10658,19 @@ fn try_authenticate_profile5_blob_source(
         || stored.semantic_id != projection.semantic_id
         || semantic_id != projection.semantic_id
         || stored.blob_id != projection.blob_id
+        || publication.blob_id() != projection.blob_id
         || commitment.blob_id() != projection.blob_id
+        || publication.physical_lineage() != &projection.physical_lineage
         || stored.manifest_digest != projection.manifest_digest
         || manifest_digest != projection.manifest_digest
         || stored.route_lineage != Some(projection.route_lineage)
         || stored.physical_lineage != Some(projection.physical_lineage)
-        || session.route_lineage() != &projection.route_lineage
+        || session.route_lineage() != physical_open.authorization_digest()
         || session.physical_lineage() != &projection.physical_lineage
+        || physical_open.content_group() != open.content_group()
+        || physical_open.content_epoch() != open.content_epoch()
+        || physical_open.total_len() != open.total_len()
+        || physical_open.metadata() != open.metadata()
         || open.publisher() != projection.publisher
         || open.topic() != &projection.topic
         || open.scope() != &projection.scope
@@ -10452,12 +10682,19 @@ fn try_authenticate_profile5_blob_source(
         || projection.sealed_len != sealed_len
         || stored.header.stamp.dot.publisher != open.publisher()
         || stored.header.stamp.dot.counter != open.publisher_counter()
+        || stored.header.stamp.context != *open.causal_context()
         || stored.header.topic != *open.topic()
         || stored.header.scope != *open.scope()
         || stored.header.priority != open.priority()
         || stored.header.ttl_ms != open.ttl_ms()
+        || stored.header.content_len != sealed_len
         || stored.header.key_epoch != open.content_epoch()
         || stored.header.logical_key.as_slice() != commitment.blob_id().as_bytes()
+        || stored.header.blob_route.is_none_or(|route| {
+            route.blob_id() != commitment.blob_id()
+                || route.chunk_count() != commitment.segment_count()
+                || route.root() != commitment.ciphertext_root()
+        })
     {
         return Err(NodeError::Protocol(
             "retained Profile-5 Blob proof differs from its exact transfer".into(),
@@ -10472,9 +10709,54 @@ fn try_authenticate_profile5_blob_source(
             &projection.physical_lineage,
         )
     {
-        return Ok(Some(false));
+        return Ok(Profile5BlobSourceAuthentication::Unavailable);
     }
-    Ok(Some(true))
+    Ok(Profile5BlobSourceAuthentication::Authenticated(Box::new(
+        AuthenticatedProfile5BlobRouteClaim {
+            mission_authority: verifier.mission_authority_id(),
+            projection: projection.clone(),
+            retention,
+            authority,
+        },
+    )))
+}
+
+pub(crate) fn cache_authenticated_profile5_blob_route_claim(
+    store: &Store,
+    cache: &AuthenticatedEventRouteCache,
+    verifier: &ReferenceEnvelopeSealer,
+    stored: &StoredBlob,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+) -> Result<(), NodeError> {
+    let retained = store
+        .blob_source_projection(stored.transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "promoted Profile-5 Blob is missing its retained source projection".into(),
+            )
+        })?;
+    if retained.retention
+        != (BlobSourceRetention::Completed {
+            acceptance_marker: stored.acceptance_marker,
+        })
+    {
+        return Err(NodeError::Protocol(
+            "promoted Profile-5 Blob retention differs from its acceptance marker".into(),
+        ));
+    }
+    let Profile5BlobSourceAuthentication::Authenticated(claim) =
+        try_authenticate_profile5_blob_source(
+            store,
+            verifier,
+            &retained.source,
+            retained.retention,
+        )?
+    else {
+        return Err(NodeError::Protocol(
+            "promoted Profile-5 Blob cannot produce an authenticated native route claim".into(),
+        ));
+    };
+    cache.insert_profile5_blob(verifier, *claim)
 }
 
 fn authenticate_blob_source_for_contact(
@@ -10797,7 +11079,7 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     let mut retained_blobs = BTreeMap::new();
     let mut blob_claims = BTreeMap::new();
     let mut profile5_blobs = BTreeSet::new();
-    let mut verified_profile5_blobs = BTreeSet::new();
+    let mut verified_profile5_blobs = BTreeMap::new();
     // Several authenticated publications may share one immutable physical
     // variant. Startup audits every exact variant once, then reuses only the
     // nonconstructible depot capability; each source claim still cross-binds
@@ -10918,13 +11200,18 @@ pub(crate) fn open_startup_event_verifier_and_cache(
         }
         match try_authenticate_profile5_blob_source(store, &verifier, &item.source, item.retention)?
         {
-            Some(authenticated) => {
+            Profile5BlobSourceAuthentication::Authenticated(claim) => {
                 profile5_blobs.insert(id);
-                if authenticated {
-                    verified_profile5_blobs.insert(id);
+                if verified_profile5_blobs.insert(id, *claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "pre-control retained Profile-5 Blob proof is duplicated".into(),
+                    ));
                 }
             }
-            None => {
+            Profile5BlobSourceAuthentication::Unavailable => {
+                profile5_blobs.insert(id);
+            }
+            Profile5BlobSourceAuthentication::Legacy => {
                 let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
                 if let Some(claim) = try_authenticate_blob_source(
                     store,
@@ -10949,7 +11236,7 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     }
     let mut unclaimed_blobs_by_scope_epoch = BTreeMap::new();
     for (id, (projection, _)) in &retained_blobs {
-        if !blob_claims.contains_key(id) && !verified_profile5_blobs.contains(id) {
+        if !blob_claims.contains_key(id) && !verified_profile5_blobs.contains_key(id) {
             unclaimed_blobs_by_scope_epoch
                 .entry((projection.scope.clone(), projection.epoch))
                 .or_insert_with(Vec::new)
@@ -10986,15 +11273,18 @@ pub(crate) fn open_startup_event_verifier_and_cache(
                 )
             })?;
             if profile5_blobs.contains(&id) {
-                if try_authenticate_profile5_blob_source(store, &verifier, projection, *retention)?
-                    != Some(true)
-                {
-                    continue;
-                }
-                if !verified_profile5_blobs.insert(id) {
-                    return Err(NodeError::Protocol(
-                        "incremental retained Profile-5 Blob proof is duplicated".into(),
-                    ));
+                match try_authenticate_profile5_blob_source(
+                    store, &verifier, projection, *retention,
+                )? {
+                    Profile5BlobSourceAuthentication::Authenticated(claim) => {
+                        if verified_profile5_blobs.insert(id, *claim).is_some() {
+                            return Err(NodeError::Protocol(
+                                "incremental retained Profile-5 Blob proof is duplicated".into(),
+                            ));
+                        }
+                    }
+                    Profile5BlobSourceAuthentication::Unavailable
+                    | Profile5BlobSourceAuthentication::Legacy => continue,
                 }
             } else {
                 let sealed = retained_blob_sealed(store, projection, *retention)?;
@@ -11126,20 +11416,21 @@ pub(crate) fn open_startup_event_verifier_and_cache(
             ));
         }
         if profile5_blobs.contains(&id) {
-            if !verified_profile5_blobs.contains(&id) {
-                if try_authenticate_profile5_blob_source(
-                    store,
-                    &verifier,
-                    &item.source,
-                    item.retention,
-                )? != Some(true)
-                {
+            if let Entry::Vacant(entry) = verified_profile5_blobs.entry(id) {
+                let Profile5BlobSourceAuthentication::Authenticated(claim) =
+                    try_authenticate_profile5_blob_source(
+                        store,
+                        &verifier,
+                        &item.source,
+                        item.retention,
+                    )?
+                else {
                     return Err(NodeError::Protocol(
                         "retained Profile-5 Blob source cannot be opened by its current provider"
                             .into(),
                     ));
-                }
-                verified_profile5_blobs.insert(id);
+                };
+                entry.insert(*claim);
             }
         } else if let Entry::Vacant(entry) = blob_claims.entry(id) {
             let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
@@ -11162,7 +11453,10 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     if final_blob_ids.len() != retained_blobs.len()
         || blob_claims.len().checked_add(verified_profile5_blobs.len())
             != Some(retained_blobs.len())
-        || profile5_blobs != verified_profile5_blobs
+        || profile5_blobs.len() != verified_profile5_blobs.len()
+        || !profile5_blobs
+            .iter()
+            .all(|id| verified_profile5_blobs.contains_key(id))
     {
         return Err(NodeError::Protocol(
             "retained Blob source proof is incomplete across control replay".into(),
@@ -11177,6 +11471,7 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     cache.replace(&verifier, control_head, claims)?;
     cache.replace_mutable(&verifier, mutable_claims)?;
     cache.replace_blobs(&verifier, blob_claims)?;
+    cache.replace_profile5_blobs(&verifier, verified_profile5_blobs)?;
     #[cfg(test)]
     cache.record_startup_blob_completion_audits(startup_blob_completions.len());
     cleanup_ineligible_pending_blobs(store, &mut verifier, &cache)?;
@@ -13412,54 +13707,6 @@ pub(crate) fn cache_authenticated_record_route_claim(
     cache.require_binding(verifier)?;
     cache.record_mutable_source_verification();
     cache.insert_mutable(verifier, claim)
-}
-
-/// Installs the exact completed local Blob claim after its durable publication
-/// commits while the caller still holds the shared Blob lifecycle lock.
-///
-/// This function deliberately reconstructs the cache capability from the
-/// freshly authenticated source envelope and the retained store projection;
-/// request fields or depot completion alone are never cache authority.
-pub(crate) fn cache_authenticated_blob_route_claim(
-    store: &Store,
-    cache: &AuthenticatedEventRouteCache,
-    verifier: &ReferenceEnvelopeSealer,
-    blob: &ContentVerifiedBlobEnvelope,
-    manifest_bytes: &[u8],
-    sealed: &[u8],
-    acceptance_marker: u64,
-) -> Result<(), NodeError> {
-    let transfer_id = BlobTransferId::new(blob.envelope_id());
-    let retained = store.blob_source_projection(transfer_id)?.ok_or_else(|| {
-        NodeError::Protocol(
-            "authenticated local Blob publication is missing its exact retained source row".into(),
-        )
-    })?;
-    let expected_retention = BlobSourceRetention::Completed { acceptance_marker };
-    if retained.retention != expected_retention {
-        return Err(NodeError::Protocol(
-            "authenticated local Blob publication marker differs from its retained source row"
-                .into(),
-        ));
-    }
-    let depot_completion = store.completed_retained_blob(
-        &retained.source,
-        expected_retention,
-        blob,
-        manifest_bytes,
-        sealed,
-    )?;
-    let claim = AuthenticatedBlobRouteClaim::from_verified(
-        store,
-        blob,
-        sealed,
-        &retained.source,
-        expected_retention,
-        Some(depot_completion),
-    )?;
-    cache.require_binding(verifier)?;
-    cache.record_mutable_source_verification();
-    cache.insert_blob(verifier, claim)
 }
 
 fn cache_committed_state_route_claim(
@@ -17066,7 +17313,7 @@ async fn run_node_actor_inner(
     )
     .map_err(|error| {
         NodeError::Protocol(format!(
-            "selected Blob finalization pool failed to start: {error}"
+            "selected Blob pack promotion pool failed to start: {error}"
         ))
     })?;
     let initial_status_metrics = SelectedEventStoreMetrics::read(&store)?;
@@ -19259,9 +19506,11 @@ async fn sync_once_with_forwarding(
             "receive-only policy cannot initiate a carrier contact".into(),
         ));
     }
-    timeout(CONTACT_DEADLINE, sync_session(endpoint, contact))
+    with_authenticated_contact_progress_deadline(sync_session(endpoint, contact))
         .await
-        .map_err(|_| NodeError::Protocol("contact exceeded its total deadline".into()))?
+        .map_err(|()| {
+            NodeError::Protocol("contact exceeded its authenticated-progress deadline".into())
+        })?
 }
 
 async fn sync_session(
@@ -27167,17 +27416,14 @@ fn next_canonical_blob_publication(
             })?;
         match store.open_profile5_pack_transfer_read(stored.variant_id) {
             Ok(session) => {
-                let open = verifier.verify_blob_stream_open(session.authenticated_open())?;
-                verifier
-                    .verify_blob_stream_commitment(&open, session.authenticated_commitment())?;
-                if verifier.blob_stream_authorization_digest(
-                    open.open().scope(),
-                    open.open().content_epoch(),
-                ) != Some(retained.source.route_lineage)
+                let authority = verifier.verify_blob_stream_publication_source(&stored.sealed)?;
+                let open = authority.publication().publication().open();
+                if verifier.blob_stream_authorization_digest(open.scope(), open.content_epoch())
+                    != Some(retained.source.route_lineage)
                     || !verifier.is_current_blob_physical_lineage_binding(
-                        open.open().scope(),
-                        open.open().topic(),
-                        open.open().content_epoch(),
+                        open.scope(),
+                        open.topic(),
+                        open.content_epoch(),
                         &retained.source.physical_lineage,
                     )
                 {
@@ -27187,7 +27433,7 @@ fn next_canonical_blob_publication(
                     stored,
                     retained.source.clone(),
                     retained.retention,
-                    open,
+                    authority,
                     &session,
                 )
                 .map_err(profile5_blob_network_error)?;
@@ -27281,8 +27527,8 @@ async fn send_profile5_blob_direction(
                     publication.key_epoch(),
                 )?
                 .wire_bytes(),
-            source_len: u32::try_from(publication.authenticated_open().len()).unwrap_or(u32::MAX),
-            source_digest: Sha256::digest(publication.authenticated_open()).into(),
+            source_len: u32::try_from(publication.source_record().len()).unwrap_or(u32::MAX),
+            source_digest: Sha256::digest(publication.source_record()).into(),
             finite: publication.is_finite(),
         }),
         None => None,
@@ -27455,13 +27701,11 @@ async fn receive_profile5_blob_direction(
         ));
     }
     guard.check(&store)?;
-    let route_cache = contact_mutable_route_cache(verifier)?;
     let transport = blob_stream::select_production_stream_transport(connection.clone())
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::receive_canonical_blob_profile5(
         transport.as_ref(),
         Arc::clone(&store),
-        route_cache.as_ref(),
         guard.policy(),
         verifier,
         mission,
@@ -28352,29 +28596,26 @@ async fn serve_connection_with_forwarding(
         custody_clock,
     };
     let close = connection.clone();
-    match timeout(
-        CONTACT_DEADLINE,
-        CONTACT_EVENT_ROUTE_CACHE.scope(
-            event_route_cache,
-            CONTACT_EMISSION_GUARD.scope(
-                guard,
-                serve_session(
-                    store,
-                    connection,
-                    credentials,
-                    expected_peer,
-                    InboundPreInventoryAuthorization {
-                        #[cfg(feature = "nearby-discovery")]
-                        automatic_admission,
-                        deferred_custody_maintenance,
-                        event_bridge,
-                    },
-                    policy_lock,
-                    mutable_interests,
-                ),
+    match with_authenticated_contact_progress_deadline(CONTACT_EVENT_ROUTE_CACHE.scope(
+        event_route_cache,
+        CONTACT_EMISSION_GUARD.scope(
+            guard,
+            serve_session(
+                store,
+                connection,
+                credentials,
+                expected_peer,
+                InboundPreInventoryAuthorization {
+                    #[cfg(feature = "nearby-discovery")]
+                    automatic_admission,
+                    deferred_custody_maintenance,
+                    event_bridge,
+                },
+                policy_lock,
+                mutable_interests,
             ),
         ),
-    )
+    ))
     .await
     {
         Ok(Ok(receipt)) => Ok(receipt),
@@ -28385,7 +28626,7 @@ async fn serve_connection_with_forwarding(
         Err(_) => {
             close.close();
             Err(NodeError::Protocol(
-                "inbound contact exceeded its total deadline".into(),
+                "inbound contact exceeded its authenticated-progress deadline".into(),
             ))
         }
     }
@@ -32863,6 +33104,32 @@ mod tests {
         };
         assert_eq!(public, "profile-5 Blob framing failed");
         assert!(!public.contains("overflow"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_profile5_progress_extends_contact_lifetime() {
+        let started = tokio::time::Instant::now();
+        let result = with_authenticated_contact_progress_deadline(async {
+            for _ in 0..4 {
+                sleep(CONTACT_DEADLINE - Duration::from_secs(1)).await;
+                record_authenticated_contact_progress();
+            }
+            "complete"
+        })
+        .await;
+
+        assert_eq!(result, Ok("complete"));
+        assert!(started.elapsed() > CONTACT_DEADLINE * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contact_without_authenticated_progress_retains_bounded_deadline() {
+        let started = tokio::time::Instant::now();
+        let result =
+            with_authenticated_contact_progress_deadline(std::future::pending::<()>()).await;
+
+        assert_eq!(result, Err(()));
+        assert_eq!(started.elapsed(), CONTACT_DEADLINE);
     }
 
     #[test]
@@ -40903,11 +41170,16 @@ mod tests {
         assert_eq!(receipt.blob_operations, 1);
         assert_eq!(receipt.blob_variants, 1);
         assert_eq!(receipt.blob_finalized_variants, 1);
-        assert_eq!(receipt.blob_committed_chunks, 2);
-        assert!(receipt.blob_committed_file_bytes >= blob_bytes.len() as u64);
         assert_eq!(
-            receipt.blob_reserved_file_bytes,
-            receipt.blob_committed_file_bytes
+            receipt.blob_committed_chunks,
+            blob_bytes
+                .len()
+                .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES) as u64
+        );
+        assert!(receipt.blob_committed_file_bytes >= blob_bytes.len() as u64);
+        assert!(
+            receipt.blob_reserved_file_bytes >= receipt.blob_committed_file_bytes,
+            "Profile-5 quota retains its conservative fixed pack reservation"
         );
         assert_eq!(receipt.pending_blobs, 0);
         assert_eq!(receipt.blob_carrier_prefixes, 0);
@@ -44038,11 +44310,14 @@ mod tests {
         assert!(receipt.blob_operation_bytes > 0);
         assert_eq!(receipt.blob_variants, 1);
         assert_eq!(receipt.blob_finalized_variants, 1);
-        assert_eq!(receipt.blob_committed_chunks, 3);
-        assert!(receipt.blob_committed_file_bytes >= bytes.len() as u64);
         assert_eq!(
-            receipt.blob_reserved_file_bytes,
-            receipt.blob_committed_file_bytes
+            receipt.blob_committed_chunks,
+            bytes.len().div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES) as u64
+        );
+        assert!(receipt.blob_committed_file_bytes >= bytes.len() as u64);
+        assert!(
+            receipt.blob_reserved_file_bytes >= receipt.blob_committed_file_bytes,
+            "Profile-5 quota retains its conservative fixed pack reservation"
         );
         assert_eq!(receipt.pending_blobs, 0);
         assert_eq!(receipt.blob_carrier_prefixes, 0);
@@ -44108,8 +44383,8 @@ mod tests {
             assert_eq!(startup.cache.blob_claim_count(), 2);
             assert_eq!(
                 startup.cache.startup_blob_completion_audits(),
-                1,
-                "startup performs one physical completion audit per exact variant"
+                0,
+                "native Profile-5 packs use lifecycle-bound completion authentication, not legacy completion capabilities"
             );
         }
 
@@ -44649,7 +44924,15 @@ mod tests {
         assert_eq!(receipt.blob_operations, 3);
         assert_eq!(receipt.blob_variants, 3);
         assert_eq!(receipt.blob_finalized_variants, 3);
-        assert_eq!(receipt.blob_committed_chunks, 6);
+        assert_eq!(
+            receipt.blob_committed_chunks,
+            (a_bytes
+                .len()
+                .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)
+                + 2 * b_bytes
+                    .len()
+                    .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)) as u64
+        );
 
         {
             let store = Store::open_for_mission(
@@ -44660,7 +44943,11 @@ mod tests {
             let startup = open_startup_event_verifier_and_cache(&store, &restart_mission)
                 .expect("rebuild bounded three-lineage Blob cache");
             assert_eq!(startup.cache.blob_claim_count(), 3);
-            assert_eq!(startup.cache.startup_blob_completion_audits(), 3);
+            assert_eq!(
+                startup.cache.startup_blob_completion_audits(),
+                0,
+                "native Profile-5 packs use lifecycle-bound completion authentication, not legacy completion capabilities"
+            );
             assert_eq!(
                 startup.cache.startup_blob_replay_candidate_visits(),
                 2,
@@ -48666,6 +48953,29 @@ mod tests {
         plaintext: &[u8],
         ttl_ms: Option<u64>,
     ) -> BlobTransferId {
+        publish_test_profile5_pack_with_operation(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            plaintext,
+            ttl_ms,
+            b"runtime/native-profile5-crossing",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_test_profile5_pack_with_operation(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: Option<u64>,
+        operation_key: &[u8],
+    ) -> BlobTransferId {
         let initial_custody = ttl_ms.map(|_| CustodySample {
             clock_id: [0xd1; 16],
             tick_ms: 10,
@@ -48673,9 +48983,8 @@ mod tests {
         let policy = store
             .control_policy_snapshot()
             .expect("native Profile-5 source policy");
-        let operation =
-            aster_redb_store::BlobOperationKey::new(b"runtime/native-profile5-crossing".to_vec())
-                .expect("native Profile-5 operation key");
+        let operation = aster_redb_store::BlobOperationKey::new(operation_key.to_vec())
+            .expect("native Profile-5 operation key");
         let owner = aster_redb_store::BlobOperationOwner::new(sealer.identity(), operation);
         let request = aster_redb_store::BlobUploadRequest {
             owner,
@@ -48815,14 +49124,31 @@ mod tests {
                 lineage,
             )
             .expect("install native Profile-5 completion");
+        let physical_lineage = store
+            .profile5_upload_publication_binding(&reservation, &checkpoint)
+            .expect("bind native Profile-5 publication to pack");
+        let publication = aster_mesh::BlobStreamPublication::new(
+            open.open().clone(),
+            commitment.blob_id(),
+            commitment.final_custody(),
+            physical_lineage,
+        )
+        .expect("native Profile-5 publication binding");
+        let authenticated_publication = sealer
+            .seal_blob_stream_publication(&publication)
+            .expect("seal native Profile-5 publication binding");
+        let verified_publication = sealer
+            .verify_blob_stream_publication(&authenticated_publication)
+            .expect("verify native Profile-5 publication binding");
         store
-            .commit_profile5_upload_once_with_policy(
+            .commit_profile5_publication_once_with_policy(
                 &policy,
                 &reservation,
                 &checkpoint,
+                &verified_publication,
                 initial_custody.map(|sample| CustodySample {
                     clock_id: sample.clock_id,
-                    tick_ms: sample.tick_ms + 20,
+                    tick_ms: sample.tick_ms + 10,
                 }),
             )
             .expect("promote native Profile-5 publication")
@@ -51260,10 +51586,7 @@ mod tests {
         let root = root(&format!("live-blob-contact-fatal-{fault:?}"));
         let source_state = root.join("source");
         let receiver_state = root.join("receiver");
-        let source_path = root.join("source.bin");
         fs::create_dir_all(&root).expect("contact-fatal Blob root");
-        fs::write(&source_path, vec![0x6d; MAX_BLOB_NETWORK_RANGE_BYTES + 1])
-            .expect("contact-fatal Blob source");
         let services = control_test_services([0xf0 + fault as u8; 32]);
         let source_mission = IssuedMission {
             identity: services.member.identity(),
@@ -51294,37 +51617,24 @@ mod tests {
         }
         let topic = services.topic;
         let scope = services.scope;
-        let offline = with_test_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
-            Box::pin(start_node(NodeConfig {
-                state: source_state.clone(),
-                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: source_mission.credentials.clone(),
-                peers: Vec::new(),
-                mutable_interests: Default::default(),
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            })),
+        // These hooks exercise the semantic-v8/Profile-4 compatibility lane.
+        // Seed that historical storage shape directly: the public Blob API now
+        // creates only native Profile-5 packs and must not manufacture a legacy
+        // projection for a v8 contact.
+        let source_store = Store::open_for_mission(
+            source_state.join(STORE_FILE),
+            source_mission.credentials.mission_authority_id(),
         )
-        .await
-        .expect("start contact-fatal source fixture");
-        offline
-            .selected_blobs()
-            .publish(
-                live_blob_request(
-                    format!("contact-fatal-{fault:?}").as_bytes(),
-                    &topic,
-                    &scope,
-                ),
-                File::open(&source_path).expect("open contact-fatal Blob source"),
-            )
-            .await
-            .expect("publish contact-fatal Blob fixture");
-        offline
-            .shutdown()
-            .await
-            .expect("stop contact-fatal source fixture");
+        .expect("open contact-fatal source fixture");
+        publish_test_blob(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x6d; MAX_BLOB_NETWORK_RANGE_BYTES + 1],
+        );
+        drop(source_store);
 
         let target_is_source = matches!(
             fault,
@@ -52377,30 +52687,63 @@ mod tests {
     }
 
     #[test]
-    fn pre_profile5_blob_is_profile5_sender_eligible() {
-        // Mutation caught: reading the removed split stream-publication table
-        // would return no work for an ordinary pre-profile-5 canonical Blob.
+    fn public_blob_publish_is_native_profile5_sender_eligible() {
+        // Mutation caught: routing the public Rust API through the removed
+        // two-pass chunk depot creates a canonical publication with no native
+        // pack, which the semantic-v9 sender must reject.
         let services = control_test_services([0xa4; 32]);
         let state = root("canonical-profile5-inventory");
         fs::create_dir_all(&state).expect("canonical inventory state");
-        let store = Store::open_for_mission(
-            state.join(STORE_FILE),
-            services.member.mission_authority_id(),
-        )
-        .expect("canonical inventory store");
-        let mut verifier = open_test_sealer(&services.member);
-        let publication = publish_test_blob(
-            &store,
-            &mut verifier,
-            &services.topic,
-            &services.scope,
-            1,
-            b"ordinary canonical Blob predating profile 5",
+        let store = Arc::new(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("canonical inventory store"),
         );
+        let verifier = open_test_sealer(&services.member);
+        let cache = Arc::new(AuthenticatedEventRouteCache::empty(&verifier));
+        let mut node = SelectedBlobNode::from_runtime(
+            services.member.clone(),
+            Arc::clone(&store),
+            verifier,
+            store.control_head().expect("canonical control head"),
+            cache,
+            NodeCustodyClock::injected([0xd1; 16], 10, 0),
+        )
+        .expect("open public Blob publisher");
+        let result = node
+            .publish(
+                crate::application::BlobPublishRequest {
+                    operation_key: b"runtime/native-public-publish".to_vec(),
+                    topic: services.topic.clone(),
+                    scope: services.scope.clone(),
+                    priority: Priority::Routine,
+                    media_type: Some("application/octet-stream".into()),
+                    schema_id: Vec::new(),
+                },
+                &mut std::io::Cursor::new(b"ordinary native profile-5 Blob".to_vec()),
+            )
+            .expect("publish through public native API");
+        assert!(result.publication_id.is_some());
+        drop(node);
+        let mut verifier = open_test_sealer(&services.member);
         let policy = store.control_policy_snapshot().expect("canonical policy");
+        let mut retained = Vec::new();
+        store
+            .visit_retained_blob_sources(Some(&policy), |source| retained.push(source.clone()))
+            .expect("enumerate public native publication");
+        assert_eq!(retained.len(), 1);
+        assert!(matches!(
+            retained[0].retention,
+            BlobSourceRetention::Completed { .. }
+        ));
+        assert!(blob_projection_fits_profile5_bound(&retained[0].source));
+        assert_eq!(retained[0].source.blob_id.as_bytes(), result.id.as_bytes());
+        let publication = retained[0].source.transfer_id;
         let peer_verifier = open_test_sealer(&services.other);
         let peer_interest = protected_blob_interest(
-            &store,
+            store.as_ref(),
             &peer_verifier,
             &MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
                 services.topic.clone(),
@@ -52413,7 +52756,7 @@ mod tests {
         let commitments = authenticated_peer_route_commitments(&services.member, &services.other);
 
         let selected = next_canonical_blob_publication(
-            &store,
+            store.as_ref(),
             &policy,
             &mut verifier,
             services.other.identity(),
@@ -52553,19 +52896,14 @@ mod tests {
         )
         .expect("finite canonical inventory store");
         let mut verifier = open_test_sealer(&services.member);
-        let publication = publish_test_finite_blob(
+        let publication = publish_test_profile5_pack(
             &store,
             &mut verifier,
             &services.topic,
             &services.scope,
             1,
             b"finite canonical Blob awaiting profile-5 custody",
-            600_000,
-            25,
-            CustodySample {
-                clock_id: [0xa7; 16],
-                tick_ms: 0,
-            },
+            Some(600_000),
         );
         assert!(store.get_blob(publication).unwrap().is_some());
         let policy = store.control_policy_snapshot().expect("finite policy");
@@ -52601,10 +52939,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_published_blob_remains_profile4_eligible_for_v8() {
-        // Task 3 commits stream uploads through this same canonical projection;
-        // profile choice therefore depends on authenticated shape/version, not
-        // which application API produced the publication.
+    fn legacy_blob_remains_profile4_eligible_for_v8() {
+        // A retained Profile-4 publication remains available to a v8 peer, but
+        // its 64-KiB chunk projection must not be reinterpreted as a native
+        // Profile-5 pack.
         let services = control_test_services([0xa6; 32]);
         let state = root("canonical-dual-profile-eligibility");
         fs::create_dir_all(&state).expect("dual-profile state");
@@ -52628,274 +52966,24 @@ mod tests {
             .expect("dual-profile retained source");
 
         assert!(blob_projection_fits_network_bound(&retained.source));
-        assert!(blob_projection_fits_profile5_bound(&retained.source));
-
-        let mut over_profile4 = retained.source;
-        over_profile4.total_len = MAX_NETWORK_BLOB_BYTES + 1;
-        over_profile4.chunk_count = over_profile4
-            .total_len
-            .div_ceil(u64::from(over_profile4.chunk_size));
-        assert!(!blob_projection_fits_network_bound(&over_profile4));
-        assert!(blob_projection_fits_profile5_bound(&over_profile4));
+        assert!(!blob_projection_fits_profile5_bound(&retained.source));
 
         drop(store);
         fs::remove_dir_all(state).expect("dual-profile cleanup");
     }
 
-    #[test]
-    fn canonical_sender_rejects_a_completion_for_another_verified_blob() {
-        // Mutation caught: accepting Store + transfer ID, or checking only that
-        // some finalized depot exists, would let source A read variant B.
-        let services = control_test_services([0xa5; 32]);
-        let state = root("canonical-profile5-capability");
-        fs::create_dir_all(&state).expect("canonical capability state");
-        let store = Store::open_for_mission(
-            state.join(STORE_FILE),
-            services.member.mission_authority_id(),
-        )
-        .expect("canonical capability store");
-        let mut verifier = open_test_sealer(&services.member);
-        let first = publish_test_blob(
-            &store,
-            &mut verifier,
-            &services.topic,
-            &services.scope,
-            1,
-            b"canonical capability first",
-        );
-        let second = publish_test_blob(
-            &store,
-            &mut verifier,
-            &services.topic,
-            &services.scope,
-            1,
-            b"canonical capability second",
-        );
-        let first_stored = store.get_blob(first).unwrap().unwrap();
-        let first_plan = completed_test_blob_plan(&store, &mut verifier, first);
-        let second_stored = store.get_blob(second).unwrap().unwrap();
-        let second_retained = store.blob_source_projection(second).unwrap().unwrap();
-        let second_route = verifier.verify_blob(&second_stored.sealed).unwrap();
-        let BlobContentVerification::ContentVerified {
-            blob: second_blob,
-            manifest_bytes: second_manifest,
-        } = verifier
-            .verify_blob_content(second_route, &second_stored.sealed)
-            .unwrap()
-        else {
-            panic!("second canonical Blob lost content access")
-        };
-        let second_completion = store
-            .completed_retained_blob(
-                &second_retained.source,
-                second_retained.retention,
-                &second_blob,
-                &second_manifest,
-                &second_stored.sealed,
-            )
-            .expect("second canonical completion");
-
-        assert!(
-            blob_stream::CanonicalBlobSendSource::new(first_stored, first_plan, second_completion,)
-                .is_err()
-        );
-
-        drop(store);
-        fs::remove_dir_all(state).expect("canonical capability cleanup");
-    }
-
-    #[derive(Debug)]
-    struct SenderOwnershipTestReceipt {
-        carrier_zeroizations: usize,
-        extent_body_zeroizations: usize,
-        prefix_header_zeroizations: usize,
-        encoded_header_creations: usize,
-        actual_peak_live_bytes: usize,
-    }
-
-    #[derive(Debug)]
-    struct Profile5ReceiverMeasurementReceipt {
-        payload_bytes: u64,
-        wall_time_ns: u64,
-        bytes_per_second: f64,
-        mib_per_second: f64,
-        pipeline: crate::stream_pipeline::PipelineReport,
-        sender_pipeline: crate::stream_pipeline::PipelineReport,
-        sender_store_reads: u64,
-        sender_carrier_zeroizations: u64,
-        sender_extent_body_zeroizations: u64,
-        sender_prefix_header_zeroizations: u64,
-        sender_encoded_header_creations: u64,
-        sender_actual_peak_live_bytes: u64,
-        store: aster_redb_store::Profile5BatchTestCounts,
-    }
-
-    impl Profile5ReceiverMeasurementReceipt {
-        fn new(
-            payload_bytes: usize,
-            wall_time: std::time::Duration,
-            pipeline: crate::stream_pipeline::PipelineReport,
-            sender_pipeline: crate::stream_pipeline::PipelineReport,
-            sender_store_reads: u64,
-            sender_ownership: SenderOwnershipTestReceipt,
-            store: aster_redb_store::Profile5BatchTestCounts,
-        ) -> Self {
-            let payload_bytes = u64::try_from(payload_bytes).expect("profile-5 fixture size");
-            let wall_time_ns = u64::try_from(wall_time.as_nanos()).unwrap_or(u64::MAX);
-            let bytes_per_second = payload_bytes as f64 / wall_time.as_secs_f64().max(f64::EPSILON);
-            Self {
-                payload_bytes,
-                wall_time_ns,
-                bytes_per_second,
-                mib_per_second: bytes_per_second / (1024.0 * 1024.0),
-                pipeline,
-                sender_pipeline,
-                sender_store_reads,
-                sender_carrier_zeroizations: sender_ownership.carrier_zeroizations as u64,
-                sender_extent_body_zeroizations: sender_ownership.extent_body_zeroizations as u64,
-                sender_prefix_header_zeroizations: sender_ownership.prefix_header_zeroizations
-                    as u64,
-                sender_encoded_header_creations: sender_ownership.encoded_header_creations as u64,
-                sender_actual_peak_live_bytes: sender_ownership.actual_peak_live_bytes as u64,
-                store,
-            }
-        }
-
-        fn stage_line(&self, stage: crate::stream_pipeline::PipelineStage) -> String {
-            let observation = self.pipeline.stage(stage);
-            format!(
-                "{{\"items\":{},\"bytes\":{},\"queue_wait_ns\":{},\"service_ns\":{},\"output_blocked_ns\":{}}}",
-                observation.items,
-                observation.bytes,
-                observation.queue_wait_ns,
-                observation.service_ns,
-                observation.output_blocked_ns,
-            )
-        }
-
-        fn structured_line(&self) -> String {
-            format!(
-                concat!(
-                    "{{\"schema\":\"aster.profile5-receiver-measurement.v1\",",
-                    "\"payload_bytes\":{},\"wall_time_ns\":{},",
-                    "\"bytes_per_second\":{:.3},\"mib_per_second\":{:.3},",
-                    "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
-                    "\"workers\":{},\"peak_in_flight_items\":{},",
-                    "\"peak_in_flight_bytes\":{},\"peak_reorder_items\":{},",
-                    "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}},",
-                    "\"store\":{{\"durable_batches\":{},\"installed_carriers\":{},",
-                    "\"total_write_begins\":{},\"total_write_commits\":{},",
-                    "\"source_stage_write_begins\":{},\"source_stage_write_commits\":{},",
-                    "\"receipt_reservation_write_begins\":{},\"receipt_reservation_write_commits\":{},",
-                    "\"extent_write_begins\":{},\"extent_write_commits\":{},",
-                    "\"promotion_write_begins\":{},\"promotion_write_commits\":{},",
-                    "\"receipt_cleanup_write_begins\":{},\"receipt_cleanup_write_commits\":{},",
-                    "\"fallback_activation_write_begins\":{},\"fallback_activation_write_commits\":{},",
-                    "\"temp_file_syncs\":{},\"parent_directory_syncs\":{}}}}}"
-                ),
-                self.payload_bytes,
-                self.wall_time_ns,
-                self.bytes_per_second,
-                self.mib_per_second,
-                self.pipeline.accepted_items(),
-                self.pipeline.completed_items(),
-                self.pipeline.worker_count(),
-                self.pipeline.peak_in_flight_items(),
-                self.pipeline.peak_in_flight_bytes(),
-                self.pipeline.peak_reorder_items(),
-                self.stage_line(crate::stream_pipeline::PipelineStage::Admission),
-                self.stage_line(crate::stream_pipeline::PipelineStage::Map),
-                self.stage_line(crate::stream_pipeline::PipelineStage::Reorder),
-                self.stage_line(crate::stream_pipeline::PipelineStage::Sink),
-                self.store.durable_batches,
-                self.store.installed_carriers,
-                self.store.total_write_begins,
-                self.store.total_write_commits,
-                self.store.source_stage_write_begins,
-                self.store.source_stage_write_commits,
-                self.store.receipt_reservation_write_begins,
-                self.store.receipt_reservation_write_commits,
-                self.store.extent_write_begins,
-                self.store.extent_write_commits,
-                self.store.promotion_write_begins,
-                self.store.promotion_write_commits,
-                self.store.receipt_cleanup_write_begins,
-                self.store.receipt_cleanup_write_commits,
-                self.store.fallback_activation_write_begins,
-                self.store.fallback_activation_write_commits,
-                self.store.temp_file_syncs,
-                self.store.parent_directory_syncs,
-            )
-        }
-
-        fn sender_structured_line(&self) -> String {
-            format!(
-                concat!(
-                    "{{\"schema\":\"aster.profile5-sender-measurement.v1\",",
-                    "\"payload_bytes\":{},\"wall_time_ns\":{},",
-                    "\"bytes_per_second\":{:.3},\"mib_per_second\":{:.3},",
-                    "\"store\":{{\"carrier_reads\":{}}},",
-                    "\"ownership\":{{\"carrier_zeroizations\":{},",
-                    "\"extent_body_zeroizations\":{},\"prefix_header_zeroizations\":{},",
-                    "\"encoded_header_creations\":{},",
-                    "\"actual_peak_live_bytes\":{},\"live_bytes_after_join\":0}},",
-                    "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
-                    "\"workers\":{},\"peak_in_flight_items\":{},",
-                    "\"peak_in_flight_bytes\":{},\"peak_owned_bytes\":{},",
-                    "\"peak_encoding_bytes\":{},\"peak_reorder_items\":{},",
-                    "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}}}}"
-                ),
-                self.payload_bytes,
-                self.wall_time_ns,
-                self.bytes_per_second,
-                self.mib_per_second,
-                self.sender_store_reads,
-                self.sender_carrier_zeroizations,
-                self.sender_extent_body_zeroizations,
-                self.sender_prefix_header_zeroizations,
-                self.sender_encoded_header_creations,
-                self.sender_actual_peak_live_bytes,
-                self.sender_pipeline.accepted_items(),
-                self.sender_pipeline.completed_items(),
-                self.sender_pipeline.worker_count(),
-                self.sender_pipeline.peak_in_flight_items(),
-                self.sender_pipeline.peak_in_flight_bytes(),
-                self.sender_pipeline.peak_owned_bytes(),
-                self.sender_pipeline.peak_encoding_bytes(),
-                self.sender_pipeline.peak_reorder_items(),
-                Self::stage_line_for(
-                    &self.sender_pipeline,
-                    crate::stream_pipeline::PipelineStage::Admission,
-                ),
-                Self::stage_line_for(
-                    &self.sender_pipeline,
-                    crate::stream_pipeline::PipelineStage::Map,
-                ),
-                Self::stage_line_for(
-                    &self.sender_pipeline,
-                    crate::stream_pipeline::PipelineStage::Reorder,
-                ),
-                Self::stage_line_for(
-                    &self.sender_pipeline,
-                    crate::stream_pipeline::PipelineStage::Sink,
-                ),
-            )
-        }
-
-        fn stage_line_for(
-            pipeline: &crate::stream_pipeline::PipelineReport,
-            stage: crate::stream_pipeline::PipelineStage,
-        ) -> String {
-            let observation = pipeline.stage(stage);
-            format!(
-                "{{\"items\":{},\"bytes\":{},\"queue_wait_ns\":{},\"service_ns\":{},\"output_blocked_ns\":{}}}",
-                observation.items,
-                observation.bytes,
-                observation.queue_wait_ns,
-                observation.service_ns,
-                observation.output_blocked_ns,
-            )
-        }
+    #[derive(Default)]
+    struct NativeProfile5LifecycleScenario {
+        ttl_ms: Option<u64>,
+        fail_after_receives: Option<usize>,
+        preseed_equivalent_pack: bool,
+        restart_before_retry: bool,
+        expire_before_promotion: bool,
+        revoke_before_promotion: bool,
+        cancel_pending_data: bool,
+        sender_finalization_delay_ms: Option<u64>,
+        source_clock_tick_ms: u64,
+        fixture_override: Option<(&'static str, u8)>,
     }
 
     fn run_native_profile5_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -52920,7 +53008,10 @@ mod tests {
     fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None, None, false, false, None, 100, None,
+                NativeProfile5LifecycleScenario {
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -52929,13 +53020,42 @@ mod tests {
     fn finite_lifecycle_native_profile5_pack_crosses_with_custody() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(600_000),
-                None,
-                false,
-                false,
-                None,
-                100,
-                None,
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(600_000),
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
+            ),
+        ));
+    }
+
+    #[test]
+    fn native_profile5_reuses_equivalent_target_pack_without_retransmit_on_retry() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                NativeProfile5LifecycleScenario {
+                    preseed_equivalent_pack: true,
+                    restart_before_retry: true,
+                    source_clock_tick_ms: 100,
+                    fixture_override: Some(("equivalent-target-pack", 0xee)),
+                    ..Default::default()
+                },
+            ),
+        ));
+    }
+
+    #[test]
+    fn finite_native_profile5_reuses_equivalent_target_pack_and_refreshes_inbound_custody() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(600_000),
+                    preseed_equivalent_pack: true,
+                    restart_before_retry: true,
+                    source_clock_tick_ms: 100,
+                    fixture_override: Some(("finite-equivalent-target-pack", 0xef)),
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -52944,13 +53064,11 @@ mod tests {
     fn interrupted_native_profile5_pack_resumes_on_fresh_adapter() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None,
-                Some(3),
-                false,
-                false,
-                None,
-                100,
-                None,
+                NativeProfile5LifecycleScenario {
+                    fail_after_receives: Some(3),
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -52959,13 +53077,11 @@ mod tests {
     fn fully_checkpointed_native_profile5_pack_reconnect_sends_finish() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None,
-                Some(5),
-                false,
-                false,
-                None,
-                100,
-                None,
+                NativeProfile5LifecycleScenario {
+                    fail_after_receives: Some(5),
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -52974,13 +53090,12 @@ mod tests {
     fn interrupted_finite_native_profile5_pack_resumes_after_store_restart() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(600_000),
-                Some(4),
-                false,
-                false,
-                None,
-                100,
-                None,
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(600_000),
+                    fail_after_receives: Some(4),
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -52989,13 +53104,12 @@ mod tests {
     fn finite_native_profile5_pack_expiring_during_transfer_stays_invisible() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(1_000),
-                None,
-                true,
-                false,
-                None,
-                100,
-                None,
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(1_000),
+                    expire_before_promotion: true,
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -53004,7 +53118,11 @@ mod tests {
     fn revoked_native_profile5_pack_during_transfer_stays_invisible() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None, None, false, true, None, 100, None,
+                NativeProfile5LifecycleScenario {
+                    revoke_before_promotion: true,
+                    source_clock_tick_ms: 100,
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -53013,13 +53131,13 @@ mod tests {
     fn native_profile5_sender_finalization_overrun_emits_nothing_and_retries() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(600_000),
-                None,
-                false,
-                false,
-                Some(MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1),
-                100,
-                Some(("sender-finalization-overrun", 0xe9)),
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(600_000),
+                    sender_finalization_delay_ms: Some(MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1),
+                    source_clock_tick_ms: 100,
+                    fixture_override: Some(("sender-finalization-overrun", 0xe9)),
+                    ..Default::default()
+                },
             ),
         ));
     }
@@ -53028,26 +53146,46 @@ mod tests {
     fn native_profile5_sender_finalization_expiry_emits_nothing() {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(80),
-                None,
-                false,
-                false,
-                Some(60),
-                30,
-                Some(("sender-finalization-expiry", 0xeb)),
+                NativeProfile5LifecycleScenario {
+                    ttl_ms: Some(80),
+                    sender_finalization_delay_ms: Some(60),
+                    source_clock_tick_ms: 30,
+                    fixture_override: Some(("sender-finalization-expiry", 0xeb)),
+                    ..Default::default()
+                },
+            ),
+        ));
+    }
+
+    #[test]
+    fn cancelled_native_profile5_sender_closes_data_and_leaves_resumable_target() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                NativeProfile5LifecycleScenario {
+                    cancel_pending_data: true,
+                    source_clock_tick_ms: 100,
+                    fixture_override: Some(("sender-cancelled", 0xed)),
+                    ..Default::default()
+                },
             ),
         ));
     }
 
     async fn assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-        ttl_ms: Option<u64>,
-        fail_after_receives: Option<usize>,
-        expire_before_promotion: bool,
-        revoke_before_promotion: bool,
-        sender_finalization_delay_ms: Option<u64>,
-        source_clock_tick_ms: u64,
-        fixture_override: Option<(&'static str, u8)>,
+        scenario: NativeProfile5LifecycleScenario,
     ) {
+        let NativeProfile5LifecycleScenario {
+            ttl_ms,
+            fail_after_receives,
+            preseed_equivalent_pack,
+            restart_before_retry,
+            expire_before_promotion,
+            revoke_before_promotion,
+            cancel_pending_data,
+            sender_finalization_delay_ms,
+            source_clock_tick_ms,
+            fixture_override,
+        } = scenario;
         let (suffix, services_seed) = fixture_override.unwrap_or_else(|| {
             match (
                 ttl_ms.is_some(),
@@ -53079,13 +53217,35 @@ mod tests {
             Store::open_for_mission(target_state.join(STORE_FILE), authority)
                 .expect("native target store"),
         );
-        let target_stats_before = target_store
-            .blob_stats()
-            .expect("native target baseline Blob stats");
         let plaintext = (0..(2 * BLOB_STREAM_SEGMENT_BYTES + 17))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let mut source_verifier = open_test_sealer(&services.member);
+        let target_existing_variant = if preseed_equivalent_pack {
+            let mut target_pack_sealer = open_test_sealer(&services.other);
+            let existing = publish_test_profile5_pack_with_operation(
+                &target_store,
+                &mut target_pack_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                &plaintext,
+                ttl_ms,
+                b"runtime/native-profile5-equivalent-target",
+            );
+            Some(
+                target_store
+                    .get_blob(existing)
+                    .expect("equivalent target publication lookup before contact")
+                    .expect("equivalent target publication exists before contact")
+                    .variant_id,
+            )
+        } else {
+            None
+        };
+        let target_stats_before = target_store
+            .blob_stats()
+            .expect("native target baseline Blob stats");
         let publication = publish_test_profile5_pack(
             &source_store,
             &mut source_verifier,
@@ -53106,22 +53266,56 @@ mod tests {
         let source_session = source_store
             .open_profile5_pack_transfer_read(stored.variant_id)
             .expect("native source transfer lease");
-        let verified_open = source_verifier
-            .verify_blob_stream_open(source_session.authenticated_open())
-            .expect("verify native source open");
-        source_verifier
-            .verify_blob_stream_commitment(
-                &verified_open,
-                source_session.authenticated_commitment(),
+        let verified_source = source_verifier
+            .verify_blob_stream_publication_source(&stored.sealed)
+            .expect("verify native publication source");
+        let mut mismatched_projection = retained.source.clone();
+        mismatched_projection.total_len = mismatched_projection
+            .total_len
+            .checked_add(1)
+            .expect("native projection mismatch length");
+        assert!(
+            blob_stream::CanonicalBlobSendSource::new_native(
+                stored.clone(),
+                mismatched_projection,
+                retained.retention,
+                verified_source.clone(),
+                &source_session,
             )
-            .expect("verify native source commitment");
-        let publication_stream_id = verified_open.open().stream_id();
+            .is_err(),
+            "native sender capability must reject a projection from another source shape"
+        );
+        let publication_stream_id = verified_source
+            .publication()
+            .publication()
+            .open()
+            .stream_id();
+        let incoming_owner = aster_redb_store::BlobOperationOwner::new(
+            verified_source
+                .publication()
+                .publication()
+                .open()
+                .publisher(),
+            aster_redb_store::BlobOperationKey::new(
+                verified_source
+                    .publication()
+                    .publication()
+                    .open()
+                    .operation_key()
+                    .to_vec(),
+            )
+            .expect("incoming native operation key"),
+        );
+        let expected_physical_open = verified_source
+            .physical_open()
+            .authenticated_bytes()
+            .to_vec();
         let source = Arc::new(
             blob_stream::CanonicalBlobSendSource::new_native(
                 stored,
                 retained.source.clone(),
                 retained.retention,
-                verified_open,
+                verified_source,
                 &source_session,
             )
             .expect("bind native source"),
@@ -53136,20 +53330,27 @@ mod tests {
                 .mint_blob_peer_content_proof(source.scope(), source.topic(), source.key_epoch())
                 .expect("native source peer proof")
                 .wire_bytes(),
-            source_len: u32::try_from(source.authenticated_open().len())
-                .expect("native source length"),
-            source_digest: Sha256::digest(source.authenticated_open()).into(),
+            source_len: u32::try_from(source.source_record().len()).expect("native source length"),
+            source_digest: Sha256::digest(source.source_record()).into(),
             finite: ttl_ms.is_some(),
         });
         let mut receiver_job = [0_u8; 16];
         receiver_job.copy_from_slice(&offer.transfer_id[..16]);
-        let pipeline_probe =
-            (expire_before_promotion || revoke_before_promotion || fail_after_receives.is_some())
-                .then(|| {
-                    crate::stream_pipeline::PipelineTestProbe::install(
-                        crate::stream_pipeline::StreamJobId::from_bytes(receiver_job),
-                    )
-                });
+        let pipeline_probe = (expire_before_promotion
+            || revoke_before_promotion
+            || fail_after_receives.is_some()
+            || cancel_pending_data)
+            .then(|| {
+                crate::stream_pipeline::PipelineTestProbe::install(
+                    crate::stream_pipeline::StreamJobId::from_bytes(receiver_job),
+                )
+            });
+        if cancel_pending_data {
+            pipeline_probe
+                .as_ref()
+                .expect("cancelled native receiver pipeline probe")
+                .hold_workers_for_test();
+        }
         let initiator_bytes = services
             .member
             .fresh_bundle()
@@ -53165,7 +53366,7 @@ mod tests {
         let source_policy = source_store
             .control_policy_snapshot()
             .expect("native source policy");
-        let target_policy = target_store
+        let mut target_policy = target_store
             .control_policy_snapshot()
             .expect("native target policy");
         let mut policy_visible = Vec::new();
@@ -53181,13 +53382,13 @@ mod tests {
             "native source must be policy-visible before transfer: expected={retained:?}, actual={policy_visible:?}"
         );
         let mut target_verifier = open_test_sealer(&services.other);
-        let target_cache = Arc::new(AuthenticatedEventRouteCache::empty(&target_verifier));
+        let target_route_cache = Arc::new(AuthenticatedEventRouteCache::empty(&target_verifier));
         let direction = EventDirection::ToSessionResponder;
         let resumed_after_interruption = if let Some(fail_after_receives) = fail_after_receives {
             let (mut failed_sender, mut failed_receiver, failed_profile_digest) =
                 blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-            let failed_adapter = blob_stream::tests::MemoryTransportAdapter::with_receive_failure(
-                Some(fail_after_receives),
+            let failed_adapter = blob_stream::tests::SmallMtuTransportAdapter::with_receive_failure(
+                fail_after_receives,
             );
             let failed_source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
             let failed_source_guard = ContactEmissionGuard {
@@ -53219,19 +53420,21 @@ mod tests {
                         [0xe6; 32],
                     ),
                 ));
-                let failed_receive = Box::pin(CONTACT_EMISSION_GUARD.scope(
-                    failed_target_guard,
-                    blob_stream::receive_canonical_blob_profile5(
-                        &failed_adapter,
-                        Arc::clone(&target_store),
-                        &target_cache,
-                        &target_policy,
-                        &mut target_verifier,
-                        &mut failed_receiver,
-                        failed_profile_digest,
-                        direction,
-                        [0xe6; 32],
-                        &offer,
+                let failed_receive = Box::pin(CONTACT_EVENT_ROUTE_CACHE.scope(
+                    Arc::clone(&target_route_cache),
+                    CONTACT_EMISSION_GUARD.scope(
+                        failed_target_guard,
+                        blob_stream::receive_canonical_blob_profile5(
+                            &failed_adapter,
+                            Arc::clone(&target_store),
+                            &target_policy,
+                            &mut target_verifier,
+                            &mut failed_receiver,
+                            failed_profile_digest,
+                            direction,
+                            [0xe6; 32],
+                            &offer,
+                        ),
                     ),
                 ));
                 tokio::join!(failed_send, failed_receive)
@@ -53285,6 +53488,42 @@ mod tests {
             } else {
                 assert!(resumed > 0 && resumed < wire_len);
             }
+            let inspection_verifier = open_test_sealer(&services.other);
+            let inspection_cache =
+                Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
+            let mut target_node = SelectedBlobNode::from_runtime(
+                services.other.clone(),
+                Arc::clone(&target_store),
+                inspection_verifier,
+                target_store
+                    .control_head()
+                    .expect("interrupted target control head"),
+                inspection_cache,
+                NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
+            )
+            .expect("open public Blob status for interrupted native pack");
+            let inspection = target_node
+                .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                    publication_id: crate::application::BlobStreamPublicationId::from_bytes(
+                        *publication_stream_id.as_bytes(),
+                    )
+                    .expect("native publication identity"),
+                    topic: services.topic.clone(),
+                    scope: services.scope.clone(),
+                })
+                .expect("inspect interrupted native publication");
+            assert_eq!(
+                inspection.phase,
+                if fail_after_receives == 5 {
+                    crate::application::BlobPublicationPhase::ReadyToFinalize
+                } else {
+                    crate::application::BlobPublicationPhase::Receiving
+                }
+            );
+            assert!(inspection.durable_plaintext_bytes > 0);
+            assert!(inspection.durable_transfer_bytes > 0);
+            assert_eq!(inspection.blob_id, None);
+            drop(target_node);
             if ttl_ms.is_some() {
                 drop(checkpoint);
                 drop(failed);
@@ -53311,7 +53550,16 @@ mod tests {
         };
         let (mut sender_session, mut receiver_session, profile_digest) =
             blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-        let adapter = Arc::new(blob_stream::tests::MemoryTransportAdapter::new());
+        let (adapter, pending_data_control) = if cancel_pending_data {
+            let (adapter, control) =
+                blob_stream::tests::MemoryTransportAdapter::with_pending_data_send();
+            (Arc::new(adapter), Some(control))
+        } else {
+            (
+                Arc::new(blob_stream::tests::MemoryTransportAdapter::new()),
+                None,
+            )
+        };
         let nonce = [0xe2; 32];
         let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
         let source_guard = ContactEmissionGuard {
@@ -53413,24 +53661,26 @@ mod tests {
         };
         let receiver_adapter = Arc::clone(&adapter);
         let receiver_store = Arc::clone(&target_store);
-        let receiver_cache = Arc::clone(&target_cache);
         let receiver_offer = Arc::clone(&offer);
-        let receiver_inner = CONTACT_EMISSION_GUARD.scope(target_guard, async move {
-            let result = blob_stream::receive_canonical_blob_profile5(
-                receiver_adapter.as_ref(),
-                receiver_store,
-                receiver_cache.as_ref(),
-                &target_policy,
-                &mut target_verifier,
-                &mut receiver_session,
-                profile_digest,
-                direction,
-                nonce,
-                receiver_offer.as_ref(),
-            )
-            .await;
-            (result, target_verifier)
-        });
+        let receiver_route_cache = Arc::clone(&target_route_cache);
+        let receiver_inner = CONTACT_EVENT_ROUTE_CACHE.scope(
+            receiver_route_cache,
+            CONTACT_EMISSION_GUARD.scope(target_guard, async move {
+                let result = blob_stream::receive_canonical_blob_profile5(
+                    receiver_adapter.as_ref(),
+                    receiver_store,
+                    &target_policy,
+                    &mut target_verifier,
+                    &mut receiver_session,
+                    profile_digest,
+                    direction,
+                    nonce,
+                    receiver_offer.as_ref(),
+                )
+                .await;
+                (result, target_verifier)
+            }),
+        );
         let receiver_handle = if let Some(hook) = promotion_hook {
             tokio::spawn(async move {
                 blob_stream::tests::with_native_profile5_prepromotion_hook(hook, receiver_inner)
@@ -53439,6 +53689,105 @@ mod tests {
         } else {
             tokio::spawn(receiver_inner)
         };
+
+        if let Some(control) = pending_data_control {
+            control.wait_entered().await;
+            let cancellation_probe = pipeline_probe
+                .as_ref()
+                .expect("cancelled native receiver pipeline probe");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while cancellation_probe.active_workers() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native receiver map worker becomes active before cancellation");
+            sender_handle.abort();
+            let cancelled = sender_handle
+                .await
+                .expect_err("native sender task is cancelled");
+            assert!(cancelled.is_cancelled());
+            let (received, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(15), receiver_handle)
+                    .await
+                    .expect("receiver observes cancelled native DATA stream")
+                    .expect("join receiver after native sender cancellation");
+            assert!(
+                received.is_err(),
+                "receiver must reject DATA EOF before authenticated FINISH"
+            );
+            assert!(
+                adapter.data_frames_sent() >= 1,
+                "the cancelled attempt must reach the native DATA lane"
+            );
+            assert_eq!(adapter.data_part_body_lengths().len(), 2);
+            assert!(
+                target_store
+                    .get_blob(publication)
+                    .expect("cancelled native target lookup")
+                    .is_none(),
+                "cancelled native DATA must never become application-visible"
+            );
+            let (_, checkpoint) = target_store
+                .resume_blob_upload_by_publication_id(publication_stream_id)
+                .expect("load cancelled native upload")
+                .expect("cancelled native upload remains resumable");
+            assert!(
+                checkpoint.durable_pack_checkpoint().is_none(),
+                "the blocked first native DATA record must not initialize durable pack progress"
+            );
+            drop(checkpoint);
+            assert!(cancellation_probe.peak_active_workers() > 0);
+            assert_eq!(cancellation_probe.active_workers(), 0);
+            assert_eq!(
+                cancellation_probe.joined_workers(),
+                cancellation_probe.worker_exits(),
+                "cancellation must join every native receiver map worker"
+            );
+
+            drop(target_store);
+            target_store = Arc::new(
+                Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen cancelled native target store"),
+            );
+            let inspection_verifier = open_test_sealer(&services.other);
+            let inspection_cache =
+                Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
+            let mut target_node = SelectedBlobNode::from_runtime(
+                services.other.clone(),
+                Arc::clone(&target_store),
+                inspection_verifier,
+                target_store
+                    .control_head()
+                    .expect("cancelled target control head"),
+                inspection_cache,
+                NodeCustodyClock::injected([0xe5; 16], 10_000, 0),
+            )
+            .expect("open public Blob status after cancellation restart");
+            let inspection = target_node
+                .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                    publication_id: crate::application::BlobStreamPublicationId::from_bytes(
+                        *publication_stream_id.as_bytes(),
+                    )
+                    .expect("native publication identity"),
+                    topic: services.topic.clone(),
+                    scope: services.scope.clone(),
+                })
+                .expect("inspect cancelled native publication after restart");
+            assert_eq!(
+                inspection.phase,
+                crate::application::BlobPublicationPhase::AwaitingData
+            );
+            assert_eq!(inspection.durable_plaintext_bytes, 0);
+            assert_eq!(inspection.durable_transfer_bytes, 0);
+            assert_eq!(inspection.blob_id, None);
+            drop(target_node);
+            drop(target_store);
+            drop(source_store);
+            fs::remove_dir_all(source_state).expect("cancelled sender source cleanup");
+            fs::remove_dir_all(target_state).expect("cancelled sender target cleanup");
+            return;
+        }
 
         if sender_finalization_delay_ms.is_some() {
             let (sent, received) =
@@ -53487,8 +53836,8 @@ mod tests {
                 "pre-emission rejection must not consume target Blob capacity"
             );
             let source_after_rejection = source_store.get_blob(publication);
-            if sender_finalization_delay_ms
-                .is_some_and(|delay| delay > MAX_CUSTODY_FINALIZATION_CHARGE_MS)
+            if let Some(finalization_delay_ms) = sender_finalization_delay_ms
+                .filter(|delay| *delay > MAX_CUSTODY_FINALIZATION_CHARGE_MS)
             {
                 assert!(
                     source_after_rejection
@@ -53505,7 +53854,7 @@ mod tests {
                 let retry_source_live =
                     Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
                 let retry_source_tick = source_clock_tick_ms
-                    .checked_add(sender_finalization_delay_ms.expect("finalization delay"))
+                    .checked_add(finalization_delay_ms)
                     .and_then(|tick| tick.checked_add(1))
                     .expect("fresh retry source clock remains bounded");
                 let retry_source_guard = ContactEmissionGuard {
@@ -53541,19 +53890,21 @@ mod tests {
                                     retry_nonce,
                                 ),
                             )),
-                            Box::pin(CONTACT_EMISSION_GUARD.scope(
-                                retry_target_guard,
-                                blob_stream::receive_canonical_blob_profile5(
-                                    &retry_adapter,
-                                    Arc::clone(&target_store),
-                                    &target_cache,
-                                    &target_policy,
-                                    &mut target_verifier,
-                                    &mut retry_receiver_session,
-                                    retry_profile_digest,
-                                    direction,
-                                    retry_nonce,
-                                    &offer,
+                            Box::pin(CONTACT_EVENT_ROUTE_CACHE.scope(
+                                Arc::clone(&target_route_cache),
+                                CONTACT_EMISSION_GUARD.scope(
+                                    retry_target_guard,
+                                    blob_stream::receive_canonical_blob_profile5(
+                                        &retry_adapter,
+                                        Arc::clone(&target_store),
+                                        &target_policy,
+                                        &mut target_verifier,
+                                        &mut retry_receiver_session,
+                                        retry_profile_digest,
+                                        direction,
+                                        retry_nonce,
+                                        &offer,
+                                    ),
                                 ),
                             ))
                         )
@@ -53577,11 +53928,10 @@ mod tests {
                 );
             } else {
                 assert!(
-                    matches!(
-                        source_after_rejection,
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ),
-                    "elapsed finite source must retire before emission: {source_after_rejection:?}"
+                    source_after_rejection
+                        .expect("source lookup after finalization expiry")
+                        .is_some(),
+                    "carrier-adjacent expiry must suppress emission without deleting the durable source outside lifecycle maintenance"
                 );
             }
             drop(target_store);
@@ -53649,7 +53999,13 @@ mod tests {
             tokio::join!(sender_handle, receiver_handle)
         })
         .await
-        .expect("native Profile-5 crossing remains bounded");
+        .unwrap_or_else(|_| {
+            panic!(
+                "native Profile-5 crossing remains bounded: data_frames_sent={}, data_part_body_lengths={:?}",
+                adapter.data_frames_sent(),
+                adapter.data_part_body_lengths(),
+            )
+        });
         let sent = sent
             .expect("join native Profile-5 sender")
             .expect("native Profile-5 sender");
@@ -53661,9 +54017,18 @@ mod tests {
         assert_eq!(sent.wire_bytes, received.wire_bytes);
         assert_eq!(sent.resumed_from, resumed_after_interruption);
         assert_eq!(received.resumed_from, resumed_after_interruption);
+        let target_incoming_transfer = if preseed_equivalent_pack {
+            target_store
+                .blob_for_owner_with_policy(&target_policy, &incoming_owner)
+                .expect("native target semantic owner lookup after promotion")
+                .expect("native target semantic publication after promotion")
+                .transfer_id
+        } else {
+            publication
+        };
         let first_finite_lifetime = ttl_ms.map(|ttl_ms| {
             let evidence = target_store
-                .test_blob_finite_lifetime_evidence(publication)
+                .test_blob_finite_lifetime_evidence(target_incoming_transfer)
                 .expect("native finite lifetime after first promotion")
                 .expect("native finite publication after first promotion");
             assert_eq!(evidence.0, ttl_ms);
@@ -53682,7 +54047,7 @@ mod tests {
             Box::pin(async {
                 let digest_before_failed_retry = target_store.test_blob_logical_digest();
                 let lifetime_before_failed_retry = target_store
-                    .test_blob_finite_lifetime_evidence(publication)
+                    .test_blob_finite_lifetime_evidence(target_incoming_transfer)
                     .expect("finite lifetime before failed native retry")
                     .expect("finite publication before failed native retry");
                 let failed_retry_adapter =
@@ -53729,19 +54094,21 @@ mod tests {
                                     [0xe4; 32],
                                 ),
                             )),
-                            Box::pin(CONTACT_EMISSION_GUARD.scope(
-                                failed_retry_target_guard,
-                                blob_stream::receive_canonical_blob_profile5(
-                                    &failed_retry_adapter,
-                                    Arc::clone(&target_store),
-                                    &target_cache,
-                                    &target_policy,
-                                    &mut target_verifier,
-                                    &mut failed_retry_receiver_session,
-                                    failed_retry_profile_digest,
-                                    direction,
-                                    [0xe4; 32],
-                                    &offer,
+                            Box::pin(CONTACT_EVENT_ROUTE_CACHE.scope(
+                                Arc::clone(&target_route_cache),
+                                CONTACT_EMISSION_GUARD.scope(
+                                    failed_retry_target_guard,
+                                    blob_stream::receive_canonical_blob_profile5(
+                                        &failed_retry_adapter,
+                                        Arc::clone(&target_store),
+                                        &target_policy,
+                                        &mut target_verifier,
+                                        &mut failed_retry_receiver_session,
+                                        failed_retry_profile_digest,
+                                        direction,
+                                        [0xe4; 32],
+                                        &offer,
+                                    ),
                                 ),
                             ))
                         )
@@ -53759,7 +54126,7 @@ mod tests {
                 );
                 assert_eq!(
                     target_store
-                        .test_blob_finite_lifetime_evidence(publication)
+                        .test_blob_finite_lifetime_evidence(target_incoming_transfer)
                         .expect("finite lifetime after failed native retry")
                         .expect("finite publication after failed native retry"),
                     lifetime_before_failed_retry,
@@ -53767,6 +54134,17 @@ mod tests {
                 );
             })
             .await;
+        }
+
+        if restart_before_retry {
+            drop(target_store);
+            target_store = Arc::new(
+                Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen promoted native target before retry"),
+            );
+            target_policy = target_store
+                .control_policy_snapshot()
+                .expect("reopened native target policy before retry");
         }
 
         let (retry_adapter, retry_sent, retry_received) = Box::pin(async {
@@ -53806,19 +54184,21 @@ mod tests {
                                 retry_nonce,
                             ),
                         )),
-                        Box::pin(CONTACT_EMISSION_GUARD.scope(
-                            retry_target_guard,
-                            blob_stream::receive_canonical_blob_profile5(
-                                &retry_adapter,
-                                Arc::clone(&target_store),
-                                &target_cache,
-                                &target_policy,
-                                &mut target_verifier,
-                                &mut retry_receiver_session,
-                                retry_profile_digest,
-                                direction,
-                                retry_nonce,
-                                &offer,
+                        Box::pin(CONTACT_EVENT_ROUTE_CACHE.scope(
+                            Arc::clone(&target_route_cache),
+                            CONTACT_EMISSION_GUARD.scope(
+                                retry_target_guard,
+                                blob_stream::receive_canonical_blob_profile5(
+                                    &retry_adapter,
+                                    Arc::clone(&target_store),
+                                    &target_policy,
+                                    &mut target_verifier,
+                                    &mut retry_receiver_session,
+                                    retry_profile_digest,
+                                    direction,
+                                    retry_nonce,
+                                    &offer,
+                                ),
                             ),
                         ))
                     )
@@ -53838,7 +54218,7 @@ mod tests {
         assert!(retry_received.pipeline.is_none());
         let retry_finite_lifetime = first_finite_lifetime.map(|first| {
             let retried = target_store
-                .test_blob_finite_lifetime_evidence(publication)
+                .test_blob_finite_lifetime_evidence(target_incoming_transfer)
                 .expect("native finite lifetime after exact retry")
                 .expect("native finite publication after exact retry");
             assert_eq!(retried.0, first.0);
@@ -53857,9 +54237,55 @@ mod tests {
         });
 
         let target_blob = target_store
-            .get_blob(publication)
+            .get_blob(target_incoming_transfer)
             .expect("native target lookup")
             .expect("native target publication promoted");
+        if let Some(existing_variant) = target_existing_variant {
+            assert_ne!(
+                target_blob.transfer_id, publication,
+                "canonical substitution must retain the target's physical wrapper identity"
+            );
+            assert_eq!(target_blob.variant_id, existing_variant);
+        }
+        let inspection_verifier = open_test_sealer(&services.other);
+        let inspection_cache = Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
+        let mut target_node = SelectedBlobNode::from_runtime(
+            services.other.clone(),
+            Arc::clone(&target_store),
+            inspection_verifier,
+            target_store
+                .control_head()
+                .expect("completed native target control head"),
+            inspection_cache,
+            NodeCustodyClock::injected([0xe5; 16], 20_000, 0),
+        )
+        .expect("open public Blob status for completed native pack");
+        let inspection = target_node
+            .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                publication_id: crate::application::BlobStreamPublicationId::from_bytes(
+                    *publication_stream_id.as_bytes(),
+                )
+                .expect("completed native publication identity"),
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+            })
+            .expect("inspect completed incoming native publication");
+        assert_eq!(
+            inspection.phase,
+            crate::application::BlobPublicationPhase::Available
+        );
+        assert_eq!(inspection.plaintext_total_bytes, plaintext.len() as u64);
+        assert_eq!(
+            inspection.total_units,
+            plaintext.len().div_ceil(BLOB_STREAM_SEGMENT_BYTES) as u64
+        );
+        assert_eq!(
+            inspection.blob_id,
+            Some(crate::application::BlobId::from_bytes(
+                *target_blob.blob_id.as_bytes()
+            ))
+        );
+        drop(target_node);
         let source_blob = source_store
             .get_blob(publication)
             .expect("native source lookup after crossing")
@@ -53880,7 +54306,9 @@ mod tests {
                 .expect("read native target record");
             match (source_record, target_record) {
                 (Some(source_record), Some(target_record)) => {
-                    assert_eq!(source_record.as_bytes(), target_record.as_bytes());
+                    if !preseed_equivalent_pack {
+                        assert_eq!(source_record.as_bytes(), target_record.as_bytes());
+                    }
                     record_lengths.push(source_record.as_bytes().len());
                 }
                 (None, None) => break,
@@ -53922,21 +54350,32 @@ mod tests {
         drop(target_store);
         let reopened_target = Store::open_for_mission(target_state.join(STORE_FILE), authority)
             .expect("reopen native target store");
-        let restarted = reopened_target
-            .get_blob(publication)
-            .expect("restart native target lookup")
-            .expect("native target publication survives restart");
+        let reopened_policy = reopened_target
+            .control_policy_snapshot()
+            .expect("reopened native target policy");
+        let restarted = if preseed_equivalent_pack {
+            reopened_target
+                .blob_for_owner_with_policy(&reopened_policy, &incoming_owner)
+                .expect("restart native target semantic owner lookup")
+                .expect("native target semantic publication survives restart")
+        } else {
+            reopened_target
+                .get_blob(publication)
+                .expect("restart native target lookup")
+                .expect("native target publication survives restart")
+        };
         let restarted_pack = reopened_target
             .open_profile5_pack_transfer_read(restarted.variant_id)
             .expect("native target pack survives restart");
-        assert_eq!(
-            restarted_pack.authenticated_open(),
-            source.authenticated_open()
-        );
+        if preseed_equivalent_pack {
+            assert_ne!(restarted_pack.authenticated_open(), expected_physical_open);
+        } else {
+            assert_eq!(restarted_pack.authenticated_open(), expected_physical_open);
+        }
         if let Some(expected) = retry_finite_lifetime {
             assert_eq!(
                 reopened_target
-                    .test_blob_finite_lifetime_evidence(publication)
+                    .test_blob_finite_lifetime_evidence(restarted.transfer_id)
                     .expect("reopened native finite lifetime")
                     .expect("reopened native finite publication"),
                 expected,
@@ -53948,1423 +54387,6 @@ mod tests {
         drop(source_store);
         fs::remove_dir_all(source_state).expect("native Profile-5 source cleanup");
         fs::remove_dir_all(target_state).expect("native Profile-5 target cleanup");
-    }
-
-    async fn assert_completed_canonical_blob_crossing(
-        sustained_pipeline_bytes: usize,
-    ) -> Profile5ReceiverMeasurementReceipt {
-        let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
-        let sustained_pipeline = vec![0x6bu8; sustained_pipeline_bytes];
-        let mut pipeline_measurement = None;
-        for (label, plaintext, finite) in [
-            ("nonempty", multi_extent.as_slice(), false),
-            ("pipeline", sustained_pipeline.as_slice(), false),
-            ("sink-failure", multi_extent.as_slice(), false),
-            ("sender-map-failure", multi_extent.as_slice(), false),
-            ("sender-extent-failure", multi_extent.as_slice(), false),
-            ("sender-auth-failure", multi_extent.as_slice(), false),
-            ("sender-transport-failure", multi_extent.as_slice(), false),
-            (
-                "sender-cancelled-send",
-                sustained_pipeline.as_slice(),
-                false,
-            ),
-            ("empty", b"".as_slice(), false),
-            (
-                "finite",
-                b"finite canonical profile-5 production crossing".as_slice(),
-                true,
-            ),
-        ] {
-            let services = control_test_services([0xa8; 32]);
-            let source_state = root(&format!("canonical-v9-source-{label}"));
-            let target_state = root(&format!("canonical-v9-target-{label}"));
-            fs::create_dir_all(&source_state).expect("canonical v9 source state");
-            fs::create_dir_all(&target_state).expect("canonical v9 target state");
-            let authority = services.member.mission_authority_id();
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                    .expect("canonical v9 source store"),
-            );
-            let mut target_store = Arc::new(
-                Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("canonical v9 target store"),
-            );
-            let target_before = target_store
-                .blob_stats()
-                .expect("target capacity before transfer");
-            let mut source_verifier = open_test_sealer(&services.member);
-            let publication = if finite {
-                publish_test_finite_blob(
-                    &source_store,
-                    &mut source_verifier,
-                    &services.topic,
-                    &services.scope,
-                    1,
-                    plaintext,
-                    600_000,
-                    25,
-                    CustodySample {
-                        clock_id: [0xb1; 16],
-                        tick_ms: 0,
-                    },
-                )
-            } else {
-                publish_test_blob(
-                    &source_store,
-                    &mut source_verifier,
-                    &services.topic,
-                    &services.scope,
-                    1,
-                    plaintext,
-                )
-            };
-            let retained = source_store
-                .blob_source_projection(publication)
-                .expect("canonical v9 source projection")
-                .expect("canonical v9 retained source");
-            let stored = source_store
-                .get_blob(publication)
-                .expect("canonical v9 source lookup")
-                .expect("canonical v9 source exists");
-            let route = source_verifier
-                .verify_blob(&stored.sealed)
-                .expect("canonical v9 source route");
-            let BlobContentVerification::ContentVerified {
-                blob,
-                manifest_bytes,
-            } = source_verifier
-                .verify_blob_content(route, &stored.sealed)
-                .expect("canonical v9 source content")
-            else {
-                panic!("canonical v9 source lost content access")
-            };
-            let plan = blob
-                .transfer_plan(&manifest_bytes)
-                .expect("canonical v9 source plan");
-            let wire_shape = aster_mesh::profile5_canonical_wire_shape(&plan)
-                .expect("canonical v9 ABX1 wire shape");
-            let canonical_chunk_count = plan.manifest().chunk_count();
-            if matches!(label, "nonempty" | "pipeline") {
-                assert!(plan.manifest().chunk_count() > 2);
-                assert!(
-                    wire_shape.checkpoints().len() > 2,
-                    "must span multiple extents"
-                );
-                assert!(
-                    wire_shape.checkpoints()[1].next_chunk_index > 1,
-                    "first extent must batch multiple carriers"
-                );
-            }
-            assert_eq!(blob.mission_authority_id(), authority);
-            assert_eq!(plan.source_envelope().into_bytes(), blob.envelope_id());
-            assert_eq!(plan.manifest(), blob.manifest());
-            assert_eq!(plan.manifest_digest(), blob.manifest_digest());
-            assert_eq!(plan.physical_lineage(), blob.physical_lineage());
-            let completion = source_store
-                .completed_retained_blob(
-                    &retained.source,
-                    retained.retention,
-                    &blob,
-                    &manifest_bytes,
-                    &stored.sealed,
-                )
-                .expect("canonical v9 retained completion");
-            let published_blob_id = *blob.blob_id().as_bytes();
-            let source = if finite {
-                blob_stream::CanonicalBlobSendSource::new_with_lifetime(
-                    stored,
-                    plan,
-                    completion,
-                    blob,
-                    retained.source.clone(),
-                    retained.retention,
-                )
-            } else {
-                blob_stream::CanonicalBlobSendSource::new(stored, plan, completion)
-            }
-            .expect("canonical v9 send authority");
-            let offer = BlobStreamSourceOfferV1 {
-                transfer_id: *source.publication().as_bytes(),
-                topic: source.topic().clone(),
-                scope: source.scope().clone(),
-                key_epoch: source.key_epoch(),
-                content_proof: source_verifier
-                    .mint_blob_peer_content_proof(
-                        source.scope(),
-                        source.topic(),
-                        source.key_epoch(),
-                    )
-                    .expect("canonical v9 source proof")
-                    .wire_bytes(),
-                source_len: u32::try_from(source.authenticated_open().len())
-                    .expect("canonical v9 source length"),
-                source_digest: Sha256::digest(source.authenticated_open()).into(),
-                finite: source.is_finite(),
-            };
-            let initiator_bytes = services
-                .member
-                .fresh_bundle()
-                .expect("canonical v9 initiator bundle")
-                .to_bytes()
-                .expect("encode canonical v9 initiator bundle");
-            let responder_bytes = services
-                .other
-                .fresh_bundle()
-                .expect("canonical v9 responder bundle")
-                .to_bytes()
-                .expect("encode canonical v9 responder bundle");
-            let (mut sender_session, mut receiver_session, profile_digest) =
-                blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-            let (adapter, pending_data_send): (
-                Box<dyn crate::stream_transport::StreamTransportAdapter>,
-                Option<blob_stream::tests::PendingDataSendControl>,
-            ) = if label == "nonempty" {
-                // Persist the first of multiple canonical extents, then lose
-                // the connection before the second extent is received.
-                (
-                    Box::new(blob_stream::tests::SmallMtuTransportAdapter::with_receive_failure(3)),
-                    None,
-                )
-            } else if label == "empty" {
-                // OPEN and empty SOURCE staging succeed; disconnect before
-                // FINISH so the exact (0, 0) pending receipt must reopen.
-                (
-                    Box::new(
-                        blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2)),
-                    ),
-                    None,
-                )
-            } else if label == "sender-cancelled-send" {
-                let (adapter, control) =
-                    blob_stream::tests::MemoryTransportAdapter::with_pending_data_send();
-                (Box::new(adapter), Some(control))
-            } else {
-                (
-                    Box::new(blob_stream::tests::MemoryTransportAdapter::new()),
-                    None,
-                )
-            };
-            let source_policy = source_store
-                .control_policy_snapshot()
-                .expect("canonical v9 source policy");
-            if label == "sender-map-failure" {
-                source_store.fail_profile5_sender_carrier_read_at_for_test(2);
-            }
-            let target_policy = target_store
-                .control_policy_snapshot()
-                .expect("canonical v9 target policy");
-            let subscription = target_store
-                .create_blob_subscription_with_policy(
-                    &target_policy,
-                    &BlobSubscriptionKey::new(
-                        format!("canonical-v9-subscription-{label}").into_bytes(),
-                    )
-                    .expect("canonical v9 subscription key"),
-                    BlobSubscriptionSpec {
-                        topic: services.topic.clone(),
-                        scope: services.scope.clone(),
-                        include_descendant_scopes: false,
-                    },
-                )
-                .expect("canonical v9 subscription");
-            let mut target_verifier = open_test_sealer(&services.other);
-            let target_cache = AuthenticatedEventRouteCache::empty(&target_verifier);
-            let attempt_nonce = [0xa9; 32];
-            let direction = EventDirection::ToSessionResponder;
-            let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
-            let source_guard = ContactEmissionGuard {
-                captured: source_live.snapshot().expect("source emission snapshot"),
-                live: source_live,
-                custody_clock: NodeCustodyClock::injected([0xb1; 16], 100, 0),
-            };
-            let target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
-            let target_guard = ContactEmissionGuard {
-                captured: target_live.snapshot().expect("target emission snapshot"),
-                live: target_live,
-                custody_clock: NodeCustodyClock::injected([0xb2; 16], 1_000, 0),
-            };
-            let mut pipeline_job = [0u8; 16];
-            pipeline_job.copy_from_slice(&offer.transfer_id[..16]);
-            let pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
-                crate::stream_pipeline::StreamJobId::from_bytes(pipeline_job),
-            );
-            let mut sender_pipeline_job = pipeline_job;
-            sender_pipeline_job[0] ^= 0x80;
-            let sender_pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
-                crate::stream_pipeline::StreamJobId::from_bytes(sender_pipeline_job),
-            );
-            sender_pipeline_probe.inject_sender_sink_failure(match label {
-                "sender-extent-failure" => 1,
-                "sender-auth-failure" => 2,
-                "sender-transport-failure" => 3,
-                _ => 0,
-            });
-            let sender_send_barrier = if label == "pipeline" {
-                sender_pipeline_probe.block_sender_send_for_test();
-                let probe = sender_pipeline_probe.clone();
-                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
-                Some(tokio::spawn(async move {
-                    probe.wait_sender_send_entered().await;
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while probe.prepared_sender_carriers() <= first_extent_end
-                        && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                    let prepared = probe.prepared_sender_carriers();
-                    probe.release_sender_send();
-                    assert!(
-                        prepared > first_extent_end,
-                        "carrier N+1 must be prepared while send_data_parts for extent N is blocked"
-                    );
-                }))
-            } else {
-                None
-            };
-            let precommit_barrier = if label == "sink-failure" {
-                let (entered, release) = target_store.install_profile5_batch_precommit_gate();
-                let probe = pipeline_probe.clone();
-                Some(std::thread::spawn(move || {
-                    entered
-                        .recv_timeout(std::time::Duration::from_secs(10))
-                        .expect("first extent reached the filesystem-sync/redb-commit boundary");
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    let target_extents = 2;
-                    while probe.received_extents() < target_extents
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::yield_now();
-                    }
-                    let received = probe.received_extents();
-                    release
-                        .send(label != "sink-failure")
-                        .expect("release first extent durability barrier");
-                    received
-                }))
-            } else {
-                None
-            };
-
-            let transfer_started = std::time::Instant::now();
-            let data_header_encodings_before =
-                crate::stream_transfer::test_data_header_encoding_count();
-            let sender_future = CONTACT_EMISSION_GUARD.scope(
-                source_guard,
-                blob_stream::send_canonical_blob_profile5(
-                    adapter.as_ref(),
-                    Arc::clone(&source_store),
-                    &source_policy,
-                    &source,
-                    &mut sender_session,
-                    profile_digest,
-                    direction,
-                    attempt_nonce,
-                ),
-            );
-            let receiver_future = CONTACT_EMISSION_GUARD.scope(
-                target_guard,
-                blob_stream::receive_canonical_blob_profile5(
-                    adapter.as_ref(),
-                    Arc::clone(&target_store),
-                    &target_cache,
-                    &target_policy,
-                    &mut target_verifier,
-                    &mut receiver_session,
-                    profile_digest,
-                    direction,
-                    attempt_nonce,
-                    &offer,
-                ),
-            );
-            if let Some(control) = pending_data_send {
-                let mut sender_future = Box::pin(sender_future);
-                let mut receiver_future = Box::pin(receiver_future);
-                tokio::select! {
-                    () = control.wait_entered() => {}
-                    result = &mut sender_future => panic!("sender completed before pending DATA cancellation: {result:?}"),
-                    result = &mut receiver_future => panic!("receiver completed before pending DATA cancellation: {result:?}"),
-                }
-                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                while sender_pipeline_probe.prepared_sender_carriers() <= first_extent_end
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::task::yield_now().await;
-                }
-                assert!(
-                    sender_pipeline_probe.prepared_sender_carriers() > first_extent_end,
-                    "production cancellation fixture must retain prepared carrier N+1 while send_data_parts is pending"
-                );
-                drop(sender_future);
-                let receiver_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), &mut receiver_future)
-                        .await
-                        .expect("receiver observes EOF after cancelled pending DATA send");
-                assert!(receiver_result.is_err());
-                assert!(
-                    target_store
-                        .get_blob(publication)
-                        .expect("cancelled sender target lookup")
-                        .is_none(),
-                    "cancelled pending DATA must never promote a Blob"
-                );
-                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
-                assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
-                assert_eq!(sender_pipeline_probe.sender_prefix_header_zeroizations(), 3);
-                assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 1);
-                assert_eq!(
-                    crate::stream_transfer::test_data_header_encoding_count()
-                        - data_header_encodings_before,
-                    sender_pipeline_probe.sender_encoded_header_creations(),
-                    "production cancellation creates no uncharged duplicate DATA header"
-                );
-                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
-                assert!(sender_pipeline_probe.cleanup_observed());
-                assert!(sender_pipeline_probe.cancellation_signalled());
-                assert!(sender_pipeline_probe.channels_closed());
-                assert_eq!(
-                    sender_pipeline_probe.sender_producer_exits(),
-                    sender_pipeline_probe.sender_producer_joins(),
-                    "sender admission producer must be structurally joined"
-                );
-                assert_eq!(sender_pipeline_probe.sender_producer_exits(), 1);
-                assert_eq!(sender_pipeline_probe.sender_producer_starts(), 1);
-                assert!(sender_pipeline_probe.sender_partition_channel_closed());
-                assert_eq!(sender_pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    sender_pipeline_probe.worker_exits(),
-                    sender_pipeline_probe.joined_workers()
-                );
-                assert_eq!(sender_pipeline_probe.available_item_permits(), 128);
-                assert_eq!(
-                    sender_pipeline_probe.available_byte_permits(),
-                    4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
-                );
-                drop(receiver_future);
-                drop((source_store, target_store));
-                fs::remove_dir_all(source_state).expect("cancelled sender source cleanup");
-                fs::remove_dir_all(target_state).expect("cancelled sender target cleanup");
-                continue;
-            }
-            let (first_sender, first_receiver) = tokio::join!(sender_future, receiver_future);
-            let transfer_wall_time = transfer_started.elapsed();
-            if let Some(barrier) = sender_send_barrier {
-                barrier.await.expect("sender send barrier task");
-            }
-            let first = match (first_sender, first_receiver) {
-                (Ok(sent), Ok(received)) => Ok((sent, received)),
-                (Err(error), _) | (_, Err(error)) => Err(error),
-            };
-            if let Some(barrier) = precommit_barrier {
-                let received = barrier.join().expect("precommit barrier thread");
-                assert!(
-                    received >= 2,
-                    "extent N+1 must be received before extent N durability is released"
-                );
-            }
-            if label == "sink-failure" {
-                assert!(
-                    first.is_err(),
-                    "injected sink failure must fail the attempt"
-                );
-                let (_, durable) = target_store
-                    .resume_profile5_receipt(publication)
-                    .expect("sink-failure receipt lookup")
-                    .expect("sink-failure receipt remains resumable");
-                assert_eq!(durable, aster_redb_store::BlobStreamResume::default());
-                assert!(pipeline_probe.mapped_ciphertext_zeroizations() > 0);
-                assert!(pipeline_probe.cleanup_observed());
-                assert!(pipeline_probe.cancellation_signalled());
-                assert_eq!(pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    pipeline_probe.worker_exits(),
-                    pipeline_probe.joined_workers()
-                );
-                let failed_counts = target_store.profile5_batch_test_counts();
-                assert_eq!(
-                    (
-                        failed_counts.total_write_begins,
-                        failed_counts.total_write_commits,
-                        failed_counts.source_stage_write_begins,
-                        failed_counts.source_stage_write_commits,
-                        failed_counts.receipt_reservation_write_begins,
-                        failed_counts.receipt_reservation_write_commits,
-                        failed_counts.extent_write_begins,
-                        failed_counts.extent_write_commits,
-                        failed_counts.promotion_write_begins,
-                        failed_counts.promotion_write_commits,
-                        failed_counts.receipt_cleanup_write_begins,
-                        failed_counts.receipt_cleanup_write_commits,
-                    ),
-                    (2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0),
-                    "sink failure stops after stage/reservation and before extent metadata, promotion, or cleanup writes"
-                );
-                drop((source_store, target_store));
-                fs::remove_dir_all(source_state).expect("sink-failure source cleanup");
-                fs::remove_dir_all(target_state).expect("sink-failure target cleanup");
-                continue;
-            }
-            if matches!(
-                label,
-                "sender-map-failure"
-                    | "sender-extent-failure"
-                    | "sender-auth-failure"
-                    | "sender-transport-failure"
-            ) {
-                assert!(
-                    first.is_err(),
-                    "injected sender failure must fail the attempt"
-                );
-                let stage = first.as_ref().expect_err("sender failure").stage();
-                let source = std::error::Error::source(first.as_ref().expect_err("sender failure"))
-                    .expect("sender failure retains its concrete source");
-                assert_eq!(
-                    stage,
-                    match label {
-                        "sender-map-failure" => blob_stream::BlobNetworkStage::Verification,
-                        "sender-extent-failure" => blob_stream::BlobNetworkStage::Framing,
-                        "sender-auth-failure" => blob_stream::BlobNetworkStage::Authentication,
-                        "sender-transport-failure" => blob_stream::BlobNetworkStage::Transport,
-                        _ => unreachable!(),
-                    }
-                );
-                match label {
-                    "sender-map-failure" => assert!(
-                        source
-                            .downcast_ref::<aster_redb_store::StoreError>()
-                            .is_some()
-                    ),
-                    "sender-extent-failure" => assert!(
-                        source
-                            .downcast_ref::<blob_stream::InjectedExtentEncodeError>()
-                            .is_some()
-                    ),
-                    "sender-auth-failure" => assert!(
-                        source
-                            .downcast_ref::<blob_stream::InjectedDataAuthenticationError>()
-                            .is_some()
-                    ),
-                    "sender-transport-failure" => assert!(
-                        source
-                            .downcast_ref::<crate::stream_transport::StreamTransportError>()
-                            .is_some()
-                    ),
-                    _ => unreachable!(),
-                }
-                assert!(
-                    target_store
-                        .get_blob(publication)
-                        .expect("sender-failure target lookup")
-                        .is_none()
-                );
-                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
-                assert!(sender_pipeline_probe.cleanup_observed());
-                assert!(sender_pipeline_probe.cancellation_signalled());
-                assert!(sender_pipeline_probe.channels_closed());
-                assert_eq!(sender_pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    sender_pipeline_probe.worker_exits(),
-                    sender_pipeline_probe.joined_workers()
-                );
-                assert_eq!(sender_pipeline_probe.available_item_permits(), 128);
-                assert_eq!(
-                    sender_pipeline_probe.available_byte_permits(),
-                    4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
-                );
-                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
-                assert!(
-                    sender_pipeline_probe.sender_peak_live_bytes()
-                        <= blob_stream::PROFILE5_SENDER_OWNED_BYTES
-                );
-                if label != "sender-map-failure" {
-                    assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
-                }
-                if matches!(label, "sender-auth-failure" | "sender-transport-failure") {
-                    assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 1);
-                    assert_eq!(
-                        sender_pipeline_probe.sender_prefix_header_zeroizations(),
-                        if label == "sender-auth-failure" { 1 } else { 3 }
-                    );
-                } else {
-                    assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 0);
-                }
-                assert_eq!(
-                    crate::stream_transfer::test_data_header_encoding_count()
-                        - data_header_encodings_before,
-                    sender_pipeline_probe.sender_encoded_header_creations(),
-                    "fault path creates no uncharged duplicate DATA header"
-                );
-                drop((source_store, target_store));
-                fs::remove_dir_all(source_state).expect("sender-failure source cleanup");
-                fs::remove_dir_all(target_state).expect("sender-failure target cleanup");
-                continue;
-            }
-            let (sent, received, capacity_chain) = if label == "nonempty" {
-                assert!(
-                    first.is_err(),
-                    "mid-DATA disconnect must interrupt transfer"
-                );
-                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
-                assert!(sender_pipeline_probe.cleanup_observed());
-                assert!(sender_pipeline_probe.cancellation_signalled());
-                assert!(sender_pipeline_probe.channels_closed());
-                assert_eq!(sender_pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    sender_pipeline_probe.worker_exits(),
-                    sender_pipeline_probe.joined_workers(),
-                    "a transport failure must join every sender map worker before returning"
-                );
-                assert!(
-                    target_store
-                        .get_blob(publication)
-                        .expect("partial lookup")
-                        .is_none()
-                );
-                let (_, partial) = target_store
-                    .resume_profile5_receipt(publication)
-                    .expect("partial receipt lookup")
-                    .expect("partial receipt exists");
-                assert!(
-                    partial.durable_wire_offset() > 0,
-                    "received_extents={} receiver_ops={:?} sender_prepared={}",
-                    pipeline_probe.received_extents(),
-                    target_store.profile5_batch_test_counts(),
-                    sender_pipeline_probe.prepared_sender_carriers(),
-                );
-                assert!(partial.durable_wire_offset() < wire_shape.terminal().wire_offset);
-                let partial_stats = target_store
-                    .blob_stats()
-                    .expect("capacity after partial staging");
-                assert!(partial_stats.committed_file_bytes > target_before.committed_file_bytes);
-                assert!(partial_stats.reserved_file_bytes > target_before.reserved_file_bytes);
-                drop(target_store);
-                Store::inspect_existing(target_state.join(STORE_FILE))
-                    .expect("read-only audit interrupted receipt");
-                let status_mission = target_state.join("profile5-status.bundle");
-                drop(
-                    crate::mission::UnprotectedReferenceMission::persist(
-                        &status_mission,
-                        responder_bytes.clone(),
-                    )
-                    .expect("persist profile-5 status mission"),
-                );
-                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
-                    *publication.as_bytes(),
-                )
-                .expect("profile-5 publication identity");
-                let interrupted_status = {
-                    let mut application = SelectedBlobNode::open_unprotected_reference(
-                        &target_state,
-                        &status_mission,
-                    )
-                    .expect("open application over interrupted profile-5 receipt");
-                    application
-                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
-                            publication_id,
-                            topic: services.topic.clone(),
-                            scope: services.scope.clone(),
-                        })
-                        .expect("inspect interrupted profile-5 publication")
-                };
-                assert_eq!(
-                    interrupted_status.phase,
-                    crate::application::BlobPublicationPhase::Receiving
-                );
-                assert_eq!(
-                    interrupted_status.durable_plaintext_bytes,
-                    partial.durable_plaintext_offset()
-                );
-                assert_eq!(
-                    interrupted_status.durable_transfer_bytes,
-                    partial.durable_wire_offset()
-                );
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen interrupted profile-5 receiver"),
-                );
-
-                let (mut ack_sender, mut ack_receiver, ack_digest) =
-                    blob_stream::tests::mission_pair_from_bundles(
-                        &initiator_bytes,
-                        &responder_bytes,
-                    );
-                let ack_adapter =
-                    blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(4));
-                let mut ack_verifier = open_test_sealer(&services.other);
-                let dropped_ack = tokio::try_join!(
-                    blob_stream::send_canonical_blob_profile5(
-                        &ack_adapter,
-                        Arc::clone(&source_store),
-                        &source_policy,
-                        &source,
-                        &mut ack_sender,
-                        ack_digest,
-                        direction,
-                        [0xab; 32],
-                    ),
-                    blob_stream::receive_canonical_blob_profile5(
-                        &ack_adapter,
-                        Arc::clone(&target_store),
-                        &target_cache,
-                        &target_policy,
-                        &mut ack_verifier,
-                        &mut ack_receiver,
-                        ack_digest,
-                        direction,
-                        [0xab; 32],
-                        &offer,
-                    ),
-                );
-                assert!(
-                    dropped_ack.is_err(),
-                    "dropped RESULT ACK must interrupt settlement"
-                );
-                assert!(
-                    target_store
-                        .get_blob(publication)
-                        .expect("canonical v9 promoted lookup after dropped ACK")
-                        .is_some()
-                );
-                let promoted_stats = target_store
-                    .blob_stats()
-                    .expect("capacity after canonical promotion");
-                assert!(promoted_stats.committed_file_bytes > target_before.committed_file_bytes);
-                assert!(promoted_stats.reserved_file_bytes > target_before.reserved_file_bytes);
-                assert!(
-                    promoted_stats.committed_file_bytes >= partial_stats.committed_file_bytes,
-                    "promotion cannot lose committed bytes charged for the first durable extent"
-                );
-                assert!(
-                    promoted_stats.reserved_file_bytes >= partial_stats.reserved_file_bytes,
-                    "promotion cannot lose reserved bytes charged for the first durable extent"
-                );
-                assert!(
-                    target_store
-                        .resume_profile5_receipt(publication)
-                        .expect("canonical v9 interrupted receipt")
-                        .is_some()
-                );
-                let (_, promoted_progress) = target_store
-                    .resume_profile5_receipt(publication)
-                    .expect("read receipt advanced by second adapter")
-                    .expect("dropped ACK retains terminal receipt");
-                assert!(promoted_progress.generation() > partial.generation());
-                assert!(promoted_progress.durable_wire_offset() > partial.durable_wire_offset());
-                assert_eq!(
-                    promoted_progress.durable_wire_offset(),
-                    wire_shape.terminal().wire_offset
-                );
-                assert_eq!(
-                    promoted_progress.durable_plaintext_offset(),
-                    plaintext.len() as u64
-                );
-
-                // Canonical publication authority must be visible immediately
-                // after promotion even while the dropped-ACK receipt remains.
-                drop(target_store);
-                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
-                    *publication.as_bytes(),
-                )
-                .expect("profile-5 publication identity");
-                let promoted_status = {
-                    let mut application = SelectedBlobNode::open_unprotected_reference(
-                        &target_state,
-                        target_state.join("profile5-status.bundle"),
-                    )
-                    .expect("open application during profile-5 settlement retry");
-                    let status = application
-                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
-                            publication_id,
-                            topic: services.topic.clone(),
-                            scope: services.scope.clone(),
-                        })
-                        .expect("inspect promoted publication with residual receipt");
-                    assert_eq!(
-                        status.phase,
-                        crate::application::BlobPublicationPhase::Available
-                    );
-                    let blob_id = status.blob_id.expect("available profile-5 Blob id");
-                    let mut received_plaintext = Vec::with_capacity(plaintext.len());
-                    let mut offset = 0_u64;
-                    while offset < plaintext.len() as u64 {
-                        let page = application
-                            .read_page(crate::application::BlobReadPageRequest {
-                                blob: crate::application::BlobReadRequest {
-                                    id: blob_id,
-                                    topic: services.topic.clone(),
-                                    scope: services.scope.clone(),
-                                },
-                                offset,
-                                max_bytes: crate::application::MAX_SELECTED_BLOB_PAGE_BYTES,
-                            })
-                            .expect("read promoted profile-5 content with residual receipt");
-                        received_plaintext.extend_from_slice(page.as_bytes());
-                        offset = page.next_offset();
-                    }
-                    assert_eq!(received_plaintext.as_slice(), plaintext);
-                    status
-                };
-                assert_eq!(promoted_status.publication_id, publication_id);
-                assert_eq!(
-                    promoted_status.blob_id.map(|id| *id.as_bytes()),
-                    Some(published_blob_id)
-                );
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen target after promoted status inspection"),
-                );
-                assert!(
-                    target_store
-                        .resume_profile5_receipt(publication)
-                        .expect("receipt remains until settlement ACK")
-                        .is_some()
-                );
-
-                let (mut retry_sender, mut retry_receiver, retry_digest) =
-                    blob_stream::tests::mission_pair_from_bundles(
-                        &initiator_bytes,
-                        &responder_bytes,
-                    );
-                let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
-                let mut retry_verifier = open_test_sealer(&services.other);
-                let settled = tokio::try_join!(
-                    blob_stream::send_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&source_store),
-                        &source_policy,
-                        &source,
-                        &mut retry_sender,
-                        retry_digest,
-                        direction,
-                        [0xaa; 32],
-                    ),
-                    blob_stream::receive_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&target_store),
-                        &target_cache,
-                        &target_policy,
-                        &mut retry_verifier,
-                        &mut retry_receiver,
-                        retry_digest,
-                        direction,
-                        [0xaa; 32],
-                        &offer,
-                    ),
-                )
-                .expect("canonical v9 already-present retry");
-                let settled_stats = target_store
-                    .blob_stats()
-                    .expect("capacity after profile-5 ACK");
-                assert_eq!(
-                    settled_stats.committed_file_bytes,
-                    promoted_stats.committed_file_bytes
-                );
-                assert_eq!(
-                    settled_stats.reserved_file_bytes,
-                    promoted_stats.reserved_file_bytes
-                );
-                (
-                    settled.0,
-                    settled.1,
-                    Some((partial_stats, promoted_stats, settled_stats)),
-                )
-            } else if label == "empty" {
-                assert!(
-                    first.is_err(),
-                    "post-SOURCE empty disconnect must interrupt transfer"
-                );
-                assert!(
-                    target_store
-                        .get_blob(publication)
-                        .expect("empty partial lookup")
-                        .is_none()
-                );
-                assert!(
-                    target_store
-                        .resume_profile5_receipt(publication)
-                        .expect("empty receipt lookup")
-                        .is_some()
-                );
-                drop(target_store);
-                Store::inspect_existing(target_state.join(STORE_FILE))
-                    .expect("read-only audit interrupted empty receipt");
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen interrupted empty profile-5 receiver"),
-                );
-                let (mut retry_sender, mut retry_receiver, retry_digest) =
-                    blob_stream::tests::mission_pair_from_bundles(
-                        &initiator_bytes,
-                        &responder_bytes,
-                    );
-                let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
-                let mut retry_verifier = open_test_sealer(&services.other);
-                let settled = tokio::try_join!(
-                    blob_stream::send_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&source_store),
-                        &source_policy,
-                        &source,
-                        &mut retry_sender,
-                        retry_digest,
-                        direction,
-                        [0xac; 32],
-                    ),
-                    blob_stream::receive_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&target_store),
-                        &target_cache,
-                        &target_policy,
-                        &mut retry_verifier,
-                        &mut retry_receiver,
-                        retry_digest,
-                        direction,
-                        [0xac; 32],
-                        &offer,
-                    ),
-                )
-                .expect("resume interrupted empty profile-5 transfer");
-                (settled.0, settled.1, None)
-            } else {
-                let settled = first.expect("canonical v9 production crossing");
-                (settled.0, settled.1, None)
-            };
-            assert_eq!(sent.roots, received.roots);
-            if label == "pipeline" {
-                let sender_pipeline = sent
-                    .pipeline
-                    .as_ref()
-                    .expect("canonical production send must report its bounded pipeline");
-                assert_eq!(sender_pipeline.completed_items(), canonical_chunk_count);
-                assert!(sender_pipeline.worker_count() > 1);
-                assert!(sender_pipeline.peak_in_flight_items() <= 128);
-                assert!(
-                    sender_pipeline.peak_in_flight_bytes()
-                        <= 4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
-                );
-                assert!(sender_pipeline.peak_reorder_items() <= 128);
-                assert!(
-                    sender_pipeline.peak_owned_bytes() <= blob_stream::PROFILE5_SENDER_OWNED_BYTES
-                );
-                assert!(sender_pipeline.peak_encoding_bytes() > 0);
-                assert!(
-                    sender_pipeline.peak_owned_bytes() >= sender_pipeline.peak_encoding_bytes(),
-                    "the total ownership peak must include encoded DATA held through transport"
-                );
-                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
-                assert_eq!(
-                    sender_pipeline_probe.sender_peak_live_bytes(),
-                    sender_pipeline.peak_owned_bytes(),
-                    "reported ownership peak must equal the actual-live-byte observer"
-                );
-                assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
-                assert_eq!(
-                    sender_pipeline_probe.sender_prefix_header_zeroizations(),
-                    3 * wire_shape.checkpoints().len().saturating_sub(1)
-                );
-                assert_eq!(
-                    sender_pipeline_probe.sender_encoded_header_creations(),
-                    wire_shape.checkpoints().len().saturating_sub(1),
-                    "each emitted DATA extent creates its encoded header exactly once"
-                );
-                assert_eq!(
-                    crate::stream_transfer::test_data_header_encoding_count()
-                        - data_header_encodings_before,
-                    sender_pipeline_probe.sender_encoded_header_creations(),
-                    "successful production path creates each DATA header only in charged ownership"
-                );
-                assert!(sender_pipeline_probe.peak_active_workers() > 1);
-                assert!(sender_pipeline_probe.cleanup_observed());
-                assert!(sender_pipeline_probe.cancellation_signalled());
-                assert!(sender_pipeline_probe.channels_closed());
-                assert_eq!(sender_pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    sender_pipeline_probe.worker_exits(),
-                    sender_pipeline_probe.joined_workers()
-                );
-                assert_eq!(
-                    sender_pipeline_probe.mapped_ciphertext_zeroizations(),
-                    canonical_chunk_count as usize,
-                    "every prepared sender carrier is zeroized after ordered emission"
-                );
-                assert_eq!(
-                    source_store
-                        .profile5_batch_test_counts()
-                        .sender_carrier_reads,
-                    canonical_chunk_count,
-                    "the production sender performs exactly one Store carrier read per resumed map partition"
-                );
-                for stage in [
-                    crate::stream_pipeline::PipelineStage::Admission,
-                    crate::stream_pipeline::PipelineStage::Map,
-                    crate::stream_pipeline::PipelineStage::Reorder,
-                    crate::stream_pipeline::PipelineStage::Sink,
-                ] {
-                    assert_eq!(sender_pipeline.stage(stage).items, canonical_chunk_count);
-                }
-                let pipeline = received
-                    .pipeline
-                    .as_ref()
-                    .expect("canonical production receive must report its bounded pipeline");
-                assert_eq!(
-                    pipeline.completed_items(),
-                    canonical_chunk_count,
-                    "every canonical carrier crosses the production map/reorder/sink pipeline"
-                );
-                assert!(pipeline.worker_count() > 1);
-                assert_eq!(pipeline.peak_in_flight_items(), 8);
-                assert!(pipeline.peak_in_flight_bytes() <= 1024 * 1024);
-                assert!(pipeline.peak_reorder_items() <= 8);
-                assert!(pipeline_probe.peak_active_workers() > 1);
-                assert!(pipeline_probe.cleanup_observed());
-                assert!(pipeline_probe.cancellation_signalled());
-                assert!(pipeline_probe.channels_closed());
-                assert_eq!(pipeline_probe.active_workers(), 0);
-                assert_eq!(
-                    pipeline_probe.mapped_ciphertext_zeroizations(),
-                    canonical_chunk_count as usize,
-                    "every mapped ciphertext buffer is zeroized after the joined sink completes",
-                );
-                assert_eq!(
-                    pipeline_probe.worker_exits(),
-                    pipeline_probe.joined_workers(),
-                    "production receive must join every pipeline worker"
-                );
-                assert_eq!(pipeline.accepted_items(), canonical_chunk_count);
-                let batch_counts = target_store.profile5_batch_test_counts();
-                pipeline_measurement = Some(Profile5ReceiverMeasurementReceipt::new(
-                    plaintext.len(),
-                    transfer_wall_time,
-                    pipeline.clone(),
-                    sender_pipeline.clone(),
-                    source_store
-                        .profile5_batch_test_counts()
-                        .sender_carrier_reads,
-                    SenderOwnershipTestReceipt {
-                        carrier_zeroizations: sender_pipeline_probe
-                            .mapped_ciphertext_zeroizations(),
-                        extent_body_zeroizations: sender_pipeline_probe
-                            .sender_extent_body_zeroizations(),
-                        prefix_header_zeroizations: sender_pipeline_probe
-                            .sender_prefix_header_zeroizations(),
-                        encoded_header_creations: sender_pipeline_probe
-                            .sender_encoded_header_creations(),
-                        actual_peak_live_bytes: sender_pipeline_probe.sender_peak_live_bytes(),
-                    },
-                    batch_counts,
-                ));
-                assert_eq!(batch_counts.installed_carriers, canonical_chunk_count);
-                assert_eq!(
-                    batch_counts.durable_batches,
-                    wire_shape.checkpoints().len().saturating_sub(1) as u64,
-                    "store work is one bounded durable batch per ABX1 extent, not per page"
-                );
-                assert!(batch_counts.durable_batches < batch_counts.installed_carriers);
-                assert_eq!(
-                    batch_counts.total_write_begins,
-                    batch_counts.durable_batches + 4,
-                    "full receiver interval includes stage, reservation, extents, promotion, and cleanup"
-                );
-                assert_eq!(
-                    batch_counts.total_write_commits,
-                    batch_counts.durable_batches + 4,
-                    "every clean receiver write transaction commits"
-                );
-                assert_eq!(
-                    (
-                        batch_counts.source_stage_write_begins,
-                        batch_counts.source_stage_write_commits,
-                        batch_counts.receipt_reservation_write_begins,
-                        batch_counts.receipt_reservation_write_commits,
-                        batch_counts.promotion_write_begins,
-                        batch_counts.promotion_write_commits,
-                        batch_counts.receipt_cleanup_write_begins,
-                        batch_counts.receipt_cleanup_write_commits,
-                        batch_counts.fallback_activation_write_begins,
-                        batch_counts.fallback_activation_write_commits,
-                    ),
-                    (1, 1, 1, 1, 1, 1, 1, 1, 0, 0),
-                );
-                assert_eq!(
-                    (
-                        batch_counts.extent_write_begins,
-                        batch_counts.extent_write_commits,
-                    ),
-                    (batch_counts.durable_batches, batch_counts.durable_batches),
-                );
-                assert_eq!(
-                    batch_counts.temp_file_syncs, batch_counts.installed_carriers,
-                    "each newly installed carrier performs one observed temp-file sync"
-                );
-                assert_eq!(
-                    batch_counts.parent_directory_syncs,
-                    batch_counts.installed_carriers + 1,
-                    "each carrier plus first-extent variant-directory activation synchronizes its parent"
-                );
-                assert!(
-                    pipeline
-                        .stage(crate::stream_pipeline::PipelineStage::Map)
-                        .items
-                        > 0
-                );
-                assert!(
-                    pipeline
-                        .stage(crate::stream_pipeline::PipelineStage::Sink)
-                        .items
-                        > 0
-                );
-                for stage in [
-                    crate::stream_pipeline::PipelineStage::Admission,
-                    crate::stream_pipeline::PipelineStage::Map,
-                    crate::stream_pipeline::PipelineStage::Reorder,
-                    crate::stream_pipeline::PipelineStage::Sink,
-                ] {
-                    assert_eq!(
-                        pipeline.stage(stage).items,
-                        canonical_chunk_count,
-                        "each production stage performs one linear operation per carrier"
-                    );
-                }
-            }
-            if label == "nonempty" {
-                assert_eq!(sent.resumed_from, sent.wire_bytes);
-                assert_eq!(received.resumed_from, received.wire_bytes);
-                assert!(sent.resumed_from > 0);
-            } else {
-                assert_eq!(sent.resumed_from, 0);
-                assert_eq!(received.resumed_from, 0);
-            }
-            assert!(
-                target_store
-                    .get_blob(publication)
-                    .expect("canonical v9 target lookup")
-                    .is_some()
-            );
-            assert_eq!(
-                target_store
-                    .resume_profile5_receipt(publication)
-                    .expect("canonical v9 settled receipt"),
-                None,
-                "ACK retires the bounded settlement receipt"
-            );
-            let poll = target_store
-                .prepare_blob_subscription_poll_with_policy(&target_policy, subscription.id, 1, 8)
-                .expect("canonical v9 first subscription poll");
-            assert_eq!(poll.candidates().len(), 1);
-            let semantic = poll.candidates()[0].projection().semantic_id;
-            let page = target_store
-                .commit_blob_subscription_poll_with_policy(
-                    &target_policy,
-                    &poll,
-                    &BlobSubscriptionPollSelection {
-                        deliverable: vec![semantic],
-                        inactive: Vec::new(),
-                    },
-                )
-                .expect("canonical v9 first subscription delivery");
-            assert_eq!(page.deliveries.len(), 1);
-            let delivery = page.deliveries[0].clone();
-            assert_eq!(
-                target_store
-                    .acknowledge_blob_delivery_with_policy(
-                        &target_policy,
-                        subscription.id,
-                        delivery.semantic_id,
-                        delivery.token,
-                    )
-                    .expect("acknowledge canonical v9 subscription delivery"),
-                BlobDeliveryAck::Acknowledged
-            );
-            let retry_poll = target_store
-                .prepare_blob_subscription_poll_with_policy(&target_policy, subscription.id, 1, 8)
-                .expect("canonical v9 retry subscription poll");
-            let retry_page = target_store
-                .commit_blob_subscription_poll_with_policy(
-                    &target_policy,
-                    &retry_poll,
-                    &BlobSubscriptionPollSelection {
-                        deliverable: vec![semantic],
-                        inactive: Vec::new(),
-                    },
-                )
-                .expect("canonical v9 subscription retry");
-            assert!(
-                retry_page.deliveries.is_empty(),
-                "canonical apply plus already-present retry delivers once"
-            );
-
-            if label == "nonempty" {
-                drop(target_store);
-                let status_mission = target_state.join("profile5-status.bundle");
-                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
-                    *publication.as_bytes(),
-                )
-                .expect("profile-5 publication identity");
-                let available_status = {
-                    let mut application = SelectedBlobNode::open_unprotected_reference(
-                        &target_state,
-                        &status_mission,
-                    )
-                    .expect("reopen application after profile-5 promotion");
-                    application
-                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
-                            publication_id,
-                            topic: services.topic.clone(),
-                            scope: services.scope.clone(),
-                        })
-                        .expect("inspect available profile-5 publication")
-                };
-                assert_eq!(
-                    available_status.phase,
-                    crate::application::BlobPublicationPhase::Available
-                );
-                assert_eq!(available_status.publication_id, publication_id);
-                assert_eq!(
-                    available_status.blob_id.map(|id| *id.as_bytes()),
-                    Some(published_blob_id)
-                );
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen target after application status inspection"),
-                );
-                let charged = target_store
-                    .blob_stats()
-                    .expect("profile-5 charge before retirement");
-                let (partial, promoted, acknowledged) =
-                    capacity_chain.expect("nonempty capacity chain");
-                assert!(promoted.committed_file_bytes >= partial.committed_file_bytes);
-                assert!(promoted.reserved_file_bytes >= partial.reserved_file_bytes);
-                assert_eq!(
-                    acknowledged.committed_file_bytes,
-                    promoted.committed_file_bytes
-                );
-                assert_eq!(
-                    acknowledged.reserved_file_bytes,
-                    promoted.reserved_file_bytes
-                );
-                assert_eq!(
-                    charged.committed_file_bytes,
-                    acknowledged.committed_file_bytes
-                );
-                assert_eq!(
-                    charged.reserved_file_bytes,
-                    acknowledged.reserved_file_bytes
-                );
-                target_store
-                    .test_revoke_blob_publisher_for_reclamation(services.member.identity())
-                    .expect("revoke received profile-5 publisher");
-                let mut retired = None;
-                for _ in 0..256 {
-                    target_store
-                        .run_blob_maintenance_turn(blob_maintenance_runtime_budget())
-                        .expect("retire received profile-5 publication");
-                    let publication_retired = match target_store.get_blob(publication) {
-                        Ok(None) => true,
-                        Ok(Some(_)) => false,
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => true,
-                        Err(error) => panic!("profile-5 retirement lookup: {error}"),
-                    };
-                    if publication_retired {
-                        retired = Some(
-                            target_store
-                                .blob_stats()
-                                .expect("capacity after canonical retirement"),
-                        );
-                        break;
-                    }
-                }
-                let retired = retired.expect("received profile-5 publication retires");
-                assert_eq!(retired.committed_file_bytes, charged.committed_file_bytes);
-                assert_eq!(retired.reserved_file_bytes, charged.reserved_file_bytes);
-                let mut reclaimed = retired;
-                for _ in 0..512 {
-                    target_store
-                        .run_blob_maintenance_turn(blob_maintenance_runtime_budget())
-                        .expect("reclaim received profile-5 variant");
-                    reclaimed = target_store
-                        .blob_stats()
-                        .expect("capacity during physical reclamation");
-                    if reclaimed.committed_file_bytes == target_before.committed_file_bytes
-                        && reclaimed.reserved_file_bytes == target_before.reserved_file_bytes
-                    {
-                        break;
-                    }
-                }
-                assert_eq!(
-                    (
-                        reclaimed.committed_file_bytes,
-                        reclaimed.reserved_file_bytes
-                    ),
-                    (
-                        target_before.committed_file_bytes,
-                        target_before.reserved_file_bytes
-                    )
-                );
-            }
-
-            if finite {
-                let before_restart = target_store.test_blob_logical_digest();
-                let lifetime_before = target_store
-                    .test_blob_finite_lifetime_evidence(publication)
-                    .expect("finite receiver lifetime evidence")
-                    .expect("finite receiver lifetime");
-                assert_eq!(lifetime_before.0, 600_000);
-                assert!(lifetime_before.1 >= 25);
-                assert_eq!(
-                    lifetime_before
-                        .2
-                        .expect("receiver-local custody checkpoint")
-                        .clock_id,
-                    [0xb2; 16]
-                );
-                drop(target_store);
-                let reopened = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("reopen finite canonical v9 receiver");
-                assert_eq!(reopened.test_blob_logical_digest(), before_restart);
-                assert_eq!(
-                    reopened
-                        .test_blob_finite_lifetime_evidence(publication)
-                        .expect("reopened finite lifetime evidence")
-                        .expect("reopened finite lifetime"),
-                    lifetime_before
-                );
-                assert!(
-                    reopened
-                        .get_blob(publication)
-                        .expect("reopened finite canonical v9 lookup")
-                        .is_some()
-                );
-                drop((source_store, reopened));
-            } else if label == "empty" {
-                drop(target_store);
-                let mission_path = target_state.join("empty-profile5-reader.bundle");
-                let mission_bytes = services
-                    .other
-                    .fresh_bundle()
-                    .expect("fresh empty profile-5 reader bundle")
-                    .to_bytes()
-                    .expect("encode empty profile-5 reader bundle");
-                drop(
-                    crate::mission::UnprotectedReferenceMission::persist(
-                        &mission_path,
-                        mission_bytes,
-                    )
-                    .expect("persist empty profile-5 reader mission"),
-                );
-                let mut application =
-                    SelectedBlobNode::open_unprotected_reference(&target_state, &mission_path)
-                        .expect("open application over received empty profile-5 Blob");
-                let page = application
-                    .read_page(crate::application::BlobReadPageRequest {
-                        blob: crate::application::BlobReadRequest {
-                            id: crate::application::BlobId::from_bytes(published_blob_id),
-                            topic: services.topic.clone(),
-                            scope: services.scope.clone(),
-                        },
-                        offset: 0,
-                        max_bytes: 31,
-                    })
-                    .expect("read received empty profile-5 Blob EOF");
-                assert!(page.is_empty());
-                assert_eq!(page.next_offset(), 0);
-                assert!(page.complete);
-                drop((source_store, application));
-            } else {
-                drop((source_store, target_store));
-            }
-            fs::remove_dir_all(source_state).expect("canonical v9 source cleanup");
-            fs::remove_dir_all(target_state).expect("canonical v9 target cleanup");
-        }
-        pipeline_measurement.expect("canonical profile-5 pipeline measurement")
-    }
-
-    #[tokio::test]
-    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume()
-     {
-        let receipt = assert_completed_canonical_blob_crossing(4 * 1024 * 1024 + 1).await;
-        let structured: serde_json::Value = serde_json::from_str(&receipt.structured_line())
-            .expect("profile-5 measurement receipt is valid JSON");
-        assert_eq!(
-            structured["schema"],
-            "aster.profile5-receiver-measurement.v1"
-        );
-        assert_eq!(structured["payload_bytes"], 4 * 1024 * 1024 + 1);
-        let sender: serde_json::Value = serde_json::from_str(&receipt.sender_structured_line())
-            .expect("profile-5 sender measurement receipt is valid JSON");
-        assert_eq!(sender["schema"], "aster.profile5-sender-measurement.v1");
-        assert_eq!(sender["payload_bytes"], 4 * 1024 * 1024 + 1);
-        assert!(
-            sender["ownership"]["carrier_zeroizations"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(
-            sender["ownership"]["extent_body_zeroizations"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(
-            sender["ownership"]["prefix_header_zeroizations"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(
-            sender["ownership"]["encoded_header_creations"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert_eq!(sender["ownership"]["live_bytes_after_join"], 0);
-        assert!(
-            sender["ownership"]["actual_peak_live_bytes"]
-                .as_u64()
-                .unwrap()
-                <= blob_stream::PROFILE5_SENDER_OWNED_BYTES as u64
-        );
-        assert_eq!(
-            sender["store"]["carrier_reads"], sender["pipeline"]["completed_items"],
-            "sender Store work remains exactly linear in canonical carriers"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "release-only real production path; requires multi-GiB RAM/disk and is not a default local gate"]
-    async fn release_profile5_receiver_real_path_covers_exact_800_mib_and_1_gib() {
-        for bytes in [800 * 1024 * 1024, 1024 * 1024 * 1024] {
-            let receipt = assert_completed_canonical_blob_crossing(bytes).await;
-            assert_eq!(receipt.payload_bytes, bytes as u64);
-            assert!(receipt.wall_time_ns > 0);
-            assert!(receipt.bytes_per_second > 0.0);
-            assert!(receipt.mib_per_second > 0.0);
-            assert!(receipt.pipeline.completed_items() > 0);
-            assert_eq!(
-                receipt.store.temp_file_syncs,
-                receipt.store.installed_carriers
-            );
-            println!("{}", receipt.structured_line());
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "release-only exact sender production path; requires multi-GiB RAM/disk and is not a default local gate"]
-    async fn release_profile5_sender_real_path_covers_exact_800_mib_and_1_gib() {
-        for bytes in [800 * 1024 * 1024, 1024 * 1024 * 1024] {
-            let receipt = assert_completed_canonical_blob_crossing(bytes).await;
-            assert_eq!(receipt.payload_bytes, bytes as u64);
-            assert!(receipt.wall_time_ns > 0);
-            assert!(receipt.bytes_per_second > 0.0);
-            assert!(receipt.mib_per_second > 0.0);
-            assert!(receipt.sender_pipeline.worker_count() > 1);
-            assert_eq!(
-                receipt.sender_store_reads,
-                receipt.sender_pipeline.completed_items(),
-            );
-            println!("{}", receipt.sender_structured_line());
-        }
     }
 
     #[tokio::test]

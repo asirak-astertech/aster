@@ -1098,84 +1098,6 @@ pub(crate) struct BlobAccess {
     physical_lineage: BlobPhysicalLineage,
 }
 
-/// Provider-bound, cloneable canonical chunk mapper. The content-grant
-/// material is immutable while shared and every owned copy is zeroized when
-/// dropped.
-#[derive(Clone)]
-pub struct CanonicalBlobChunkSealer {
-    epoch_seed: [u8; 32],
-    content_group: [u8; 32],
-    epoch: u64,
-    physical_lineage: BlobPhysicalLineage,
-}
-
-impl Drop for CanonicalBlobChunkSealer {
-    fn drop(&mut self) {
-        self.epoch_seed.zeroize();
-    }
-}
-
-/// One independently mapped canonical chunk. Ciphertext is zeroized when the
-/// ordered sink consumes or abandons it.
-pub struct SealedCanonicalBlobChunk {
-    index: u64,
-    record: BlobChunkRecord,
-    ciphertext: Zeroizing<Vec<u8>>,
-}
-
-impl SealedCanonicalBlobChunk {
-    pub const fn index(&self) -> u64 {
-        self.index
-    }
-
-    pub fn owned_bytes(&self) -> usize {
-        self.ciphertext.capacity()
-    }
-
-    pub fn ciphertext_len(&self) -> usize {
-        self.ciphertext.len()
-    }
-}
-
-impl CanonicalBlobChunkSealer {
-    pub fn seal(
-        &self,
-        manifest: &BlobManifest,
-        index: u64,
-        expected_digest: &[u8; 32],
-        plaintext: Vec<u8>,
-    ) -> Result<SealedCanonicalBlobChunk, BlobError> {
-        validate_selected_manifest(manifest)?;
-        if manifest.content_group != self.content_group || manifest.content_epoch != self.epoch {
-            return Err(BlobError::AuthenticationFailed);
-        }
-        let expected = manifest.plaintext_len(index)?;
-        let mut ciphertext = Zeroizing::new(plaintext);
-        if ciphertext.len() != expected || sha256(&ciphertext) != *expected_digest {
-            return Err(BlobError::SourceChanged);
-        }
-        let access = BlobAccess {
-            epoch_seed: BlobSecret(self.epoch_seed),
-            content_group: self.content_group,
-            epoch: self.epoch,
-            physical_lineage: self.physical_lineage,
-        };
-        encrypt_chunk(&access, manifest, index, &mut ciphertext)?;
-        let record = BlobChunkRecord {
-            plaintext_sha256: *expected_digest,
-            ciphertext_sha256: sha256(&ciphertext),
-            plaintext_len: u32::try_from(expected).map_err(|_| BlobError::LengthOverflow)?,
-            ciphertext_len: u32::try_from(ciphertext.len())
-                .map_err(|_| BlobError::LengthOverflow)?,
-        };
-        Ok(SealedCanonicalBlobChunk {
-            index,
-            record,
-            ciphertext,
-        })
-    }
-}
-
 impl BlobAccess {
     #[cfg(test)]
     pub(crate) fn new(epoch_seed: [u8; 32], scope: &Scope, topic: &Topic, epoch: u64) -> Self {
@@ -2923,34 +2845,6 @@ impl<S: BlobStore> ReferenceBlobService<S> {
         BlobWriter::new(&mut self.store, access).encrypt_some(source, manifest, max_new_chunks)
     }
 
-    /// Creates a provider-bound fixed-worker mapper without exporting content
-    /// keys or algorithm controls.
-    pub fn canonical_chunk_sealer(&self) -> Result<CanonicalBlobChunkSealer, BlobError> {
-        self.ensure_live()?;
-        Ok(CanonicalBlobChunkSealer {
-            epoch_seed: *self.epoch_seed.expose(),
-            content_group: self.content_group,
-            epoch: self.epoch,
-            physical_lineage: self.physical_lineage,
-        })
-    }
-
-    /// Commits one independently mapped chunk through the bound durable
-    /// adapter. Ordering remains the caller's responsibility.
-    pub fn commit_sealed_chunk(
-        &mut self,
-        manifest: &BlobManifest,
-        sealed: SealedCanonicalBlobChunk,
-    ) -> Result<(), BlobError> {
-        self.ensure_live()?;
-        let access = self.access()?;
-        BlobWriter::new(&mut self.store, access).validate_access(manifest)?;
-        validate_record(manifest, sealed.index, &sealed.record)?;
-        self.store
-            .commit_verified_chunk(manifest.id, sealed.index, sealed.record, &sealed.ciphertext)
-            .map_err(store_error)
-    }
-
     pub fn write_manifest<W: Write>(
         &mut self,
         manifest: &BlobManifest,
@@ -4488,63 +4382,6 @@ pub fn inspect_blob_transfer_object(bytes: &[u8]) -> Result<BlobTransferObject, 
         proof,
         ciphertext,
     })
-}
-
-/// Fuzz-only independently constructed source/manifest oracle that enters the
-/// same route- and record-bound carrier authentication path as the production
-/// receiver. Ciphertext bytes are derived from the corpus formula rather than
-/// trusted from the carrier under test.
-#[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_verify_profile5_carrier(
-    bytes: &[u8],
-    expected_index: u64,
-    expected_ciphertext_lengths: &[u32],
-) -> Result<(), BlobError> {
-    let expected_position =
-        usize::try_from(expected_index).map_err(|_| BlobError::LengthOverflow)?;
-    let expected_len = *expected_ciphertext_lengths
-        .get(expected_position)
-        .ok_or(BlobError::InvalidManifest)?;
-    let expected_ciphertext = (0..expected_len)
-        .map(|value| expected_index.wrapping_add(u64::from(value)) as u8)
-        .collect::<Vec<_>>();
-    let records = expected_ciphertext_lengths
-        .iter()
-        .enumerate()
-        .map(|(index, length)| {
-            let index = u64::try_from(index).map_err(|_| BlobError::LengthOverflow)?;
-            let ciphertext = (0..*length)
-                .map(|value| index.wrapping_add(u64::from(value)) as u8)
-                .collect::<Vec<_>>();
-            let plaintext_len = length
-                .checked_sub(GCM_TAG_LEN as u32)
-                .ok_or(BlobError::InvalidManifest)?;
-            BlobChunkRecord::from_parts([0x30; 32], sha256(&ciphertext), plaintext_len, *length)
-        })
-        .collect::<Result<Vec<_>, BlobError>>()?;
-    let blob_id = BlobId::from_bytes([0x20; 32]);
-    let tree = BlobRouteTree::build(blob_id, records)?;
-    let commitment = tree.commitment()?;
-    let route = AuthenticatedBlobRoute::new(EnvelopeId::from_bytes([0x10; 32]), commitment);
-    let proof = tree.proof(expected_index)?;
-    let ciphertext_sha256 = sha256(&expected_ciphertext);
-    let object_id = transfer_object_id(
-        route.source_envelope,
-        blob_id,
-        expected_index,
-        ciphertext_sha256,
-        expected_len,
-        &proof,
-    );
-    let inspected = authenticate_blob_transfer_object_for_route(object_id, bytes, route)?;
-    if inspected.index != expected_index
-        || inspected.ciphertext_sha256 != ciphertext_sha256
-        || inspected.ciphertext_len != expected_len
-        || inspected.ciphertext != expected_ciphertext.as_slice()
-    {
-        return Err(BlobError::AuthenticationFailed);
-    }
-    Ok(())
 }
 
 fn read_exact_chunk<R: Read>(

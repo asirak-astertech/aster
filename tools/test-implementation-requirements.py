@@ -20,6 +20,90 @@ SPEC.loader.exec_module(CHECKER)
 
 
 class BlobCapabilityDocumentationTests(unittest.TestCase):
+    def test_profile5_retired_api_guard_covers_public_core_and_store_surfaces(self) -> None:
+        retired = (
+            "Profile5CanonicalCheckpoint",
+            "Profile5CanonicalWireShape",
+            "profile5_canonical_wire_shape",
+            "PROFILE5_CANONICAL_",
+            "BlobProfile5Receipt",
+            "reserve_profile5_receipt",
+            "checkpoint_profile5_receipt",
+            "resume_profile5_receipt",
+            "complete_profile5_receipt",
+            "begin_profile5_sender_carrier",
+            "begin_profile5_sender_read",
+            "read_profile5_sender_carrier",
+            "commit_verified_profile5_batch_with_policy",
+            "apply_verified_profile5_blob_with_policy",
+        )
+        for token in retired:
+            with self.subTest(token=token), self.assertRaisesRegex(
+                ValueError, "legacy carrier concepts remain active"
+            ):
+                CHECKER.validate_profile5_native_pack_path(
+                    active_sources={"retirement-regression.rs": token},
+                    active_documentation={},
+                )
+
+    def test_profile5_native_pack_guard_covers_stream_transfer_and_active_docs(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        stream_path = "crates/aster-node/src/stream_transfer.rs"
+        docs_path = "docs/transports.md"
+        stream = (root / stream_path).read_text()
+        docs = (root / docs_path).read_text()
+
+        CHECKER.validate_profile5_native_pack_path(
+            active_sources={stream_path: stream},
+            active_documentation={docs_path: docs},
+        )
+        for token in ("ABX1", "ASTRBT01"):
+            with self.subTest(surface="stream_transfer", token=token), self.assertRaisesRegex(
+                ValueError, "legacy carrier concepts remain active"
+            ):
+                CHECKER.validate_profile5_native_pack_path(
+                    active_sources={stream_path: stream + f'\nconst REGRESSION: &str = "{token}";\n'},
+                    active_documentation={docs_path: docs},
+                )
+            with self.subTest(surface="active_v9_docs", token=token), self.assertRaisesRegex(
+                ValueError, "legacy carrier concepts remain active"
+            ):
+                CHECKER.validate_profile5_native_pack_path(
+                    active_sources={stream_path: stream},
+                    active_documentation={
+                        docs_path: docs
+                        + f"\nSemantic-v9 Profile-5 DATA actively carries {token} records.\n"
+                    },
+                )
+
+        CHECKER.validate_profile5_native_pack_path(
+            active_sources={stream_path: stream},
+            active_documentation={
+                docs_path: docs
+                + "\nHistorical semantic-v7/v8 profile-4 used ASTRBT01 and ABX1.\n"
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "legacy carrier concepts remain active"):
+            CHECKER.validate_profile5_native_pack_path(
+                active_sources={stream_path: stream},
+                active_documentation={
+                    docs_path: docs
+                    + "\nHistorical Profile-4 used ASTRBT01. "
+                    "Semantic-v9 Profile-5 actively carries ABX1.\n"
+                },
+            )
+        for mixed_clause in (
+            "Historical Profile-4 used ASTRBT01, while semantic-v9 Profile-5 actively carries ABX1.",
+            "Unlike legacy ASTRBT01, semantic-v9 Profile-5 actively carries ABX1.",
+        ):
+            with self.subTest(mixed_clause=mixed_clause), self.assertRaisesRegex(
+                ValueError, "legacy carrier concepts remain active"
+            ):
+                CHECKER.validate_profile5_native_pack_path(
+                    active_sources={stream_path: stream},
+                    active_documentation={docs_path: docs + "\n" + mixed_clause + "\n"},
+                )
+
     def test_current_capability_boundary_is_required(self) -> None:
         payload = {
             "schema": 1,

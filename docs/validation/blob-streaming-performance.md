@@ -67,7 +67,9 @@ receipt. `blob_stream_sent_bytes` and `blob_stream_received_bytes` are the
 canonical pack bytes carried in the current attempt; `blob_stream_resumed_bytes`
 is the durable prefix skipped across local send and receive directions.
 `blob_stream_checkpoints` and `blob_stream_partitions` count checkpoint
-settlement and receiver pipeline completion.
+settlement and receiver pipeline completion. `blob_stream_resumed_bytes` is
+cumulative across the contact's Profile-5 exchanges: an exact already-present
+retry may add the complete wire length while adding zero sent/received bytes.
 
 `blob_stream_pipeline` is a semicolon-delimited value. Its capacity prefix is
 `workers`, `peak_items`, `peak_bytes`, and `peak_reorder`. Each subsequent stage
@@ -75,6 +77,101 @@ has the form `name:items:bytes:queue_wait_ns:service_ns:output_blocked_ns` for
 `admission`, `map`, `reorder`, and `sink`. These cumulative, bounded counters
 make a CM4 run attributable without retaining per-partition histories or Blob
 identifiers. A sender-only direction has no receiver pipeline samples.
+
+## 2026-10-23 current-tree CM4 selected-node composite
+
+An uncommitted ARM64 release build of the current Profile-5 selected-node
+benchmark was run on the inactive `rpi4-3` CM4. The artifact was not installed
+as a service. The first runtime-fix artifact matched SHA-256
+`e2045d187a4ed28f1c86620a015a5310e6bd716314fcc6b3953891fba9a00104`;
+the receipt-instrumented rebuild matched
+`3900ca123f77c71a6aaf9a9cab60027043cdb859a8a9b45a6ee8c10bdaaaafc5`
+locally and on the device. Runtime code was identical between those builds.
+The fixture used two independent node actors and stores on that CM4 with direct
+loopback Iroh QUIC. This is complete selected-stack and persistence evidence,
+not WLAN or three-device qualification.
+
+The exact 1-GiB source and reopened receiver both produced SHA-256
+`f1a2bfc482ceca384b185a6da411a5ae9709058a330a4b43bce318e2403dd4c6`.
+The receiver committed 1,024 native 1-MiB segments, retained no pending source
+or network staging, and verified all 2,048 application pages after restart.
+
+| Boundary | Elapsed |
+| --- | ---: |
+| Deterministic source generation and fsync (excluded from benchmark total) | 21.815 s |
+| Independent local durable publication | 94.175 s |
+| Publication start through first receiver-readable byte | 228.299 s (3 min 48.299 s) |
+| Publication start through authenticated contact settlement | 228.378 s |
+| Connected-node start through first receiver-readable byte | 119.443 s |
+| Connected-node start through contact settlement | 119.522 s |
+| Connected-node shutdown | 25.436 s |
+| Peerless durable Store reopen/invariant checks | approximately 43.249 s |
+| Receiver node restart | 28.714 s |
+| Full 2,048-page read and SHA-256 after restart | 49.079 s |
+| Harness total, including shutdown/restart validation work | 374.856 s |
+
+The one contact moved 1,073,879,040 wire bytes with eight durable checkpoints,
+four receiver map workers, 1,024 completed partitions, and about 8 MiB peak
+in-flight pipeline bytes. It remained active for more than 109 seconds and
+settled once. The instrumented sample retained two pre-contact connection
+timeouts while the second local node was starting; the successful Blob stream
+itself did not restart. Its full-length resumed counter came from a later
+already-present zero-byte exchange in the same contact, not from skipping the
+fresh transfer. The prior runtime-fix sample had zero contact errors and zero
+resumed bytes. The previous fixed
+30-second outer contact deadline had interrupted the same healthy transfer
+three times; the current authenticated-progress watchdog removes that resume
+churn while retaining the 30-second no-progress bound, the two-minute
+Profile-5 operation-idle bound, and the size-derived hard attempt deadline.
+
+The older run's 143.971-second settled-transfer interval fell to 116.759
+seconds in the zero-error sample (18.9% lower); the instrumented sample reached
+first visibility in 119.443 seconds despite its pre-contact startup retries.
+The older 214.020-second settle-inclusive interval fell to 183.985 seconds in
+the zero-error sample (14.0% lower). Operational availability is earlier than
+either harness total because the benchmark deliberately shuts down both nodes,
+reopens and audits the Store, restarts the receiver, and proves a peerless full
+read. The measured publish-to-visible result is 3 minutes 48.299 seconds; the
+following full download verification takes 49.079 seconds without network
+repair.
+
+## 2026-10-23 current-tree CM4 completed-pack data plane
+
+The current Profile-5 completed-pack path was isolated from publication and
+application-read timing on `rpi4-2 -> rpi4-1`. Both endpoints bound WLAN
+(`192.168.60.80 -> 192.168.60.79`) and reported `Direct`; ZeroTier carried only
+SSH test control. The uncommitted ARM64 device-validation artifact was
+8,408,736 bytes with SHA-256
+`f4159a69519a83ad026d7214a3589b75e985e20c8127c6ed74f869b710adcf86`.
+It used the selected one-MiB authenticated records, a four-worker bounded
+receiver map/reorder pipeline, and 128-MiB durable checkpoint batches.
+
+| Plaintext | Send | Receive | Checkpoints | Records | Result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 64 MiB | 8.464 MiB/s | 8.469 MiB/s | 1 | 64 | pass |
+| 256 MiB | 9.117 MiB/s | 9.118 MiB/s | 2 | 256 | pass |
+| 1 GiB | 8.143 MiB/s | 8.142 MiB/s | 8 | 1,024 | pass |
+
+The exact 1-GiB network phase transferred 1,073,879,040 wire bytes in
+125.776 seconds. Both roles reported plaintext root
+`d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857`
+and ciphertext root
+`73306a8da550d174ea3f69b2cf398b9e72ee8c33e1698bf2f48e40816c34b50d`,
+with zero resumed bytes. An immediately adjacent raw 1-GiB TCP transfer over
+the same WLAN addresses sustained 9.215 MiB/s, so the authenticated,
+checkpointed Aster data plane achieved 88.4% of available throughput. This is
+slightly above the retained 86--88% Profile-5 evidence and rejects the earlier
+7.19-MiB/s serial validation result as a benchmark-path regression rather than
+a production data-plane regression.
+
+The CM4 `/tmp` mount is a 453-MiB tmpfs, so full-size validation used
+`TMPDIR=/var/tmp`. The completed pack self-cleaned after each process exited.
+The first manual attempt also confirmed that a 30-second one-shot listener is
+shorter than CM4 pack preparation; the validation example now gives its
+receiver five minutes while retaining the sender's 30-second connect bound.
+Production publication remains peer-independent and production contact
+listeners remain node-lifetime infrastructure. This two-device transport
+isolation does not complete the pending three-CM4 end-to-end qualification.
 
 ## 2026-10-20 mission-record hot-path isolation
 
@@ -111,22 +208,22 @@ cargo test --release -p aster-node composite_profile5_records_process_256_mib_in
 {
   "schema": 1,
   "surface": "performance",
-  "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
-  "legacy_2026_10_20_supports_current_candidate": false,
-  "current_map_unit": "65536-byte canonical plaintext chunk",
-  "current_record": "ASTRBT01",
-  "current_extent": "ABX1, at most 1048576 bytes",
+  "historical_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+  "historical_2026_10_20_supports_architecture": true,
+  "historical_2026_10_20_qualifies_current_commit": false,
+  "current_map_unit": "1048576-byte native plaintext segment",
+  "current_record": "ASTRBS02, at most 1048706 bytes",
+  "current_data_body": "length-prefixed record, at most 1048710 bytes",
   "current_cm4_qualification": "pending_task_13"
 }
 ```
 <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
-The 2026-10-20 ASTRBS02 measurements used 1-MiB semantic segments and do not qualify the current candidate. Current qualification must measure 65,536-byte canonical plaintext chunks, ASTRBT01 records, and ABX1 extents of at most 1,048,576 bytes; three-CM4 qualification remains Task 13 work.
+The 2026-10-20 ASTRBS02 measurements validate the native-pack architecture but not the current commit. Current qualification must measure 1,048,576-byte plaintext segments, ASTRBS02 records of at most 1,048,706 bytes, and length-prefixed DATA bodies of at most 1,048,710 bytes; three-CM4 qualification remains Task 13 work.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
-The remediated profile uses the existing 64-KiB canonical plaintext chunk and
-an encoded canonical chunk record of at most 66,215 bytes. `ABX1` batches whole
-records into an extent of at most 1 MiB. The extent target is transfer policy,
-not the canonical plaintext chunk size and not a second Blob identity format.
+The remediated profile uses a 1-MiB native plaintext segment and an encoded
+`ASTRBS02` record of at most 1,048,706 bytes. The data lane adds only the
+four-byte record length; it does not build an intermediate carrier batch.
 
 Task 13 must establish the current candidate's end-to-end throughput and
 latency, CPU, peak RSS and
