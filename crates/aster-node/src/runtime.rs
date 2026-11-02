@@ -497,10 +497,23 @@ const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
 
-#[derive(Default)]
 struct AuthenticatedContactProgress {
     generation: AtomicU64,
+    idle_deadline_ms: AtomicU64,
     changed: Notify,
+}
+
+impl Default for AuthenticatedContactProgress {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            idle_deadline_ms: AtomicU64::new(
+                u64::try_from(CONTACT_DEADLINE.as_millis())
+                    .expect("contact deadline milliseconds fit u64"),
+            ),
+            changed: Notify::new(),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -514,6 +527,41 @@ pub(super) fn record_authenticated_contact_progress() {
     });
 }
 
+pub(super) struct AuthenticatedContactIdleDeadline {
+    progress: Option<Arc<AuthenticatedContactProgress>>,
+    previous_ms: u64,
+}
+
+impl Drop for AuthenticatedContactIdleDeadline {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress
+                .idle_deadline_ms
+                .store(self.previous_ms, Ordering::Release);
+            progress.changed.notify_one();
+        }
+    }
+}
+
+pub(super) fn enter_authenticated_contact_idle_deadline(
+    deadline: Duration,
+) -> AuthenticatedContactIdleDeadline {
+    let progress = AUTHENTICATED_CONTACT_PROGRESS.try_with(Arc::clone).ok();
+    let previous_ms = progress.as_ref().map_or(0, |progress| {
+        let deadline_ms = u64::try_from(deadline.as_millis())
+            .expect("authenticated deadline milliseconds fit u64");
+        let previous = progress
+            .idle_deadline_ms
+            .swap(deadline_ms, Ordering::AcqRel);
+        progress.changed.notify_one();
+        previous
+    });
+    AuthenticatedContactIdleDeadline {
+        progress,
+        previous_ms,
+    }
+}
+
 async fn with_authenticated_contact_progress_deadline<T>(
     future: impl Future<Output = T>,
 ) -> Result<T, ()> {
@@ -523,10 +571,12 @@ async fn with_authenticated_contact_progress_deadline<T>(
             tokio::pin!(future);
             loop {
                 let observed = progress.generation.load(Ordering::Acquire);
+                let idle_deadline =
+                    Duration::from_millis(progress.idle_deadline_ms.load(Ordering::Acquire));
                 tokio::select! {
                     result = &mut future => return Ok(result),
                     _ = progress.changed.notified() => {},
-                    _ = sleep(CONTACT_DEADLINE) => {
+                    _ = sleep(idle_deadline) => {
                         if progress.generation.load(Ordering::Acquire) == observed {
                             return Err(());
                         }
@@ -15764,48 +15814,63 @@ async fn run_selected_blob_worker(
     // before returning plaintext. The selected runtime makes no bounded-
     // latency claim for non-local/non-regular File providers; it never detaches
     // the worker or erases key-bearing state while that ownership remains live.
-    #[cfg(all(test, unix))]
     let runtime = tokio::runtime::Handle::current();
     let worker_admission = Arc::clone(&admission);
     let joined = tokio::task::spawn_blocking(move || {
         let mut application = application;
-        while let Some(command) = commands.blocking_recv() {
-            if !worker_admission.load(Ordering::Acquire) {
-                command.reject();
-                continue;
-            }
-            #[cfg(all(test, unix))]
-            if let Some(gate) = test_gate.as_ref() {
-                runtime.block_on(gate.enter_worker());
-            }
-            // A queued Blob command carries no actor policy guard. The facade
-            // replays the latest policy immediately before durable work and
-            // rechecks it before success, so controls can linearize during
-            // File or decryption work without disclosing stale-policy results.
-            let BlobWorkerCommand {
-                command,
-                _permit: permit,
-            } = command;
-            let result = application.execute_live(command, &worker_admission);
-            drop(permit);
-            if let Err(error) = result {
-                // `execute_live` returns a raw NodeError only for fatal internal
-                // coherence after a durable commit. Ordinary application
-                // errors have already been returned through the response.
-                worker_admission.store(false, Ordering::Release);
-                commands.close();
-                while let Ok(command) = commands.try_recv() {
+        let result = (|| {
+            while let Some(command) =
+                runtime.block_on(application.next_live_command(&mut commands))?
+            {
+                if !worker_admission.load(Ordering::Acquire) {
                     command.reject();
+                    continue;
                 }
-                return Err(error);
+                #[cfg(all(test, unix))]
+                if let Some(gate) = test_gate.as_ref() {
+                    runtime.block_on(gate.enter_worker());
+                }
+                // A queued Blob command carries no actor policy guard. The facade
+                // replays the latest policy immediately before durable work and
+                // rechecks it before success, so controls can linearize during
+                // File or decryption work without disclosing stale-policy results.
+                let BlobWorkerCommand {
+                    command,
+                    _permit: permit,
+                } = command;
+                let result = application.execute_live(command, &worker_admission);
+                drop(permit);
+                result?;
             }
+            Ok(())
+        })();
+        let mut reject_pending = || {
+            worker_admission.store(false, Ordering::Release);
+            commands.close();
+            while let Ok(command) = commands.try_recv() {
+                command.reject();
+            }
+        };
+        if result.is_err() {
+            reject_pending();
         }
-        if inject_fatal_on_shutdown {
-            return Err(NodeError::FatalBlobCoherence(
-                "injected worker failure during joined shutdown".into(),
-            ));
+        // EOF can race an owned promotion still running. Join before choosing
+        // success, and inspect the sticky fatal state after every job completes.
+        // An already-observed fatal closes admission before potentially slow joins.
+        let joined = application.join_live_promotions();
+        let result = result.and(joined).and_then(|()| {
+            if inject_fatal_on_shutdown {
+                Err(NodeError::FatalBlobCoherence(
+                    "injected worker failure during joined shutdown".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        if result.is_err() {
+            reject_pending();
         }
-        Ok(())
+        result
     })
     .await;
     match joined {
@@ -33269,6 +33334,303 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_rejects_dequeued_and_queued_commands() {
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        let fixture = tokio::task::block_in_place(|| {
+            crate::application::promotion_failure_fixture(ApplicationErrorKind::Integrity)
+        });
+        let admission = Arc::new(AtomicBool::new(true));
+        let priority = BlobOperationalPriorityGate::default();
+        let (sender, commands) = mpsc::channel(2);
+        let (worker_reached, mut reached) = mpsc::unbounded_channel();
+        let worker_release = Arc::new(tokio::sync::Notify::new());
+        let gate = BlobMaintenanceTestGate {
+            starts: Arc::new(AtomicUsize::new(0)),
+            first_block: None,
+            schedule_observations: None,
+            completed_progress: None,
+            block_periodic: false,
+            startup_page_entries: Arc::new(AtomicUsize::new(0)),
+            startup_pages: Arc::new(AtomicUsize::new(0)),
+            startup_before_worker: Arc::new(AtomicBool::new(false)),
+            worker_constructed: Arc::new(AtomicBool::new(false)),
+            worker_reached: Some(worker_reached),
+            worker_release: Some(worker_release.clone()),
+            retirement_deadline: None,
+        };
+        sender
+            .try_send(BlobWorkerCommand {
+                command: fixture.finish,
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue finish"));
+        let mut worker = tokio::spawn(run_selected_blob_worker(
+            fixture.node,
+            commands,
+            admission.clone(),
+            false,
+            Some(gate),
+        ));
+        reached.recv().await.unwrap();
+        worker_release.notify_one();
+        let BlobPublishFinalization::Scheduled(completion) =
+            fixture.scheduled.await.unwrap().unwrap()
+        else {
+            panic!("fresh stream must schedule promotion");
+        };
+        let mut waits = fixture.waits;
+        assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+        tokio::task::block_in_place(|| {
+            fixture
+                .started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        let (response, dequeued) = oneshot::channel();
+        sender
+            .try_send(BlobWorkerCommand {
+                command: SelectedBlobCommand::CapacityStatus { response },
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue command held before execution"));
+        reached.recv().await.unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            let (response, received) = oneshot::channel();
+            sender
+                .try_send(BlobWorkerCommand {
+                    command: SelectedBlobCommand::CapacityStatus { response },
+                    _permit: priority.acquire(),
+                })
+                .unwrap_or_else(|_| panic!("fill command queue"));
+            queued.push(received);
+        }
+        assert_eq!(sender.capacity(), 0);
+        drop(completion);
+        *fixture.release.0.lock().unwrap() = true;
+        fixture.release.1.notify_all();
+        tokio::task::block_in_place(|| {
+            fixture
+                .finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        worker_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+        if result.is_err() {
+            drop(sender);
+            for _ in 0..2 {
+                reached.recv().await.unwrap();
+                worker_release.notify_one();
+            }
+            worker.await.unwrap().unwrap();
+            panic!("promotion Integrity did not reject queued commands");
+        }
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(NodeError::FatalBlobCoherence(_))
+        ));
+        assert!(
+            dequeued.await.is_err(),
+            "command already dequeued must not execute after fatal"
+        );
+        for received in queued {
+            assert_eq!(
+                received.await.unwrap().unwrap_err().kind(),
+                ApplicationErrorKind::StateUnavailable
+            );
+        }
+        assert!(!admission.load(Ordering::Acquire));
+        assert!(sender.is_closed());
+        assert_eq!(priority.outstanding(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_ordinary_expiry_and_panic_keep_worker_available() {
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        // Break caught: treating all asynchronous errors as fatal would turn
+        // normal expiry or the existing panic classification into actor failure.
+        for expected in [
+            ApplicationErrorKind::ExpiredOrRetired,
+            ApplicationErrorKind::StateUnavailable,
+        ] {
+            let fixture = tokio::task::block_in_place(|| {
+                crate::application::promotion_failure_fixture(expected)
+            });
+            let admission = Arc::new(AtomicBool::new(true));
+            let priority = BlobOperationalPriorityGate::default();
+            let (sender, commands) = mpsc::channel(1);
+            sender
+                .try_send(BlobWorkerCommand {
+                    command: fixture.finish,
+                    _permit: priority.acquire(),
+                })
+                .unwrap_or_else(|_| panic!("enqueue finish"));
+            let mut worker = tokio::spawn(run_selected_blob_worker(
+                fixture.node,
+                commands,
+                admission.clone(),
+                false,
+                None,
+            ));
+            let mut waits = fixture.waits;
+            let BlobPublishFinalization::Scheduled(completion) =
+                fixture.scheduled.await.unwrap().unwrap()
+            else {
+                panic!("fresh stream must schedule promotion");
+            };
+            assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+            tokio::task::block_in_place(|| {
+                fixture
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+            });
+            fixture.custody_clock.set_injected_tick(151).unwrap();
+            *fixture.release.0.lock().unwrap() = true;
+            fixture.release.1.notify_all();
+            assert_eq!(completion.await.unwrap().unwrap_err().kind(), expected);
+            let (response, received) = oneshot::channel();
+            sender
+                .send(BlobWorkerCommand {
+                    command: SelectedBlobCommand::CapacityStatus { response },
+                    _permit: priority.acquire(),
+                })
+                .await
+                .unwrap_or_else(|_| panic!("ordinary failure keeps worker open"));
+            assert!(received.await.unwrap().is_ok());
+            assert!(admission.load(Ordering::Acquire));
+            drop(sender);
+            tokio::time::timeout(Duration::from_secs(5), &mut worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(priority.outstanding(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_promotion_integrity_stops_worker(drop_completion: bool, close_input: bool) {
+        // Break caught: only reporting a background Integrity to the caller
+        // leaves an idle actor alive, or loses a late error during joined shutdown.
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        let fixture = tokio::task::block_in_place(|| {
+            crate::application::promotion_failure_fixture(ApplicationErrorKind::Integrity)
+        });
+        let admission = Arc::new(AtomicBool::new(true));
+        let priority = BlobOperationalPriorityGate::default();
+        let (sender, commands) = mpsc::channel(2);
+        sender
+            .try_send(BlobWorkerCommand {
+                command: fixture.finish,
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue finish"));
+        let mut worker = tokio::spawn(run_selected_blob_worker(
+            fixture.node,
+            commands,
+            admission.clone(),
+            false,
+            None,
+        ));
+        let mut waits = fixture.waits;
+        let BlobPublishFinalization::Scheduled(completion) =
+            fixture.scheduled.await.unwrap().unwrap()
+        else {
+            panic!("fresh stream must schedule promotion");
+        };
+        tokio::task::block_in_place(|| {
+            fixture
+                .started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+        let completion = if drop_completion {
+            drop(completion);
+            None
+        } else {
+            Some(completion)
+        };
+        let mut sender = Some(sender);
+        if close_input {
+            drop(sender.take());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match waits.recv().await.expect("worker wait observer stays open") {
+                        BlobLiveWaitObservation::Closed => break,
+                        BlobLiveWaitObservation::Idle => {}
+                    }
+                }
+            })
+            .await
+            .expect("worker observes channel close before promotion release");
+            assert!(
+                !worker.is_finished(),
+                "shutdown must still own the gated promotion"
+            );
+        }
+        *fixture.release.0.lock().unwrap() = true;
+        fixture.release.1.notify_all();
+        tokio::task::block_in_place(|| {
+            fixture
+                .finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        if let Some(completion) = completion {
+            assert_eq!(
+                completion.await.unwrap().unwrap_err().kind(),
+                ApplicationErrorKind::Integrity
+            );
+        }
+        // Keep the sender open: neither a new command nor EOF may be required
+        // to deliver the background failure to an idle worker.
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+        if result.is_err() {
+            drop(sender.take());
+            worker.await.unwrap().unwrap();
+            panic!("promotion Integrity did not wake and stop idle worker");
+        }
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(NodeError::FatalBlobCoherence(_))
+        ));
+        assert!(!admission.load(Ordering::Acquire));
+        assert_eq!(priority.outstanding(), 0);
+        if let Some(sender) = sender {
+            assert!(sender.is_closed());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_wakes_idle_worker_with_attached_completion() {
+        assert_promotion_integrity_stops_worker(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_wakes_idle_worker_with_dropped_completion() {
+        assert_promotion_integrity_stops_worker(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_during_channel_close_is_fatal_after_join() {
+        assert_promotion_integrity_stops_worker(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blob_retirement_deadline_defers_to_queued_request_and_resumes() {
         assert_blob_retirement_deadline_priority(true).await;
     }
@@ -49045,14 +49407,9 @@ mod tests {
                 },
             )
             .expect("reserve native Profile-5 upload");
-        let root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)
-            .expect("native Profile-5 pack root");
-        let mut writer = aster_redb_store::pack::BlobPackWriter::open_projected_upload_pinned(
-            &root,
-            &reservation.pack_identity(),
-            checkpoint.durable_pack_checkpoint(),
-        )
-        .expect("native Profile-5 writer");
+        let mut writer = store
+            .open_blob_upload_writer(&reservation, &checkpoint)
+            .expect("native Profile-5 writer");
         let segment_sealer = sealer
             .blob_stream_segment_sealer(&open)
             .expect("native Profile-5 segment sealer");
@@ -52886,6 +53243,97 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_native_checkpoint_retains_writer_until_projection_finishes() {
+        let services = control_test_services([0xb7; 32]);
+        let state = root("native-checkpoint-cancel-ownership");
+        fs::create_dir_all(&state).unwrap();
+        let store = Arc::new(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = aster_redb_store::BlobUploadRequest {
+            owner: aster_redb_store::BlobOperationOwner::new(
+                services.member.identity(),
+                aster_redb_store::BlobOperationKey::new(b"checkpoint/cancel".to_vec()).unwrap(),
+            ),
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            priority: Priority::Routine,
+            ttl_ms: None,
+            media_type: None,
+            schema_id: Vec::new(),
+            total_len: 1,
+        };
+        let (reservation, checkpoint) = store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .unwrap();
+        let mut writer = store
+            .open_blob_upload_writer(&reservation, &checkpoint)
+            .unwrap();
+        let durable = writer.checkpoint().unwrap();
+        let sink = Arc::new(std::sync::Mutex::new((writer, checkpoint.clone(), 0)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Occupy the only blocking worker so projection is deterministically queued.
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+            let task_store = Arc::clone(&store);
+            let task_reservation = reservation.clone();
+            let task_checkpoint = checkpoint.clone();
+            let task_durable = durable.clone();
+            let receiver = tokio::spawn(async move {
+                let commit = blob_stream::spawn_native_profile5_checkpoint(
+                    sink,
+                    task_store,
+                    policy,
+                    task_reservation,
+                    task_checkpoint,
+                    task_durable,
+                );
+                queued_tx.send(()).unwrap();
+                commit.await
+            });
+            queued_rx.await.unwrap();
+            receiver.abort();
+            assert!(receiver.await.unwrap_err().is_cancelled());
+            let duplicate = store.open_blob_upload_writer(&reservation, &checkpoint);
+            // Always release the blocked worker, including on a failing assertion.
+            let duplicate_rejected = duplicate.is_err();
+            drop(duplicate);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                duplicate_rejected,
+                "cancelled receiver released the writer before its queued checkpoint"
+            );
+            let (_, restored) = store.resume_blob_upload(&request.owner).unwrap().unwrap();
+            assert_eq!(restored.durable_pack_checkpoint(), Some(&durable));
+            assert!(
+                store
+                    .open_blob_upload_writer(&reservation, &restored)
+                    .is_ok()
+            );
+        });
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn finite_profile5_source_is_inventory_eligible_with_v9_custody_authority() {
         let services = control_test_services([0xa7; 32]);
         let state = root("canonical-profile5-finite-inventory");
@@ -52977,6 +53425,8 @@ mod tests {
         ttl_ms: Option<u64>,
         fail_after_receives: Option<usize>,
         preseed_equivalent_pack: bool,
+        completed_before_contact: bool,
+        pressure_before_promotion: bool,
         restart_before_retry: bool,
         expire_before_promotion: bool,
         revoke_before_promotion: bool,
@@ -53058,6 +53508,74 @@ mod tests {
                 },
             ),
         ));
+    }
+
+    #[test]
+    fn completed_native_profile5_upload_recovers_without_data() {
+        for (suffix, seed, preseed, ttl) in [
+            ("completed-dedup", 0xb0, true, None),
+            ("completed-finite-dedup", 0xb1, true, Some(600_000)),
+            ("completed-original", 0xb2, false, None),
+            ("completed-finite-original", 0xb3, false, Some(600_000)),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: preseed,
+                        completed_before_contact: true,
+                        ttl_ms: ttl,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
+    }
+
+    #[test]
+    fn native_profile5_reuse_holds_pack_lease_through_promotion() {
+        for (suffix, seed, completed) in [
+            ("retained-lease", 0xb7, false),
+            ("completed-lease", 0xb8, true),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: true,
+                        completed_before_contact: completed,
+                        pressure_before_promotion: true,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
+    }
+
+    #[test]
+    fn native_profile5_reuse_requires_finish_and_current_authority() {
+        for (suffix, seed, fail, expire, revoke) in [
+            ("reuse-finish", 0xb4, Some(3), false, false),
+            ("reuse-expiry", 0xb5, None, true, false),
+            ("reuse-revoke", 0xb6, None, false, true),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: true,
+                        ttl_ms: Some(if expire { 1_000 } else { 600_000 }),
+                        fail_after_receives: fail,
+                        expire_before_promotion: expire,
+                        revoke_before_promotion: revoke,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
     }
 
     #[test]
@@ -53178,6 +53696,8 @@ mod tests {
             ttl_ms,
             fail_after_receives,
             preseed_equivalent_pack,
+            completed_before_contact,
+            pressure_before_promotion,
             restart_before_retry,
             expire_before_promotion,
             revoke_before_promotion,
@@ -53263,12 +53783,78 @@ mod tests {
             .get_blob(publication)
             .expect("native source lookup")
             .expect("native source exists");
-        let source_session = source_store
+        let mut source_session = source_store
             .open_profile5_pack_transfer_read(stored.variant_id)
             .expect("native source transfer lease");
         let verified_source = source_verifier
             .verify_blob_stream_publication_source(&stored.sealed)
             .expect("verify native publication source");
+        if completed_before_contact {
+            // Recreate the durable boundary left by the old receiver after pack
+            // completion but before publication, then reconnect through production transport.
+            let policy = target_store
+                .control_policy_snapshot()
+                .expect("completion policy");
+            let (reservation, checkpoint, open) = target_store
+                .reserve_received_profile5_upload_with_policy(
+                    &policy,
+                    verified_source.publication(),
+                    verified_source.physical_open(),
+                )
+                .expect("reserve completed receiver fixture");
+            let mut writer = target_store
+                .open_blob_upload_writer(&reservation, &checkpoint)
+                .expect("completed receiver writer");
+            let opener = source_verifier
+                .blob_stream_segment_opener(&open)
+                .expect("completed receiver segment opener");
+            while let Some(segment) = source_session
+                .next_segment()
+                .expect("completed receiver segment")
+            {
+                let (_, leaves) = opener
+                    .open(&segment)
+                    .expect("verify completed receiver segment");
+                writer
+                    .append(&segment, leaves)
+                    .expect("append completed receiver segment");
+            }
+            let completion = writer
+                .finish_profile5(verified_source.physical_commitment())
+                .expect("finish completed receiver pack");
+            let checkpoint = target_store
+                .checkpoint_blob_upload(
+                    &policy,
+                    &reservation,
+                    checkpoint,
+                    completion.checkpoint().clone(),
+                )
+                .expect("project completed receiver pack");
+            let checkpoint = target_store
+                .complete_profile5_upload_pack(
+                    &policy,
+                    &reservation,
+                    checkpoint,
+                    completion,
+                    verified_source.physical_commitment(),
+                    source_verifier
+                        .blob_stream_lineage(&open)
+                        .expect("completed receiver lineage"),
+                )
+                .expect("retain completed receiver authority");
+            assert_eq!(
+                checkpoint
+                    .profile5_completion()
+                    .unwrap()
+                    .reuses_existing_pack(),
+                preseed_equivalent_pack
+            );
+            drop(target_store);
+            target_store = Arc::new(
+                Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen receiver between completion and publication"),
+            );
+        }
         let mut mismatched_projection = retained.source.clone();
         mismatched_projection.total_len = mismatched_projection
             .total_len
@@ -53449,102 +54035,122 @@ mod tests {
                 failed.0.is_err() && failed.1.is_err(),
                 "both peers must observe the interrupted adapter: {failed:?}"
             );
-            let interrupted_probe = pipeline_probe
-                .as_ref()
-                .expect("interrupted native receiver pipeline probe");
-            assert!(
-                interrupted_probe.peak_active_workers() > 0,
-                "interrupted native transfer must exercise map workers"
-            );
-            assert_eq!(
-                interrupted_probe.active_workers(),
-                0,
-                "interrupted native transfer must leave no map worker alive"
-            );
-            assert_eq!(
-                interrupted_probe.joined_workers(),
-                interrupted_probe.worker_exits(),
-                "interrupted native transfer must join every worker that exits"
-            );
-            assert!(
-                target_store
-                    .get_blob(publication)
-                    .expect("interrupted target lookup")
-                    .is_none(),
-                "interrupted native pack must remain invisible"
-            );
-            let (_, checkpoint) = target_store
-                .resume_blob_upload_by_publication_id(publication_stream_id)
-                .expect("load interrupted native upload")
-                .expect("interrupted native upload remains resumable");
-            let resumed = checkpoint
-                .durable_pack_checkpoint()
-                .expect("interrupted native pack has durable progress")
-                .payload_len();
-            let wire_len = crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
-                .expect("native pack wire length");
-            if fail_after_receives == 5 {
-                assert_eq!(resumed, wire_len);
-            } else {
-                assert!(resumed > 0 && resumed < wire_len);
-            }
-            let inspection_verifier = open_test_sealer(&services.other);
-            let inspection_cache =
-                Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
-            let mut target_node = SelectedBlobNode::from_runtime(
-                services.other.clone(),
-                Arc::clone(&target_store),
-                inspection_verifier,
-                target_store
-                    .control_head()
-                    .expect("interrupted target control head"),
-                inspection_cache,
-                NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
-            )
-            .expect("open public Blob status for interrupted native pack");
-            let inspection = target_node
-                .inspect_publication(crate::application::BlobPublicationInspectionRequest {
-                    publication_id: crate::application::BlobStreamPublicationId::from_bytes(
-                        *publication_stream_id.as_bytes(),
-                    )
-                    .expect("native publication identity"),
-                    topic: services.topic.clone(),
-                    scope: services.scope.clone(),
-                })
-                .expect("inspect interrupted native publication");
-            assert_eq!(
-                inspection.phase,
-                if fail_after_receives == 5 {
-                    crate::application::BlobPublicationPhase::ReadyToFinalize
-                } else {
-                    crate::application::BlobPublicationPhase::Receiving
-                }
-            );
-            assert!(inspection.durable_plaintext_bytes > 0);
-            assert!(inspection.durable_transfer_bytes > 0);
-            assert_eq!(inspection.blob_id, None);
-            drop(target_node);
-            if ttl_ms.is_some() {
-                drop(checkpoint);
-                drop(failed);
-                drop(target_store);
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen interrupted native target store"),
+            if preseed_equivalent_pack {
+                assert!(
+                    target_store
+                        .blob_for_owner_with_policy(&target_policy, &incoming_owner)
+                        .expect("failed FINISH owner lookup")
+                        .is_none()
                 );
-                let (_, reopened_checkpoint) = target_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load restarted native upload")
-                    .expect("restarted native upload remains resumable");
+                assert!(
+                    target_store
+                        .resume_blob_upload(&incoming_owner)
+                        .expect("failed FINISH upload lookup")
+                        .is_none()
+                );
                 assert_eq!(
-                    reopened_checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("restarted native pack durable progress")
-                        .payload_len(),
-                    resumed
+                    target_store.blob_stats().expect("failed FINISH stats"),
+                    target_stats_before
                 );
+                0
+            } else {
+                let interrupted_probe = pipeline_probe
+                    .as_ref()
+                    .expect("interrupted native receiver pipeline probe");
+                assert!(
+                    interrupted_probe.peak_active_workers() > 0,
+                    "interrupted native transfer must exercise map workers"
+                );
+                assert_eq!(
+                    interrupted_probe.active_workers(),
+                    0,
+                    "interrupted native transfer must leave no map worker alive"
+                );
+                assert_eq!(
+                    interrupted_probe.joined_workers(),
+                    interrupted_probe.worker_exits(),
+                    "interrupted native transfer must join every worker that exits"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("interrupted target lookup")
+                        .is_none(),
+                    "interrupted native pack must remain invisible"
+                );
+                let (_, checkpoint) = target_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("load interrupted native upload")
+                    .expect("interrupted native upload remains resumable");
+                let resumed = checkpoint
+                    .durable_pack_checkpoint()
+                    .expect("interrupted native pack has durable progress")
+                    .payload_len();
+                let wire_len = crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
+                    .expect("native pack wire length");
+                if fail_after_receives == 5 {
+                    assert_eq!(resumed, wire_len);
+                } else {
+                    assert!(resumed > 0 && resumed < wire_len);
+                }
+                let inspection_verifier = open_test_sealer(&services.other);
+                let inspection_cache =
+                    Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
+                let mut target_node = SelectedBlobNode::from_runtime(
+                    services.other.clone(),
+                    Arc::clone(&target_store),
+                    inspection_verifier,
+                    target_store
+                        .control_head()
+                        .expect("interrupted target control head"),
+                    inspection_cache,
+                    NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
+                )
+                .expect("open public Blob status for interrupted native pack");
+                let inspection = target_node
+                    .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                        publication_id: crate::application::BlobStreamPublicationId::from_bytes(
+                            *publication_stream_id.as_bytes(),
+                        )
+                        .expect("native publication identity"),
+                        topic: services.topic.clone(),
+                        scope: services.scope.clone(),
+                    })
+                    .expect("inspect interrupted native publication");
+                assert_eq!(
+                    inspection.phase,
+                    if fail_after_receives == 5 {
+                        crate::application::BlobPublicationPhase::ReadyToFinalize
+                    } else {
+                        crate::application::BlobPublicationPhase::Receiving
+                    }
+                );
+                assert!(inspection.durable_plaintext_bytes > 0);
+                assert!(inspection.durable_transfer_bytes > 0);
+                assert_eq!(inspection.blob_id, None);
+                drop(target_node);
+                if ttl_ms.is_some() {
+                    drop(checkpoint);
+                    drop(failed);
+                    drop(target_store);
+                    target_store = Arc::new(
+                        Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                            .expect("reopen interrupted native target store"),
+                    );
+                    let (_, reopened_checkpoint) = target_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load restarted native upload")
+                        .expect("restarted native upload remains resumable");
+                    assert_eq!(
+                        reopened_checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("restarted native pack durable progress")
+                            .payload_len(),
+                        resumed
+                    );
+                }
+                resumed
             }
-            resumed
         } else {
             0
         };
@@ -53584,18 +54190,20 @@ mod tests {
                     .expect("expiring native pack wire length");
             Some(Arc::new(move || {
                 hook_ran.store(true, Ordering::SeqCst);
-                let (_, checkpoint) = hook_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load expiring native upload before promotion")
-                    .expect("expiring native upload remains provisional before promotion");
-                assert_eq!(
-                    checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("expiring native upload has durable pack progress")
-                        .payload_len(),
-                    expected_wire_len,
-                    "expiry injection must run only after the complete pack is durable"
-                );
+                if !preseed_equivalent_pack {
+                    let (_, checkpoint) = hook_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load expiring native upload before promotion")
+                        .expect("expiring native upload remains provisional before promotion");
+                    assert_eq!(
+                        checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("expiring native upload has durable pack progress")
+                            .payload_len(),
+                        expected_wire_len,
+                        "expiry injection must run only after the complete pack is durable"
+                    );
+                }
                 hook_store
                     .test_observe_blob_custody_sample(CustodySample {
                         clock_id: [0xe5; 16],
@@ -53615,21 +54223,48 @@ mod tests {
                     .expect("revoked native pack wire length");
             Some(Arc::new(move || {
                 hook_ran.store(true, Ordering::SeqCst);
-                let (_, checkpoint) = revoke_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load revoked native upload before promotion")
-                    .expect("revoked native upload remains provisional before promotion");
-                assert_eq!(
-                    checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("revoked native upload has durable pack progress")
-                        .payload_len(),
-                    expected_wire_len,
-                    "revocation injection must run only after the complete pack is durable"
-                );
+                if !preseed_equivalent_pack {
+                    let (_, checkpoint) = revoke_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load revoked native upload before promotion")
+                        .expect("revoked native upload remains provisional before promotion");
+                    assert_eq!(
+                        checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("revoked native upload has durable pack progress")
+                            .payload_len(),
+                        expected_wire_len,
+                        "revocation injection must run only after the complete pack is durable"
+                    );
+                }
                 revoke_store
                     .test_revoke_blob_publisher_for_reclamation(publisher)
                     .expect("revoke native publisher before promotion");
+            }))
+        } else if pressure_before_promotion {
+            let hook_store = Arc::clone(&target_store);
+            let hook_ran = Arc::clone(&promotion_hook_ran);
+            Some(Arc::new(move || {
+                hook_ran.store(true, Ordering::SeqCst);
+                let recovery = hook_store
+                    .run_durable_blob_pressure_recovery_after_cleanup(
+                        &StoreError::ItemLimitExceeded {
+                            current: 1,
+                            limit: 1,
+                        },
+                        Priority::Flash,
+                        None,
+                        (0, 0),
+                        blob_capacity_recovery_budget(),
+                        None,
+                    )
+                    .expect("pressure at native reuse FINISH")
+                    .expect("typed pressure demand");
+                assert!(
+                    recovery.evicted_transfer_ids().is_empty(),
+                    "the active reuse lease must protect the last retained publication"
+                );
+                assert!(!recovery.deficit_met());
             }))
         } else {
             None
@@ -53957,9 +54592,10 @@ mod tests {
                 promotion_hook_ran.load(Ordering::SeqCst),
                 "rejection must happen after the pre-promotion hook"
             );
-            assert!(
-                !adapter.data_part_body_lengths().is_empty(),
-                "rejection must happen after native DATA records cross the adapter"
+            assert_eq!(
+                adapter.data_part_body_lengths().is_empty(),
+                preseed_equivalent_pack,
+                "retained content must require no DATA even when promotion is rejected"
             );
             assert!(
                 target_store
@@ -54013,8 +54649,25 @@ mod tests {
             received.expect("join native Profile-5 receiver");
         let received = received.expect("native Profile-5 receiver");
         target_verifier = returned_target_verifier;
+        if pressure_before_promotion {
+            assert!(promotion_hook_ran.load(Ordering::SeqCst));
+        }
         assert_eq!(sent.roots, received.roots);
         assert_eq!(sent.wire_bytes, received.wire_bytes);
+        if preseed_equivalent_pack || completed_before_contact {
+            assert!(
+                adapter.data_part_body_lengths().is_empty(),
+                "a new publication over retained content must send no DATA on its first attempt"
+            );
+            assert_eq!(sent.attempt_bytes, 0);
+            assert_eq!(received.attempt_bytes, 0);
+            assert!(received.pipeline.is_none());
+        }
+        let resumed_after_interruption = if preseed_equivalent_pack || completed_before_contact {
+            sent.wire_bytes
+        } else {
+            resumed_after_interruption
+        };
         assert_eq!(sent.resumed_from, resumed_after_interruption);
         assert_eq!(received.resumed_from, resumed_after_interruption);
         let target_incoming_transfer = if preseed_equivalent_pack {

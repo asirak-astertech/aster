@@ -58,6 +58,7 @@ pub(super) enum BlobPackFaultPoint {
     DataSynced,
     CheckpointZeroSynced,
     CheckpointOneSynced,
+    CleanupEntryRemoved,
     CleanupDurable,
 }
 
@@ -142,6 +143,16 @@ impl From<std::io::Error> for BlobPackError {
 impl From<StoreError> for BlobPackError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+fn acquire_pack_writer_lock(data: &File) -> Result<(), BlobPackError> {
+    match data.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(BlobPackError::Invalid(
+            "another Blob pack writer already owns this pack",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
@@ -254,6 +265,21 @@ pub(super) fn stage_upload_pack_reservation(
     root: &PinnedBlobPackRoot,
     identity: &BlobPackIdentity,
 ) -> Result<(), BlobPackError> {
+    // The filename is keyed by stream ID, while its contents bind the entire
+    // physical identity. Reject a conflicting existing directory before making
+    // recovery authority durable. The caller holds the Store depot write lock.
+    if let Some(directory) = root
+        .directory
+        .open_child_directory_if_present(&hex32(identity.upload_id.as_bytes()))?
+    {
+        let marker = directory.read_private_file_if_present(UPLOAD_MARKER, 80)?;
+        if marker
+            .as_deref()
+            .is_some_and(|marker| marker != encode_upload_marker(*identity))
+        {
+            return Err(BlobPackError::Invalid("Blob upload pack marker mismatch"));
+        }
+    }
     let name = reservation_marker_name(*identity);
     let expected = encode_reservation_marker(*identity);
     match root.directory.read_private_file_if_present(&name, 80)? {
@@ -306,10 +332,102 @@ pub(super) fn stage_upload_pack_cleanup(
     }
 }
 
+/// The existing marker is also a fence against reopening a retiring writer.
+pub(super) fn upload_cleanup_started(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<bool, BlobPackError> {
+    match root
+        .directory
+        .read_private_file_if_present(&cleanup_marker_name(*identity), 80)?
+    {
+        Some(marker) if marker == encode_cleanup_marker(*identity) => Ok(true),
+        Some(_) => Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker mismatch",
+        )),
+        None => Ok(false),
+    }
+}
+
+/// One physical entry per turn, with no payload reads or unbounded directory
+/// scan. The caller precharges 1024 bytes for markers and at most two names,
+/// holds the depot writer lock and retains the exact durable upload row until
+/// this returns complete. A complete unit reserves its one file for removing
+/// the cleanup marker after the redb commit.
+pub(super) fn remove_upload_pack_maintenance_unit(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(u64, bool), BlobPackError> {
+    let started = upload_cleanup_started(root, identity)?;
+    let name = hex32(identity.upload_id.as_bytes());
+    let directory = root.directory.open_child_directory_if_present(&name)?;
+    let mut writer_guard = None;
+    if let Some(directory) = &directory {
+        let marker = directory.read_private_file_if_present(UPLOAD_MARKER, 80)?;
+        if marker.as_deref() != Some(encode_upload_marker(*identity).as_slice())
+            && !(started && marker.is_none() && directory.entry_names_bounded(1)?.is_empty())
+        {
+            return Err(BlobPackError::Invalid("Blob upload pack marker mismatch"));
+        }
+        if let Some(data) = directory.open_private_rw_file_if_present(PACK_FILE)? {
+            match data.try_lock() {
+                Ok(()) => writer_guard = Some(data),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok((0, false)),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+    if !started {
+        stage_upload_pack_cleanup(root, identity)?;
+        return Ok((1, false));
+    }
+    let Some(directory) = directory else {
+        #[cfg(test)]
+        maybe_inject_fault(root.directory.path(), BlobPackFaultPoint::CleanupDurable)?;
+        return Ok((1, true));
+    };
+    let entries = directory.entry_names_bounded(2)?;
+    if let Some(entry) = entries.iter().find(|name| name.as_str() != UPLOAD_MARKER) {
+        if entry != PACK_FILE
+            && entry != UPLOAD_DIGEST_FILE
+            && entry != CHECKPOINT_ZERO
+            && entry != CHECKPOINT_ONE
+            && entry != COMPLETION_FILE
+            && !entry.starts_with(PACK_TEMP_PREFIX)
+        {
+            return Err(BlobPackError::Invalid(
+                "Blob upload pack contains a foreign artifact",
+            ));
+        }
+        directory.remove_if_exists(entry, false)?;
+        #[cfg(test)]
+        maybe_inject_fault(
+            root.directory.path(),
+            BlobPackFaultPoint::CleanupEntryRemoved,
+        )?;
+    } else if !entries.is_empty() {
+        directory.remove_if_exists(UPLOAD_MARKER, false)?;
+    } else {
+        drop(directory);
+        root.directory.remove_if_exists(&name, true)?;
+    }
+    drop(writer_guard);
+    Ok((1, false))
+}
+
 pub(super) fn finish_upload_pack_cleanup(
     root: &PinnedBlobPackRoot,
     identity: &BlobPackIdentity,
 ) -> Result<(), BlobPackError> {
+    if let Some(marker) = root
+        .directory
+        .read_private_file_if_present(&cleanup_marker_name(*identity), 80)?
+        && marker != encode_cleanup_marker(*identity)
+    {
+        return Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker mismatch",
+        ));
+    }
     root.directory
         .remove_if_exists(&cleanup_marker_name(*identity), false)?;
     Ok(())
@@ -382,7 +500,7 @@ fn remove_upload_pack_directory(
     let Some(directory) = parent.open_child_directory_if_present(&name)? else {
         return Ok(());
     };
-    let entries = directory.entry_names()?;
+    let entries = directory.entry_names_reclaiming_atomic_temporaries(true)?;
     let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
         if entries.is_empty() {
             drop(directory);
@@ -421,6 +539,9 @@ fn remove_upload_pack_directory(
         .filter(|entry| entry.as_str() != UPLOAD_MARKER)
     {
         directory.remove_if_exists(entry, false)?;
+        #[cfg(test)]
+        maybe_inject_fault(parent.path(), BlobPackFaultPoint::CleanupEntryRemoved)
+            .map_err(pack_marker_store_error)?;
     }
     directory.remove_if_exists(UPLOAD_MARKER, false)?;
     drop(directory);
@@ -443,6 +564,9 @@ pub(super) struct ExpectedBlobUploadPack {
     /// Deletion owns the durable identity while the physical directory may
     /// already be absent after a crash between unlink and redb finalization.
     pub(super) may_be_absent: bool,
+    /// A durable upload completion selected another pack. Remove only this
+    /// redundant candidate, keeping its pending semantic publication intact.
+    pub(super) discard_candidate: bool,
 }
 
 fn audit_expected_upload_pack(
@@ -520,11 +644,14 @@ fn audit_expected_upload_pack(
         && projected.pack_len() == PACK_HEADER_LEN
         && projected.frontier().ciphertext_commitment()
             == frontier.checkpoint().ciphertext_commitment();
+    // Bytes after the store-authoritative checkpoint are an unacknowledged
+    // append, which may have torn anywhere in its record. Resume truncates
+    // that tail; even a read-only audit must not give it durable authority.
     while data
         .stream_position()
         .map_err(BlobStoreError::Io)
         .map_err(blob_error)?
-        < data_len
+        < projected.pack_len()
     {
         let mut length = [0; 4];
         data.read_exact(&mut length)
@@ -603,7 +730,7 @@ fn audit_upload_packs(
             )))
         };
     };
-    let entries = pack_root.entry_names()?;
+    let entries = pack_root.entry_names_reclaiming_atomic_temporaries(recover)?;
     let mut cleanup = std::collections::BTreeMap::new();
     for name in entries
         .iter()
@@ -656,10 +783,59 @@ fn audit_upload_packs(
         !name.starts_with(UPLOAD_CLEANUP_PREFIX) && !name.starts_with(UPLOAD_RESERVATION_PREFIX)
     }) {
         let directory = pack_root.open_child_directory(&name, false)?;
+        let directory_entries = directory.entry_names_reclaiming_atomic_temporaries(recover)?;
         let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
-            return Err(blob_error(BlobStoreError::DepotIntegrity(
-                "Blob upload pack marker is missing",
-            )));
+            // mkdir precedes the initial marker; cleanup unlinks the marker
+            // before rmdir. Only an empty directory and exact external
+            // transition authority can identify either interrupted operation.
+            let durable = expected
+                .iter()
+                .find(|expected| name == hex32(expected.identity.upload_id.as_bytes()));
+            let transition = cleanup
+                .values()
+                .chain(reservations.values())
+                .find(|identity| name == hex32(identity.upload_id.as_bytes()));
+            let identity = transition
+                .copied()
+                .or_else(|| {
+                    durable
+                        .filter(|pack| pack.may_be_absent)
+                        .map(|pack| pack.identity)
+                })
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob upload pack marker is missing",
+                    ))
+                })?;
+            let cleaning = cleanup.get(identity.upload_id.as_bytes()) == Some(&identity);
+            let reserving = reservations.get(identity.upload_id.as_bytes()) == Some(&identity);
+            if !directory_entries.is_empty()
+                || durable.is_some_and(|pack| pack.identity != identity)
+                || cleanup
+                    .get(identity.upload_id.as_bytes())
+                    .is_some_and(|marker| marker != &identity)
+                || reservations
+                    .get(identity.upload_id.as_bytes())
+                    .is_some_and(|marker| marker != &identity)
+                || !(cleaning
+                    || (reserving && durable.is_none())
+                    || durable.is_some_and(|pack| pack.may_be_absent))
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "markerless Blob upload directory lacks exact transition authority",
+                )));
+            }
+            if recover {
+                drop(directory);
+                remove_upload_pack_directory(&pack_root, &identity)?;
+            }
+            if durable.is_some() {
+                seen.insert(*identity.upload_id.as_bytes());
+                if cleaning {
+                    completed.push(identity);
+                }
+            }
+            continue;
         };
         let identity = decode_upload_marker(&marker).map_err(pack_marker_store_error)?;
         if name != hex32(identity.upload_id.as_bytes()) {
@@ -706,6 +882,11 @@ fn audit_upload_packs(
                 remove_upload_pack_directory(&pack_root, &identity)?;
             }
             completed.push(identity);
+        } else if expected_pack.discard_candidate {
+            if recover {
+                drop(directory);
+                remove_upload_pack_directory(&pack_root, &identity)?;
+            }
         } else {
             audit_expected_upload_pack(&directory, &expected_pack)?;
             if recover && reservations.get(identity.upload_id.as_bytes()) == Some(&identity) {
@@ -1804,6 +1985,7 @@ impl BlobPackWriter {
 
     fn create_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(true)?;
+        acquire_pack_writer_lock(&data)?;
         let open_digest = identity.request_digest;
         data.write_all(PACK_MAGIC)?;
         data.write_all(&PACK_VERSION.to_be_bytes())?;
@@ -1846,6 +2028,7 @@ impl BlobPackWriter {
 
     fn resume_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(false)?;
+        acquire_pack_writer_lock(&data)?;
         validate_header(&mut data, identity)?;
         let checkpoint = recover_checkpoint(&root, identity, data.metadata()?.len())?;
         Self::restore(root, identity, data, checkpoint)
@@ -1900,7 +2083,9 @@ impl BlobPackWriter {
 
     /// Reopens a provisional upload at exactly the checkpoint already
     /// projected into redb, discarding any later unprojected pack tail.
-    pub fn open_projected_upload_pinned(
+    /// The caller must serialize projection validation and acquisition; live
+    /// callers use Store::open_blob_upload_writer.
+    pub(crate) fn open_projected_upload_pinned(
         root: &PinnedBlobPackRoot,
         identity: &BlobPackIdentity,
         projected: Option<&BlobPackCheckpoint>,
@@ -1953,6 +2138,7 @@ impl BlobPackWriter {
             }
             None => return Err(BlobPackError::Invalid("Blob pack data is unavailable")),
         };
+        acquire_pack_writer_lock(&data)?;
         validate_header(&mut data, identity)?;
         let data_len = data.metadata()?.len();
         let checkpoint = recover_checkpoints(&root, identity, data_len)?

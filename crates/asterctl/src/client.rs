@@ -147,6 +147,12 @@ impl MutationError {
         let Some(detail) = public_error_detail(error, expected_operation) else {
             return classified;
         };
+        if expected_operation == "publish_blob"
+            && error.code == connectrpc::ErrorCode::Unavailable
+            && detail.reason.as_known() == Some(api::PublicErrorReason::StateUnavailable)
+        {
+            classified.hint = "\nThe agent reported temporarily unavailable state; an earlier publication attempt may still complete. Wait before retrying.";
+        }
         if is_definite_publish_rejection(error.code, detail.reason.as_known()) {
             classified.unknown = false;
             classified.retryable_rejection = detail.retryable;
@@ -1215,6 +1221,27 @@ mod tests {
     }
 
     #[test]
+    fn typed_blob_temporary_state_preserves_unknown_outcome_without_connection_hint() {
+        // Break caught: a reachable agent returning temporary state (including
+        // an ongoing publication) must not be diagnosed as a bad host or port.
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let error = public_error(
+            connectrpc::ErrorCode::Unavailable,
+            api::PublicErrorReason::StateUnavailable,
+            "publish_blob",
+            true,
+        );
+        let rendered =
+            MutationError::rpc_error(&error, "publish_blob").describe("PublishBlob", &key);
+        assert!(rendered.starts_with("PublishBlob outcome unknown: unavailable"));
+        assert!(rendered.contains("retry the identical request with --operation-key=blob-key"));
+        assert!(!rendered.contains("--host"));
+        assert!(!rendered.contains("--port"));
+    }
+
+    #[test]
     fn typed_blob_read_distinguishes_missing_from_expired_without_remote_text() {
         let missing = public_error(
             connectrpc::ErrorCode::NotFound,
@@ -1873,6 +1900,59 @@ mod tests {
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated contents");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
 
+        fixture.stop().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn empty_blob_read_succeeds_with_every_progress_mode() {
+        use crate::progress::{ProgressKind, ProgressMode, ProgressReporter, SystemClock};
+        let router = connectrpc::Router::new().route_server_stream(
+            SERVICE,
+            "ReadBlob",
+            connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
+                connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(read_page(
+                    0,
+                    0,
+                    vec![],
+                    true,
+                ))]))
+            }),
+        );
+        let fixture = Fixture::start(router).await;
+        let directory = private_test_directory("empty-blob-progress");
+        let request = api::ReadBlobRequest {
+            id: vec![1; 32],
+            topic: "imagery.maps".into(),
+            scope: "mission/team/alpha".into(),
+            ..Default::default()
+        };
+        for mode in [
+            ProgressMode::Auto,
+            ProgressMode::Never,
+            ProgressMode::Always,
+        ] {
+            let destination = directory.join(format!("{mode:?}"));
+            let mut reporter = ProgressReporter::new(
+                Vec::new(),
+                mode,
+                false,
+                ProgressKind::Read,
+                SystemClock::start(),
+            );
+            read_blob_with_progress(
+                fixture.address,
+                &token(),
+                request.clone(),
+                destination.clone(),
+                Duration::from_secs(2),
+                &mut reporter,
+            )
+            .await
+            .expect("valid empty Blob is published to the destination");
+            assert_eq!(std::fs::read(destination).unwrap(), b"");
+        }
         fixture.stop().await;
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -7533,6 +7533,62 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
+    pub(super) fn entry_names_bounded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let directory = rustix::fs::Dir::read_from(&self.file)
+            .map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
+        directory
+            .map(|entry| {
+                let entry = entry.map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
+                entry.file_name().to_str().map(str::to_owned).map_err(|_| {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob depot filename is not UTF-8",
+                    ))
+                })
+            })
+            .filter(|entry| !matches!(entry, Ok(name) if name == "." || name == ".."))
+            .take(limit)
+            .collect()
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn entry_names_bounded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        std::fs::read_dir(&self.path)?
+            .map(|entry| {
+                entry
+                    .map_err(|error| blob_error(BlobStoreError::Io(error)))?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| {
+                        blob_error(BlobStoreError::DepotIntegrity(
+                            "Blob depot filename is not UTF-8",
+                        ))
+                    })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Returns authoritative entries while treating interrupted atomic-write
+    /// temporaries as non-authoritative crash artifacts. Writable recovery
+    /// removes each temporary durably before callers interpret the namespace.
+    pub(super) fn entry_names_reclaiming_atomic_temporaries(
+        &self,
+        recover: bool,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut authoritative = Vec::new();
+        for name in self.entry_names()? {
+            if name.starts_with(TEMP_PREFIX) {
+                if recover {
+                    self.remove_if_exists(&name, false)?;
+                }
+            } else {
+                authoritative.push(name);
+            }
+        }
+        Ok(authoritative)
+    }
+
+    #[cfg(unix)]
     pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let flags = if directory {
             rustix::fs::AtFlags::REMOVEDIR
