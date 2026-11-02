@@ -3990,6 +3990,9 @@ impl Store {
             if matched.is_some() {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
+            if lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+            }
             let operation = decode_blob_operation_record(value.value())?;
             let publication = publications
                 .get(operation.transfer_id.as_bytes().as_slice())?
@@ -4006,9 +4009,6 @@ impl Store {
                 return Err(blob_error(BlobStoreError::PublisherRevoked(
                     owner.publisher,
                 )));
-            }
-            if lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)? {
-                return Err(blob_error(BlobStoreError::ExpiredOrRetired));
             }
             matched = Some(operation.transfer_id);
         }
