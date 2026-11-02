@@ -100,10 +100,13 @@ without translating durable state. RESULT_ACK or EOF settles only the transport
 attempt after atomic promotion and owns no durable resume state.
 Cross-transport selection and failover are not implemented.
 
-The current adapter is Iroh QUIC. The adapter interface is carrier-independent
-and retains the bindings needed by a reliable ordered full-duplex non-IP
-adapter. That keeps a future BLE adapter possible; this change does not
-implement BLE or multi-adapter failover.
+The production registry currently registers exactly one adapter, `IrohQuicV1`,
+and the selector therefore chooses it. Profile 5, its durable checkpoint, and
+the map/order/sink pipeline consume the selected `StreamTransportAdapter`, not
+an Iroh connection. The interface retains the bindings needed by a reliable,
+ordered, full-duplex non-IP adapter. That keeps a future BLE adapter possible;
+this change does not design or implement BLE, a second production adapter,
+multi-adapter failover, or cross-transport resume.
 
 Current Blob API capability: the Rust API, native-gRPC agent, and asterctl
 support bounded local publication and authenticated reads. Status boundary:
@@ -355,8 +358,19 @@ python3 tools/blob_benchmark.py \
   --campaign profile5-1g \
   --variant candidate /absolute/repo /absolute/blob_benchmark \
   --output /durable/new-profile5-1g-results \
-  --state /scratch/new-profile5-1g-state
+  --state /scratch/new-profile5-1g-state \
+  --interrupt-after-bytes 402653184
 ```
+
+`--interrupt-after-bytes` waits for the receiver-local durable plaintext
+frontier, shuts down both connected nodes, starts fresh node and adapter
+instances on new sockets, and continues the same publication. The runner
+requires exactly one `BENCH_INTERRUPTION` record with a positive durable
+frontier and a matching completed result. Production checkpoints are 128 MiB,
+so the source must be larger than one checkpoint interval; a requested
+interruption that reaches no intermediate checkpoint fails instead of being
+reported as resume evidence. `BENCH_PROGRESS` separates receiver-durable
+plaintext/carrier/unit frontiers from terminal contact counters.
 
 Do not use `total_ns` alone as operational latency: it deliberately includes
 validation-only shutdown and restart work. Use `publish_to_visible_ns` for the
