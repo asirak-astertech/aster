@@ -2218,7 +2218,7 @@ async fn receive_native_profile5_pack(
     let mut job = [0_u8; 16];
     job.copy_from_slice(&transfer_open.transfer_id[..16]);
     let pipeline_job = StreamJobId::from_bytes(job);
-    let mut pipeline_task = tokio::spawn(async move {
+    let mut pipeline = Box::pin(async move {
         let sink = Arc::new(std::sync::Mutex::new((writer, sink_initial, resumed_from)));
         let sink_for_pipeline = Arc::clone(&sink);
         let report = run_ordered_channel_pipeline_from(
@@ -2400,23 +2400,16 @@ async fn receive_native_profile5_pack(
         received = &mut receive => {
             match received {
                 Ok(received) => {
-                    let pipeline = pipeline_task
+                    let pipeline = pipeline
                         .await
-                        .map_err(|error| failure("join native Profile-5 receive pipeline", error))?
                         .map_err(map_pipeline_error)?;
                     (received, pipeline)
                 }
-                Err(error) => {
-                    pipeline_task.abort();
-                    let _ = pipeline_task.await;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
-        joined = &mut pipeline_task => {
-            let pipeline = joined
-                .map_err(|error| failure("join native Profile-5 receive pipeline", error))?
-                .map_err(map_pipeline_error)?;
+        completed = &mut pipeline => {
+            let pipeline = completed.map_err(map_pipeline_error)?;
             let received = receive.await?;
             (received, pipeline)
         }

@@ -53431,6 +53431,7 @@ mod tests {
         expire_before_promotion: bool,
         revoke_before_promotion: bool,
         cancel_pending_data: bool,
+        cancel_receiver_during_pipeline: bool,
         sender_finalization_delay_ms: Option<u64>,
         source_clock_tick_ms: u64,
         fixture_override: Option<(&'static str, u8)>,
@@ -53689,6 +53690,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cancelled_native_profile5_receiver_joins_pipeline_before_exit() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                NativeProfile5LifecycleScenario {
+                    cancel_receiver_during_pipeline: true,
+                    source_clock_tick_ms: 100,
+                    fixture_override: Some(("receiver-cancelled", 0xf0)),
+                    ..Default::default()
+                },
+            ),
+        ));
+    }
+
     async fn assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
         scenario: NativeProfile5LifecycleScenario,
     ) {
@@ -53702,6 +53717,7 @@ mod tests {
             expire_before_promotion,
             revoke_before_promotion,
             cancel_pending_data,
+            cancel_receiver_during_pipeline,
             sender_finalization_delay_ms,
             source_clock_tick_ms,
             fixture_override,
@@ -53925,13 +53941,14 @@ mod tests {
         let pipeline_probe = (expire_before_promotion
             || revoke_before_promotion
             || fail_after_receives.is_some()
-            || cancel_pending_data)
+            || cancel_pending_data
+            || cancel_receiver_during_pipeline)
             .then(|| {
                 crate::stream_pipeline::PipelineTestProbe::install(
                     crate::stream_pipeline::StreamJobId::from_bytes(receiver_job),
                 )
             });
-        if cancel_pending_data {
+        if cancel_pending_data || cancel_receiver_during_pipeline {
             pipeline_probe
                 .as_ref()
                 .expect("cancelled native receiver pipeline probe")
@@ -54156,16 +54173,17 @@ mod tests {
         };
         let (mut sender_session, mut receiver_session, profile_digest) =
             blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-        let (adapter, pending_data_control) = if cancel_pending_data {
-            let (adapter, control) =
-                blob_stream::tests::MemoryTransportAdapter::with_pending_data_send();
-            (Arc::new(adapter), Some(control))
-        } else {
-            (
-                Arc::new(blob_stream::tests::MemoryTransportAdapter::new()),
-                None,
-            )
-        };
+        let (adapter, pending_data_control) =
+            if cancel_pending_data || cancel_receiver_during_pipeline {
+                let (adapter, control) =
+                    blob_stream::tests::MemoryTransportAdapter::with_pending_data_send();
+                (Arc::new(adapter), Some(control))
+            } else {
+                (
+                    Arc::new(blob_stream::tests::MemoryTransportAdapter::new()),
+                    None,
+                )
+            };
         let nonce = [0xe2; 32];
         let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
         let source_guard = ContactEmissionGuard {
@@ -54337,6 +54355,42 @@ mod tests {
             })
             .await
             .expect("native receiver map worker becomes active before cancellation");
+            if cancel_receiver_during_pipeline {
+                receiver_handle.abort();
+                let cancelled = receiver_handle
+                    .await
+                    .expect_err("native receiver task is cancelled");
+                assert!(cancelled.is_cancelled());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while cancellation_probe.active_workers() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cancelled native receiver joins every map worker before exit");
+                assert_eq!(
+                    cancellation_probe.joined_workers(),
+                    cancellation_probe.worker_exits(),
+                    "receiver cancellation must join every native map worker"
+                );
+                sender_handle.abort();
+                let cancelled = sender_handle
+                    .await
+                    .expect_err("native sender task is cancelled after receiver exit");
+                assert!(cancelled.is_cancelled());
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("receiver-cancelled native target lookup")
+                        .is_none(),
+                    "receiver cancellation must never publish incomplete native content"
+                );
+                drop(target_store);
+                drop(source_store);
+                fs::remove_dir_all(source_state).expect("cancelled receiver source cleanup");
+                fs::remove_dir_all(target_state).expect("cancelled receiver target cleanup");
+                return;
+            }
             sender_handle.abort();
             let cancelled = sender_handle
                 .await
