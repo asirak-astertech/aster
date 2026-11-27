@@ -104,9 +104,9 @@ fn retry_delay(peer: aster_mesh::NodeId, failures: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::btle::{ActiveBtleRuntime, BtleRuntimeOwner, BtleRuntimeOwnerError};
     #[cfg(feature = "sdk-test-support")]
-    use crate::runtime::btle::{BtleRuntimeStartup, unavailable_owner};
+    use crate::runtime::btle::BtleRuntimeStartup;
+    use crate::runtime::btle::{ActiveBtleRuntime, BtleRuntimeOwner, BtleRuntimeOwnerError};
     use aster_node::{
         ContactDisposition, EventAdapterControl, EventAdapterSnapshot, EventAdapterState,
         EventAttemptReceiver, EventPeerEligibility, EventTransportKind, RunningNode,
@@ -911,19 +911,18 @@ mod tests {
         let prepared = listener_prepared(&state);
         let role_seen = Arc::new(AtomicBool::new(false));
         let role_observer = role_seen.clone();
-        let (startup, automatic_observer) =
-            BtleRuntimeStartup::automatic_linux_with_test_supervisor(
-                prepared,
-                policy,
-                &state,
-                move |config, _contacts, registration| {
-                    assert_eq!(config.role(), FixedRole::Listener);
-                    role_observer.store(true, Ordering::Release);
-                    let (_, adapter, attempts) = registration.into_parts();
-                    Ok(unavailable_owner(adapter, attempts, ()))
-                },
-            )
-            .expect("listener startup composition");
+        let (startup, automatic_observer) = BtleRuntimeStartup::automatic_linux_with_test_owner(
+            prepared,
+            policy,
+            &state,
+            move |config, registration, _contacts, _mission, _peer| {
+                assert_eq!(config.role(), FixedRole::Listener);
+                role_observer.store(true, Ordering::Release);
+                let (_, control, attempts) = registration.into_parts();
+                Ok(super::super::unavailable_owner(control, attempts, ()))
+            },
+        )
+        .expect("listener startup composition");
         let mut active = startup.start(&node).expect("listener runtime");
         let _automatic = automatic_observer.await.expect("automatic observer");
         active.install_eligibility().expect("listener eligibility");

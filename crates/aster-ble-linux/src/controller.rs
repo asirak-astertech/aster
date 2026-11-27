@@ -35,12 +35,12 @@ pub enum BtleSupport {
     Unqualified,
 }
 
-/// Authoritative current status for the automatic Linux BTLE Event adapter.
+/// Authoritative current status for the automatic Linux BTLE carrier owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtleCurrentStatus {
-    /// The adapter is operational for its configured Event role.
+    /// The carrier owner is operational for its configured direction.
     Available { support: BtleSupport },
-    /// The adapter cannot currently accept selected Event work.
+    /// The carrier owner cannot currently provide a selected contact.
     Unavailable {
         reason: AvailabilityReason,
         support: BtleSupport,
@@ -95,9 +95,9 @@ pub enum AvailabilityReason {
 /// Closed, sanitized events emitted by Linux BTLE lifecycle owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtleOperatorEvent {
-    /// The BTLE adapter can accept selected Event work.
+    /// The BTLE carrier owner can open contacts.
     AdapterAvailable,
-    /// The BTLE adapter is unavailable for one coarse reason.
+    /// The BTLE carrier owner cannot open contacts for one coarse reason.
     AdapterUnavailable(AvailabilityReason),
     /// The lifecycle owner stopped after joining its work.
     Stopped,

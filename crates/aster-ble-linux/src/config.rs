@@ -16,8 +16,6 @@ pub const RING1_MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const RING1_MAXIMUM_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest platform or authenticated-progress operation in the Ring-1 profile.
 pub const RING1_MAXIMUM_DEADLINE: Duration = Duration::from_secs(30);
-/// Initial unavailable epoch used when registering the automatic BTLE adapter.
-pub const AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH: u64 = 0;
 /// Smallest kernel-reported MTU accepted in either direction for an Event contact.
 ///
 /// LE Credit-Based L2CAP implementations must support 23-byte MTUs. Aster's
@@ -635,14 +633,8 @@ pub struct AutomaticRosteredSupervisorConfig {
     pub controller_probe_limits: ControllerProbeLimits,
     /// Fixed discovery policy and leased credentials.
     pub discovery: RosteredDiscoveryConfig,
-    /// Local authenticated mission identity.
-    pub local_mission_id: NodeId,
-    /// Stable local mission authority that scopes automatic coordinator tickets.
-    pub local_mission_authority_id: NodeId,
-    /// Exact authenticated mission peer identity.
-    pub peer_mission_id: NodeId,
-    /// Delay between successful preferred-direction contacts.
-    pub contact_cadence: Duration,
+    /// Carrier direction selected by the agent's host policy.
+    pub role: FixedRole,
     /// Existing protected-contact limits.
     pub contact_limits: ContactLimits,
 }
@@ -654,24 +646,15 @@ impl AutomaticRosteredSupervisorConfig {
             controller_policy,
             controller_probe_limits,
             discovery,
-            local_mission_id,
-            local_mission_authority_id,
-            peer_mission_id,
-            contact_cadence,
+            role,
             contact_limits,
         } = self;
         validate_probe_limits(controller_probe_limits)?;
-        validate_contact_cadence(contact_cadence)?;
-        let role = derive_role(local_mission_id, peer_mission_id)?;
         Ok(ValidatedAutomaticRosteredSupervisorConfig {
             controller_policy,
             controller_probe_limits,
             discovery: Arc::new(discovery.validate()),
-            local_mission_id,
-            local_mission_authority_id,
-            peer_mission_id,
             role,
-            contact_cadence,
             contact_limits: contact_limits.validate()?,
         })
     }
@@ -684,9 +667,7 @@ impl fmt::Debug for AutomaticRosteredSupervisorConfig {
             .field("controller_policy", &self.controller_policy)
             .field("controller_probe_limits", &self.controller_probe_limits)
             .field("discovery", &self.discovery)
-            .field("local_mission_authority_id", &"[REDACTED]")
-            .field("role", &"derived after validation")
-            .field("contact_cadence", &self.contact_cadence)
+            .field("role", &self.role)
             .field("contact_limits", &self.contact_limits)
             .field("transient_and_mission_material", &"[REDACTED]")
             .finish()
@@ -726,9 +707,7 @@ impl RosteredSupervisorConfig {
         Ok(ValidatedRosteredSupervisorConfig {
             controller,
             discovery,
-            local_mission_id,
-            local_mission_authority_id: local_mission_id,
-            peer_mission_id,
+            mission: RosteredMissionContext::FixedEvaluation { peer_mission_id },
             role,
             contact_cadence,
             contact_limits,
@@ -755,12 +734,15 @@ impl fmt::Debug for RosteredSupervisorConfig {
 pub struct ValidatedRosteredSupervisorConfig {
     controller: ValidatedControllerConfig,
     discovery: RosteredDiscoveryStorage,
-    local_mission_id: NodeId,
-    local_mission_authority_id: NodeId,
-    peer_mission_id: NodeId,
+    mission: RosteredMissionContext,
     role: FixedRole,
     contact_cadence: Duration,
     contact_limits: ValidatedContactLimits,
+}
+
+enum RosteredMissionContext {
+    FixedEvaluation { peer_mission_id: NodeId },
+    AutomaticCarrier,
 }
 
 enum RosteredDiscoveryStorage {
@@ -782,11 +764,7 @@ pub struct ValidatedAutomaticRosteredSupervisorConfig {
     controller_policy: ControllerAdmissionPolicy,
     controller_probe_limits: ControllerProbeLimits,
     discovery: Arc<ValidatedRosteredDiscoveryConfig>,
-    local_mission_id: NodeId,
-    local_mission_authority_id: NodeId,
-    peer_mission_id: NodeId,
     role: FixedRole,
-    contact_cadence: Duration,
     contact_limits: ValidatedContactLimits,
 }
 
@@ -801,22 +779,7 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
         self.controller_probe_limits
     }
 
-    /// Local authenticated mission identity.
-    pub const fn local_mission_id(&self) -> NodeId {
-        self.local_mission_id
-    }
-
-    /// Stable local mission authority that scopes automatic coordinator tickets.
-    pub const fn local_mission_authority_id(&self) -> NodeId {
-        self.local_mission_authority_id
-    }
-
-    /// Exact authenticated mission peer identity.
-    pub const fn peer_mission_id(&self) -> NodeId {
-        self.peer_mission_id
-    }
-
-    /// Preferred direction derived solely from full mission identities.
+    /// Carrier direction selected by the agent's host policy.
     pub const fn role(&self) -> FixedRole {
         self.role
     }
@@ -842,11 +805,9 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
                 cancellation,
             )?,
             discovery: RosteredDiscoveryStorage::Automatic(self.discovery.clone()),
-            local_mission_id: self.local_mission_id,
-            local_mission_authority_id: self.local_mission_authority_id,
-            peer_mission_id: self.peer_mission_id,
+            mission: RosteredMissionContext::AutomaticCarrier,
             role: self.role,
-            contact_cadence: self.contact_cadence,
+            contact_cadence: Duration::ZERO,
             contact_limits: self.contact_limits,
         })
     }
@@ -860,7 +821,6 @@ impl fmt::Debug for ValidatedAutomaticRosteredSupervisorConfig {
             .field("controller_probe_limits", &self.controller_probe_limits)
             .field("discovery", &self.discovery)
             .field("role", &self.role)
-            .field("contact_cadence", &self.contact_cadence)
             .field("contact_limits", &self.contact_limits)
             .field("transient_and_mission_material", &"[REDACTED]")
             .finish()
@@ -883,18 +843,13 @@ impl ValidatedRosteredSupervisorConfig {
         self.controller.local_address_type()
     }
 
-    /// Local authenticated mission identity.
-    pub const fn local_mission_id(&self) -> NodeId {
-        self.local_mission_id
-    }
-
-    pub(crate) const fn local_mission_authority_id(&self) -> NodeId {
-        self.local_mission_authority_id
-    }
-
-    /// Exact mission peer identity required after carrier discovery.
-    pub const fn peer_mission_id(&self) -> NodeId {
-        self.peer_mission_id
+    pub(crate) const fn fixed_peer_mission_id(&self) -> NodeId {
+        match self.mission {
+            RosteredMissionContext::FixedEvaluation { peer_mission_id } => peer_mission_id,
+            RosteredMissionContext::AutomaticCarrier => {
+                panic!("automatic carrier configuration has no mission peer")
+            }
+        }
     }
 
     /// Preferred direction derived solely from full mission identities.
@@ -1064,11 +1019,7 @@ mod tests {
         }))
     }
 
-    fn automatic_rostered(
-        local_mission_id: NodeId,
-        local_mission_authority_id: NodeId,
-        peer_mission_id: NodeId,
-    ) -> AutomaticRosteredSupervisorConfig {
+    fn automatic_rostered(role: FixedRole) -> AutomaticRosteredSupervisorConfig {
         let credentials = LeasedDiscoveryCredentialSet::new(
             DiscoveryCredential::new(
                 DiscoveryGeneration::new(7).unwrap(),
@@ -1086,10 +1037,7 @@ mod tests {
                 Duration::from_secs(8),
             ),
             discovery: RosteredDiscoveryConfig { credentials },
-            local_mission_id,
-            local_mission_authority_id,
-            peer_mission_id,
-            contact_cadence: Duration::from_secs(60),
+            role,
             contact_limits: ContactLimits {
                 maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
                 maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
@@ -1113,14 +1061,9 @@ mod tests {
 
         #[test]
         fn automatic_config_validates_without_present_controller() {
-            let validated = automatic_rostered([0x11; 32], [0x33; 32], [0x22; 32])
-                .validate()
-                .unwrap();
+            let validated = automatic_rostered(FixedRole::Initiator).validate().unwrap();
 
             assert_eq!(validated.role(), FixedRole::Initiator);
-            assert_eq!(validated.local_mission_id(), [0x11; 32]);
-            assert_eq!(validated.local_mission_authority_id(), [0x33; 32]);
-            assert_eq!(validated.peer_mission_id(), [0x22; 32]);
         }
 
         #[test]
@@ -1151,8 +1094,7 @@ mod tests {
         assert_eq!(validated.adapter_name(), "hci7");
         assert_eq!(validated.local_address(), address("02:00:00:00:00:01"));
         assert_eq!(validated.local_address_type(), AddressType::LeRandom);
-        assert_eq!(validated.local_mission_id(), local);
-        assert_eq!(validated.peer_mission_id(), peer);
+        assert_eq!(validated.fixed_peer_mission_id(), peer);
         assert_eq!(validated.role(), FixedRole::Initiator);
         assert_eq!(validated.maximum_frame_bytes(), RING1_MAXIMUM_FRAME_BYTES);
         assert_eq!(

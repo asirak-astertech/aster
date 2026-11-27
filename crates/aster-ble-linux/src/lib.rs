@@ -1,8 +1,9 @@
-//! Linux BlueZ LE L2CAP evaluation driver.
+//! Linux BlueZ LE L2CAP transport implementation.
 
 #![forbid(unsafe_code)]
 #![cfg(target_os = "linux")]
 
+mod automatic_carrier;
 mod config;
 mod controller;
 mod controller_fingerprint;
@@ -18,14 +19,18 @@ mod policy;
 mod rostered_lifecycle;
 mod stream;
 
+pub use automatic_carrier::{
+    AutomaticBtleCarrier, AutomaticBtleCarrierInbound, AutomaticBtleCarrierOutbound,
+    AutomaticBtleCarrierPort, AutomaticBtleCarrierReadiness, AutomaticBtleCarrierReadinessMonitor,
+};
 pub use config::{
-    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig,
-    BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, ContactLimits, ControllerConfig, DriverConfig,
-    FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
-    RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
-    RosteredSupervisorConfig, SupervisorConfig, ValidatedAutomaticRosteredSupervisorConfig,
-    ValidatedConfig, ValidatedContactLimits, ValidatedControllerConfig, ValidatedLinkConfig,
-    ValidatedRosteredDiscoveryConfig, ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
+    AutomaticRosteredSupervisorConfig, BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, ContactLimits,
+    ControllerConfig, DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig,
+    RosteredDiscoveryConfig, RosteredSupervisorConfig, SupervisorConfig,
+    ValidatedAutomaticRosteredSupervisorConfig, ValidatedConfig, ValidatedContactLimits,
+    ValidatedControllerConfig, ValidatedLinkConfig, ValidatedRosteredDiscoveryConfig,
+    ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{
     AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleCurrentStatus,
@@ -56,9 +61,8 @@ pub use platform::{
 };
 pub(crate) use policy::LifecycleCancellation;
 pub use rostered_lifecycle::{
-    AutomaticBtleRegistrationError, LinuxRosteredBtleEventSupervisor,
-    spawn_linux_rostered_btle_event_supervisor,
-    spawn_resolving_linux_rostered_btle_event_supervisor,
+    LinuxRosteredBtleSupervisor, spawn_linux_rostered_btle_event_supervisor,
+    spawn_resolving_linux_rostered_btle_carrier_supervisor,
 };
 pub use stream::{NegotiatedMtu, SocketOpen};
 

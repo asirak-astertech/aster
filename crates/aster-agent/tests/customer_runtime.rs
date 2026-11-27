@@ -51,8 +51,9 @@ use aster_mesh::{
 use aster_node::application::{Scope, Topic};
 #[cfg(feature = "sdk-test-support")]
 use aster_node::{
-    EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
-    EventPeerEligibility, EventTransportKind, RunningAutomaticEventTransportHandle,
+    EventAdapterControl, EventAdapterRegistration, EventAdapterSnapshot, EventAdapterState,
+    EventAttemptReceiver, EventOutboundAttempt, EventPeerEligibility, EventTransportKind,
+    RunningAutomaticEventTransportHandle,
 };
 use aster_node::{MutableSourceInterests, SourceInterestSelector};
 use buffa::Message as _;
@@ -948,8 +949,7 @@ mod btle {
         struct UnconfirmedOwner {
             completion: tokio::sync::watch::Receiver<bool>,
             cancelled: Arc<AtomicBool>,
-            _adapter: EventAdapterControl,
-            _attempts: EventAttemptReceiver,
+            _registration: EventAdapterRegistration,
         }
 
         impl BtleRuntimeOwner for UnconfirmedOwner {
@@ -973,17 +973,15 @@ mod btle {
         let (completion_send, completion) = tokio::sync::watch::channel(false);
         let cancelled = Arc::new(AtomicBool::new(false));
         let owner_cancelled = cancelled.clone();
-        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_owner(
             prepared,
             policy,
             fixture.state(),
-            move |_config, _contacts, registration| {
-                let (_, adapter, attempts) = registration.into_parts();
+            move |_config, registration, _contacts, _mission, _peer| {
                 Ok(Box::new(UnconfirmedOwner {
                     completion,
                     cancelled: owner_cancelled,
-                    _adapter: adapter,
-                    _attempts: attempts,
+                    _registration: registration,
                 }))
             },
         )
@@ -1029,8 +1027,7 @@ mod btle {
             completion: tokio::sync::watch::Receiver<bool>,
             cancelled: Arc<AtomicBool>,
             panicked: Arc<AtomicBool>,
-            _adapter: EventAdapterControl,
-            _attempts: EventAttemptReceiver,
+            _registration: EventAdapterRegistration,
         }
 
         impl BtleRuntimeOwner for PanickingOwner {
@@ -1059,18 +1056,16 @@ mod btle {
         let panicked = Arc::new(AtomicBool::new(false));
         let owner_cancelled = cancelled.clone();
         let owner_panicked = panicked.clone();
-        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_owner(
             prepared,
             policy,
             fixture.state(),
-            move |_config, _contacts, registration| {
-                let (_, adapter, attempts) = registration.into_parts();
+            move |_config, registration, _contacts, _mission, _peer| {
                 Ok(Box::new(PanickingOwner {
                     completion,
                     cancelled: owner_cancelled,
                     panicked: owner_panicked,
-                    _adapter: adapter,
-                    _attempts: attempts,
+                    _registration: registration,
                 }))
             },
         )
@@ -1147,6 +1142,56 @@ mod btle {
         assert_eq!(selected.peer(), [0xaa; 32]);
         selected.cancel_carrier_open();
         running.stop_clean().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_registration_preserves_real_selection_authority() {
+        // Break caught: replacing the node-issued attempt lane with an
+        // independent mailbox can bypass durable Event selection authority.
+        require_socket_access();
+        let fixture = CustomerFixture::new();
+        let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .expect("public test mission");
+        let expected_mission = mission.mission_authority_id();
+        let (btle, control, automatic) = automatic_test_runtime(&fixture, "event-authority");
+        let running = start_with_optional_btle(&fixture, btle).await;
+        let automatic = automatic.await.expect("automatic handle observed");
+
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+        let observed = tokio::spawn(async move { automatic.run_peer_attempt([0xaa; 32]).await });
+        control.publish(1, EventAdapterState::Available);
+        let attempt = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
+            .await
+            .expect("available lane selection deadline")
+            .expect("available lane remains registered");
+        assert_eq!(attempt.transport_kind(), EventTransportKind::BLE_L2CAP_V1);
+        assert_eq!(attempt.peer(), [0xaa; 32]);
+        assert_eq!(attempt.mission(), expected_mission);
+        attempt.cancel_carrier_open();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .expect("attempt completion deadline")
+            .expect("attempt observer task");
+        let aster_node::AutomaticEventAttemptOutcome::Completed(Err(outcome)) = outcome else {
+            panic!("cancellation must complete the selected durable attempt: {outcome:?}");
+        };
+        assert_eq!(
+            outcome.disposition(),
+            aster_node::ContactDisposition::Cancelled
+        );
+        assert_eq!(outcome.reason(), aster_node::ContactReason::CallerCancelled);
+
+        running.stop_clean().await;
+        drop(
+            prepare_customer_btle_credential(&fixture, "event-authority")
+                .expect("shutdown releases exclusive credential authority"),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1436,11 +1481,11 @@ mod btle {
         let prepared = prepare_customer_btle_credential(&fixture, "receive-only")
             .expect("prepared discovery credential");
         let (activation_send, mut activation_receive) = tokio::sync::mpsc::unbounded_channel();
-        let (btle, automatic) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+        let (btle, automatic) = BtleRuntimeStartup::automatic_linux_with_test_owner(
             prepared,
             policy,
             fixture.state(),
-            move |_config, _contacts, _registration| {
+            move |_config, _registration, _contacts, _mission, _peer| {
                 let _ = activation_send.send(());
                 Err(BtleRuntimeOwnerError::Startup)
             },
@@ -2042,7 +2087,7 @@ fn test_btle_artifact() -> Vec<u8> {
 ))]
 struct AutomaticTestState {
     initial_snapshot: Mutex<Option<EventAdapterSnapshot>>,
-    adapter: Mutex<Option<EventAdapterControl>>,
+    availability: Mutex<Option<EventAdapterControl>>,
     attempts: tokio::sync::Mutex<Option<EventAttemptReceiver>>,
     trace: Mutex<Vec<&'static str>>,
 }
@@ -2082,19 +2127,19 @@ impl AutomaticTestControl {
             .initial_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .expect("automatic adapter initial snapshot")
+            .expect("automatic registration initial snapshot")
     }
 
     fn publish(&self, epoch: u64, availability: EventAdapterState) {
-        let adapter = self
+        let publisher = self
             .state
-            .adapter
+            .availability
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            adapter
+            publisher
                 .as_ref()
-                .expect("active automatic adapter")
+                .expect("active automatic availability publisher")
                 .publish_availability(EventAdapterSnapshot::new(
                     EventTransportKind::BLE_L2CAP_V1,
                     epoch,
@@ -2105,7 +2150,7 @@ impl AutomaticTestControl {
         );
     }
 
-    async fn recv_attempt(&self) -> Option<aster_node::EventOutboundAttempt> {
+    async fn recv_attempt(&self) -> Option<EventOutboundAttempt> {
         self.state
             .attempts
             .lock()
@@ -2146,7 +2191,7 @@ impl BtleRuntimeOwner for AutomaticTestOwner {
         Box::pin(async move {
             self.state.trace("join_started");
             self.state
-                .adapter
+                .availability
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
@@ -2189,43 +2234,28 @@ fn automatic_test_runtime_with_options(
     tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
 ) {
     let policy = fixture.enable_btle_policy_with_priority(configured_priority);
-    let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
-        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
-    )
-    .expect("public test mission");
-    let expected_local_mission_id = mission.identity();
-    let expected_local_mission_authority_id = mission.mission_authority_id();
-    assert_ne!(
-        expected_local_mission_id, expected_local_mission_authority_id,
-        "production wiring fixture must distinguish member identity from mission authority"
-    );
     let prepared =
         prepare_customer_btle_credential(fixture, label).expect("prepared discovery credential");
     let state = Arc::new(AutomaticTestState {
         initial_snapshot: Mutex::new(None),
-        adapter: Mutex::new(None),
+        availability: Mutex::new(None),
         attempts: tokio::sync::Mutex::new(None),
         trace: Mutex::new(Vec::new()),
     });
     let owner_state = Arc::clone(&state);
-    let (startup, automatic) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+    let (startup, automatic) = BtleRuntimeStartup::automatic_linux_with_test_owner(
         prepared,
         policy,
         fixture.state(),
-        move |config, _contacts, registration| {
-            assert_eq!(config.local_mission_id(), expected_local_mission_id);
-            assert_eq!(
-                config.local_mission_authority_id(),
-                expected_local_mission_authority_id
-            );
+        move |_config, registration, _contacts, _mission, _peer| {
             *owner_state
                 .initial_snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(registration.initial_snapshot());
-            let (_, adapter, attempts) = registration.into_parts();
+            let (_, availability, attempts) = registration.into_parts();
             if available_on_start {
-                assert!(adapter.publish_availability(EventAdapterSnapshot::new(
+                assert!(availability.publish_availability(EventAdapterSnapshot::new(
                     EventTransportKind::BLE_L2CAP_V1,
                     1,
                     EventAdapterState::Available,
@@ -2234,9 +2264,9 @@ fn automatic_test_runtime_with_options(
                 )));
             }
             *owner_state
-                .adapter
+                .availability
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(availability);
             *owner_state
                 .attempts
                 .try_lock()
