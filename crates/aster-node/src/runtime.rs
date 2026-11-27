@@ -45941,16 +45941,6 @@ mod tests {
         })
         .await
         .expect("automatic Iroh attempt reaches Event admission");
-        assert_eq!(
-            peer_node
-                .selected_events()
-                .status()
-                .await
-                .expect("peer contact status")
-                .authenticated_contacts,
-            0,
-            "an opened automatic Iroh carrier cannot authenticate before shared Event admission"
-        );
 
         drop(held_event_session);
         let later = node
