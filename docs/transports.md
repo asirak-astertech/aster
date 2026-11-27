@@ -265,20 +265,23 @@ operational epoch admits a complete authenticated roster beacon. Public carrier
 availability still reflects local owner readiness only. BlueZ, controller, or
 transport absence leaves the node ready and local publication durable.
 
-For the one-exact-peer Event profile, only the validated lower mission member
-runs the automatic outbound schedule. It submits one contact request to the
-node coordinator and waits for the closed typed outcome; the coordinator keeps
-durable custody, selection, and admission authority. The Linux owner derives
-the fixed role once from validated local and peer mission identities; the
-agent schedule consumes that role without recomputing it. The generic node
-owns no BTLE cadence. A
-successful contact re-arms 60 seconds after completion. `RetryLater` uses
-capped, deterministically jittered backoff, while `Reselect` immediately
-submits one fresh Event request. `Suppress`, `Terminal`, and `Cancelled`
-authorize no automatic schedule retry. Authenticated `Suppress` parks only the
-affected outbound schedule while the adapter owner and transport-neutral
-service remain alive. `Terminal` ends the operation; `Cancelled` also covers
-coordinated cleanup or shutdown. Undelivered Event work remains durable.
+For the one-exact-peer Event profile, the agent derives the fixed carrier role
+once from validated local and peer mission identities. Only the lower mission
+member runs the automatic outbound schedule. The agent's private coordinator
+maps Linux readiness into the node's Event-adapter registration, consumes
+selector-issued outbound attempts, and hands inbound ordered contacts to the
+node. The Linux owner exposes only carrier readiness plus outbound and inbound
+carrier operations; it receives no Event registration, selection, admission,
+or outcome authority. The node retains durable custody, transport selection,
+contact admission, and typed outcomes, while the generic node owns no BTLE
+cadence. A successful contact re-arms 60 seconds after completion.
+`RetryLater` uses capped, deterministically jittered backoff, while `Reselect`
+immediately submits one fresh Event request. `Suppress`, `Terminal`, and
+`Cancelled` authorize no automatic schedule retry. Authenticated `Suppress`
+parks only the affected outbound schedule while the adapter owner and
+transport-neutral service remain alive. `Terminal` ends the operation;
+`Cancelled` also covers coordinated cleanup or shutdown. Undelivered Event
+work remains durable.
 
 If no eligible transport is available, the node remains ready, publication
 remains durable, and the request waits for availability without polling. This
