@@ -1,13 +1,12 @@
 use crate::{
     AsterRosterBeaconV1, AttemptKind, DiscoveryAdmission, DiscoveryCandidate, DiscoveryRecordError,
-    DriverError, DriverErrorKind, FixedRole, ObservationOutcome, SupervisorError,
+    DriverError, DriverErrorKind, FixedRole, InboundAdmission, ObservationOutcome, SupervisorError,
     ValidatedAutomaticRosteredSupervisorConfig, ValidatedRosteredSupervisorConfig,
     controller_resolver::{
         ControllerEpochActivator, ControllerEpochView, OperationalControllerEpoch,
         OperationalEpochFuture, OperationalEpochOutcome, OperationalEpochState,
         spawn_linux_controller_resolver,
     },
-    discovery::{SCAN_ACTIVE_INTERVAL, SCAN_IDLE_INTERVAL},
     lifecycle::{ContactAdmission, ContactScheduleEffect, contact_schedule_effect},
     platform::{
         discovery::{
@@ -16,7 +15,7 @@ use crate::{
         },
         socket::{
             AcceptedSocket, BluezRosteredSocketFactory, OpenedContact, RosteredSocketFactory,
-            opened_rostered_contact,
+            opened_admitted_rostered_contact, opened_rostered_contact,
         },
     },
     policy::{CappedBackoff, LifecycleCancellation, LifecycleCancellationObserver},
@@ -78,7 +77,7 @@ enum EpochEvent {
     ScanDeadline,
     ScanIdleDeadline,
     InboundAccepted(Result<(AcceptedSocket, crate::CanonicalLocator), DriverError>),
-    InboundReady(Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>),
+    InboundReady(Result<(crate::SocketOpen, InboundAdmission), DriverError>),
     InboundAcceptReady,
     OutboundRetry,
     CoordinatorAttempt(CoordinatorAttemptEvent),
@@ -92,10 +91,7 @@ type InboundAcceptFuture = Pin<
     Box<dyn Future<Output = Result<(AcceptedSocket, crate::CanonicalLocator), DriverError>> + Send>,
 >;
 type InboundReadinessFuture = Pin<
-    Box<
-        dyn Future<Output = Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>>
-            + Send,
-    >,
+    Box<dyn Future<Output = Result<(crate::SocketOpen, InboundAdmission), DriverError>> + Send>,
 >;
 type CoordinatorAttemptFuture = Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send>>;
 type CoordinatorRevocationFuture<'a> = Pin<Box<dyn Future<Output = ContactOutcome> + Send + 'a>>;
@@ -699,32 +695,34 @@ impl ContactPhase {
         Self::Active {
             cancellation,
             work: Box::pin(async move {
-                let open = open_candidate(
-                    config.as_ref(),
-                    sockets.as_ref(),
-                    candidate,
-                    &work_cancellation,
-                );
-                tokio::pin!(open);
-                let opened = match &mut owner {
-                    OutboundAttemptOwner::FixedEvaluation => Ok(open.as_mut().await),
-                    OutboundAttemptOwner::Coordinator(attempt) => {
-                        tokio::select! {
-                            biased;
-                            outcome = attempt.revocation_outcome() => Err(outcome),
-                            result = open.as_mut() => Ok(result),
+                let opened = {
+                    let open = open_candidate(
+                        config.as_ref(),
+                        sockets.as_ref(),
+                        &candidate,
+                        &work_cancellation,
+                    );
+                    tokio::pin!(open);
+                    let opened = match &mut owner {
+                        OutboundAttemptOwner::FixedEvaluation => Ok(open.as_mut().await),
+                        OutboundAttemptOwner::Coordinator(attempt) => {
+                            tokio::select! {
+                                biased;
+                                outcome = attempt.revocation_outcome() => Err(outcome),
+                                result = open.as_mut() => Ok(result),
+                            }
                         }
-                    }
-                };
-                let opened = match opened {
-                    Ok(opened) => opened,
-                    Err(outcome) => {
-                        work_cancellation.cancel();
-                        let _ = timeout(CONTACT_DRAIN_DEADLINE, open.as_mut()).await;
-                        if let OutboundAttemptOwner::Coordinator(attempt) = owner {
-                            attempt.finish_revoked();
+                    };
+                    match opened {
+                        Ok(opened) => opened,
+                        Err(outcome) => {
+                            work_cancellation.cancel();
+                            let _ = timeout(CONTACT_DRAIN_DEADLINE, open.as_mut()).await;
+                            if let OutboundAttemptOwner::Coordinator(attempt) = owner {
+                                attempt.finish_revoked();
+                            }
+                            return ContactAttemptOutcome::CoordinatorCompleted(Err(outcome));
                         }
-                        return ContactAttemptOutcome::CoordinatorCompleted(Err(outcome));
                     }
                 };
                 match opened {
@@ -744,14 +742,14 @@ impl ContactPhase {
 
     fn admitting_inbound(
         accepted: AcceptedSocket,
-        locator: crate::CanonicalLocator,
+        admission: InboundAdmission,
         readiness_timeout: Duration,
     ) -> Self {
         Self::AdmittingInbound(Box::pin(async move {
             accepted
                 .finish(readiness_timeout)
                 .await
-                .map(|socket| (socket, locator))
+                .map(|socket| (socket, admission))
         }))
     }
 
@@ -2025,12 +2023,13 @@ where
     let started_at = lifecycle_now();
     let scan_start = admission.start_scan(started_at);
     debug_assert_eq!(scan_start, crate::ScanStartOutcome::Started);
+    let scan_deadline = scan_transition_deadline(&admission, started_at);
     let mut scan_phase = ScanPhase::Active {
         scan: ActiveScan {
             owner: scan,
             observations,
         },
-        deadline: tokio::time::Instant::now() + SCAN_ACTIVE_INTERVAL,
+        deadline: scan_deadline,
     };
     let advertisement_deadline = tokio::time::Instant::now() + ADVERTISEMENT_ROTATION_INTERVAL;
     let credential_deadline = tokio::time::Instant::from_std(expires_at);
@@ -2194,28 +2193,29 @@ where
                         Err(error) => break Err(supervisor_error(error)),
                     };
                     let now = lifecycle_now();
-                    match admit_inbound_contact(&config, &mut admission, locator, now, mode) {
-                        InboundContactAdmission::Admitted => {}
-                        InboundContactAdmission::Rejected => {
-                            drop(accepted_socket);
-                            contact_phase =
-                                ContactPhase::accepting(sockets.clone(), listener.clone());
-                            continue;
-                        }
-                        InboundContactAdmission::BackoffUntil(deadline) => {
-                            drop(accepted_socket);
-                            contact_phase = ContactPhase::paused_until(deadline);
-                            continue;
-                        }
-                    }
+                    let inbound_admission =
+                        match admit_inbound_contact(&config, &mut admission, locator, now, mode) {
+                            InboundContactAdmission::Admitted(grant) => grant,
+                            InboundContactAdmission::Rejected => {
+                                drop(accepted_socket);
+                                contact_phase =
+                                    ContactPhase::accepting(sockets.clone(), listener.clone());
+                                continue;
+                            }
+                            InboundContactAdmission::BackoffUntil(deadline) => {
+                                drop(accepted_socket);
+                                contact_phase = ContactPhase::paused_until(deadline);
+                                continue;
+                            }
+                        };
                     contact_phase = ContactPhase::admitting_inbound(
                         accepted_socket,
-                        locator,
+                        inbound_admission,
                         config.open_timeout(),
                     );
                 }
                 EpochEvent::InboundReady(ready) => {
-                    let (opened_socket, locator) = match ready {
+                    let (opened_socket, inbound_admission) = match ready {
                         Ok(ready) => ready,
                         Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
                             contact_phase =
@@ -2224,7 +2224,11 @@ where
                         }
                         Err(error) => break Err(supervisor_error(error)),
                     };
-                    let opened = match opened_rostered_contact(&config, locator, opened_socket) {
+                    let opened = match opened_admitted_rostered_contact(
+                        &config,
+                        inbound_admission,
+                        opened_socket,
+                    ) {
                         Ok(opened) => opened,
                         Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
                             contact_phase =
@@ -2313,7 +2317,7 @@ where
                             if !admission.try_consume_attempt(AttemptKind::MissionHandshake, now) {
                                 drop(opened);
                                 admission.contact_closed(now);
-                                scan_phase = idle_scan_phase();
+                                scan_phase = idle_scan_phase(&admission, now);
                                 outbound_candidate_pending = true;
                                 mode.restore_outbound(owner);
                                 outbound_delay = OutboundDelay::TokenRefillUntil(
@@ -2339,7 +2343,7 @@ where
                         outcome => outcome,
                     };
                     admission.contact_closed(now);
-                    scan_phase = idle_scan_phase();
+                    scan_phase = idle_scan_phase(&admission, now);
                     let mut schedule = OutboundSchedule {
                         delay: &mut outbound_delay,
                         candidate_pending: &mut outbound_candidate_pending,
@@ -2386,12 +2390,13 @@ where
                     let now = lifecycle_now();
                     let scan_start = admission.start_scan(now);
                     debug_assert_eq!(scan_start, crate::ScanStartOutcome::Started);
+                    let deadline = scan_transition_deadline(&admission, now);
                     scan_phase = ScanPhase::Active {
                         scan: ActiveScan {
                             owner,
                             observations,
                         },
-                        deadline: tokio::time::Instant::now() + SCAN_ACTIVE_INTERVAL,
+                        deadline,
                     };
                 }
             }
@@ -2605,9 +2610,17 @@ where
     )))
 }
 
-fn idle_scan_phase() -> ScanPhase {
+fn scan_transition_deadline(admission: &DiscoveryAdmission, now: Instant) -> tokio::time::Instant {
+    let deadline = admission
+        .scan_schedule(now)
+        .transition_at()
+        .expect("active and idle portable scan states always have a transition");
+    tokio::time::Instant::from_std(deadline)
+}
+
+fn idle_scan_phase(admission: &DiscoveryAdmission, now: Instant) -> ScanPhase {
     ScanPhase::Idle {
-        deadline: tokio::time::Instant::now() + SCAN_IDLE_INTERVAL,
+        deadline: scan_transition_deadline(admission, now),
     }
 }
 
@@ -2616,14 +2629,15 @@ async fn stop_active_scan(
     admission: &mut DiscoveryAdmission,
 ) -> Result<(), SupervisorError> {
     let now = lifecycle_now();
-    let idle = ScanPhase::Idle {
-        deadline: tokio::time::Instant::now() + SCAN_IDLE_INTERVAL,
-    };
-    let ScanPhase::Active { mut scan, .. } = std::mem::replace(phase, idle) else {
+    if !matches!(phase, ScanPhase::Active { .. }) {
         return Ok(());
+    }
+    admission.stop_scan(now);
+    let idle = idle_scan_phase(admission, now);
+    let ScanPhase::Active { mut scan, .. } = std::mem::replace(phase, idle) else {
+        unreachable!("active phase checked before replacement");
     };
     let result = stop_scan(scan.owner.as_mut()).await;
-    admission.stop_scan(now);
     result.map_err(owned_cleanup_unconfirmed)
 }
 
@@ -2632,12 +2646,11 @@ fn owned_cleanup_unconfirmed(_: DriverError) -> SupervisorError {
 }
 
 fn finish_ended_scan(phase: &mut ScanPhase, admission: &mut DiscoveryAdmission) {
-    let idle = ScanPhase::Idle {
-        deadline: tokio::time::Instant::now() + SCAN_IDLE_INTERVAL,
-    };
+    let now = lifecycle_now();
+    admission.callback_queue_overflow(now);
+    let idle = idle_scan_phase(admission, now);
     let previous = std::mem::replace(phase, idle);
     debug_assert!(matches!(previous, ScanPhase::Active { .. }));
-    admission.callback_queue_overflow(lifecycle_now());
 }
 
 fn lifecycle_now() -> Instant {
@@ -2645,7 +2658,7 @@ fn lifecycle_now() -> Instant {
 }
 
 enum InboundContactAdmission {
-    Admitted,
+    Admitted(InboundAdmission),
     Rejected,
     BackoffUntil(Instant),
 }
@@ -2657,39 +2670,42 @@ fn admit_inbound_contact(
     now: Instant,
     mode: &EpochContactMode,
 ) -> InboundContactAdmission {
-    if admission.candidate(locator, now).is_none()
-        || !mode.accepts_inbound(config)
-        || now >= config.epoch_discovery_credentials().expires_at()
-    {
+    if !mode.accepts_inbound(config) || now >= config.epoch_discovery_credentials().expires_at() {
         return InboundContactAdmission::Rejected;
     }
-    if !admission.try_consume_attempt(AttemptKind::InboundAccept, now) {
+    let locator = locator.to_transient();
+    let Some(grant) = admission.admit_inbound(&locator, now) else {
+        if admission.candidate(&locator, now).is_none() {
+            return InboundContactAdmission::Rejected;
+        }
         return InboundContactAdmission::BackoffUntil(
             admission.attempt_retry_at(AttemptKind::InboundAccept, now),
         );
-    }
+    };
     if !admission.try_consume_attempt(AttemptKind::MissionHandshake, now) {
         return InboundContactAdmission::BackoffUntil(
             admission.attempt_retry_at(AttemptKind::MissionHandshake, now),
         );
     }
-    InboundContactAdmission::Admitted
+    InboundContactAdmission::Admitted(grant)
 }
 
 async fn open_candidate<S>(
     config: &ValidatedRosteredSupervisorConfig,
     sockets: &S,
-    candidate: DiscoveryCandidate,
+    candidate: &DiscoveryCandidate,
     cancellation: &LifecycleCancellation,
 ) -> Result<OpenedContact, DriverError>
 where
     S: RosteredSocketFactory,
 {
-    let connect = sockets.connect(
-        config.controller(),
-        candidate.locator(),
-        candidate.listener_psm(),
-    );
+    let locator = crate::CanonicalLocator::from_transient(candidate.locator()).map_err(|_| {
+        DriverError::new(
+            DriverErrorKind::Configuration,
+            "portable discovery candidate contains an invalid Linux locator",
+        )
+    })?;
+    let connect = sockets.connect(config.controller(), locator, candidate.listener_psm());
     let opened = tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(DriverError::new(
@@ -2704,7 +2720,7 @@ where
             )),
         }
     }?;
-    opened_rostered_contact(config, candidate.locator(), opened)
+    opened_rostered_contact(config, locator, opened)
 }
 
 async fn run_opened_contact(
@@ -2836,7 +2852,7 @@ fn admit_platform_observation(
     now: Instant,
 ) -> ObservationOutcome {
     admission.observe(
-        observation.locator(),
+        observation.locator().to_transient(),
         observation.record(),
         config.epoch_discovery_credentials(),
         now,
@@ -4541,7 +4557,7 @@ mod tests {
         );
         assert_eq!(
             admission.selected_candidate(now).unwrap().locator(),
-            locator
+            &locator.to_transient()
         );
     }
 
@@ -4871,9 +4887,18 @@ mod tests {
             LifecycleCancellation::new(),
         ));
         tokio::task::yield_now().await;
-        tokio::time::advance(SCAN_ACTIVE_INTERVAL).await;
+        let policy_now = lifecycle_now();
+        let mut policy = DiscoveryAdmission::new();
+        assert_eq!(
+            policy.start_scan(policy_now),
+            crate::ScanStartOutcome::Started
+        );
+        let active_until = policy.scan_schedule(policy_now).transition_at().unwrap();
+        policy.stop_scan(active_until);
+        let idle_until = policy.scan_schedule(active_until).transition_at().unwrap();
+        tokio::time::advance(active_until.duration_since(policy_now)).await;
         tokio::task::yield_now().await;
-        tokio::time::advance(SCAN_IDLE_INTERVAL).await;
+        tokio::time::advance(idle_until.duration_since(active_until)).await;
         assert!(
             tokio::time::timeout(Duration::from_secs(1), restart_started.notified())
                 .await
@@ -5012,7 +5037,7 @@ mod tests {
         assert_eq!(candidates.start_scan(now), crate::ScanStartOutcome::Started);
         assert_eq!(
             candidates.observe(
-                older_locator,
+                older_locator.to_transient(),
                 &older_record,
                 config.discovery_credentials(),
                 now,
@@ -5021,7 +5046,7 @@ mod tests {
         );
         assert_eq!(
             candidates.observe(
-                newer_locator,
+                newer_locator.to_transient(),
                 &newer_record,
                 config.discovery_credentials(),
                 newer,
@@ -5034,7 +5059,7 @@ mod tests {
 
         let candidate = candidates.selected_candidate(newer).unwrap();
         assert!(candidates.try_consume_attempt(AttemptKind::OutboundOpen, newer));
-        let opened = open_candidate(&config, &sockets, candidate, &LifecycleCancellation::new())
+        let opened = open_candidate(&config, &sockets, &candidate, &LifecycleCancellation::new())
             .await
             .unwrap();
 
@@ -6574,7 +6599,7 @@ mod tests {
         for _ in 0..4 {
             assert!(matches!(
                 admit_inbound_contact(&config, &mut admission, locator, now, &mode),
-                InboundContactAdmission::Admitted
+                InboundContactAdmission::Admitted(_)
             ));
         }
         assert!(matches!(

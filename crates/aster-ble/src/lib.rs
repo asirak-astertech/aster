@@ -3,12 +3,26 @@
 //!
 //! Operating-system Bluetooth APIs remain behind [`BleRadio`]. The adapter is a
 //! complete link implementation; adding a platform radio changes no protocol or
-//! synchronization code.
+//! synchronization code. Portable roster discovery authentication and bounded
+//! admission policy are shared by platform adapters in this crate.
 
 #![forbid(unsafe_code)]
 
+mod discovery;
+mod discovery_record;
+
 use aster_mesh::link::{Link, LinkCharacteristics, ReceivedFrame};
 use aster_mesh::model::NodeId;
+pub use discovery::{
+    AttemptKind, DiscoveryAdmission, DiscoveryCandidate, InboundAdmission, ObservationOutcome,
+    ObservationRejection, ScanSchedule, ScanStartOutcome, ScanState, ScanStopReason,
+    ScanWindowCounters,
+};
+pub use discovery_record::{
+    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, AsterRosterBeaconV1,
+    DiscoveryCredential, DiscoveryCredentialError, DiscoveryGeneration, DiscoveryRecordError,
+    DiscoverySecret, LeasedDiscoveryCredentialSet,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::RwLock;

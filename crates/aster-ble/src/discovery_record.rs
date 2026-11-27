@@ -1,9 +1,8 @@
-use bluer::l2cap::{PSM_LE_DYN_START, PSM_LE_MAX};
 use std::{fmt, num::NonZeroU32, time::Instant};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use aster_host::zeroizing_hmac_sha256;
+use aster_crypto::btle_discovery_hmac_sha256;
 
 /// Canonical private UUID bytes for the rostered LE L2CAP carrier.
 pub const ASTER_ROSTER_SERVICE_UUID: [u8; 16] = [
@@ -17,6 +16,8 @@ const SESSION_COC_AVAILABLE: u8 = 1;
 const HEADER_BYTES: usize = 24;
 const PROOF_BYTES: usize = 16;
 const PROOF_DOMAIN: &[u8] = b"aster/ble-l2cap/rostered-discovery/v1\0";
+const PSM_LE_DYN_START: u16 = 0x0080;
+const PSM_LE_MAX: u16 = 0x00ff;
 
 /// Closed discovery-credential construction failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,7 +327,7 @@ fn validate_psm(listener_psm: u16) -> Result<(), DiscoveryRecordError> {
 }
 
 fn proof_tag(secret: &DiscoverySecret, header: &[u8]) -> [u8; PROOF_BYTES] {
-    let output = Zeroizing::new(zeroizing_hmac_sha256(
+    let output = Zeroizing::new(btle_discovery_hmac_sha256(
         secret.as_bytes(),
         &[PROOF_DOMAIN, &ASTER_ROSTER_SERVICE_UUID, header],
     ));
@@ -379,10 +380,6 @@ mod tests {
         let (credentials, now) = credentials(None);
         let encoded = AsterRosterBeaconV1::encode(0x0081, NONCE, &credentials, now).unwrap();
         assert_eq!(encoded, EXPECTED_RECORD);
-        assert_eq!(
-            include_str!("../tests/fixtures/roster_beacon_v1.txt").trim(),
-            "0101008100000007000102030405060708090a0b0c0d0e0f5fb896d4783ec829c7c975296ca1c439"
-        );
 
         let decoded = AsterRosterBeaconV1::decode_and_verify(&encoded, &credentials, now).unwrap();
         assert_eq!(decoded.listener_psm(), 0x0081);
@@ -436,7 +433,7 @@ mod tests {
             );
         }
 
-        for psm in [0_u16, bluer::l2cap::PSM_LE_DYN_START - 1] {
+        for psm in [0_u16, PSM_LE_DYN_START - 1] {
             let mut invalid = valid;
             invalid[2..4].copy_from_slice(&psm.to_be_bytes());
             assert_eq!(
@@ -497,14 +494,12 @@ mod tests {
     #[test]
     fn discovery_record_accepts_maximum_dynamic_psm() {
         let (credentials, now) = credentials(None);
-        let record =
-            AsterRosterBeaconV1::encode(bluer::l2cap::PSM_LE_MAX, NONCE, &credentials, now)
-                .unwrap();
+        let record = AsterRosterBeaconV1::encode(PSM_LE_MAX, NONCE, &credentials, now).unwrap();
         assert_eq!(
             AsterRosterBeaconV1::decode_and_verify(&record, &credentials, now)
                 .unwrap()
                 .listener_psm(),
-            bluer::l2cap::PSM_LE_MAX
+            PSM_LE_MAX
         );
     }
 

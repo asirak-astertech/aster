@@ -427,6 +427,16 @@ pub(crate) fn opened_rostered_contact(
     )
 }
 
+pub(crate) fn opened_admitted_rostered_contact(
+    config: &ValidatedRosteredSupervisorConfig,
+    admission: crate::InboundAdmission,
+    opened_socket: SocketOpen,
+) -> Result<OpenedContact, DriverError> {
+    let locator = CanonicalLocator::from_transient(&admission.into_locator())
+        .map_err(|_| configuration("admitted peer locator is not a canonical Linux locator"))?;
+    opened_rostered_contact(config, locator, opened_socket)
+}
+
 fn opened_contact(
     opened_socket: SocketOpen,
     peer_locator: TransientLocator,

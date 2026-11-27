@@ -1,3 +1,7 @@
+//! Small secret-handling primitives shared across Aster component boundaries.
+
+#![forbid(unsafe_code)]
+
 use sha2::{Digest, Sha256};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
@@ -10,9 +14,9 @@ fn require_zeroize_on_drop<T: ZeroizeOnDrop>(value: T) -> T {
     value
 }
 
-/// Computes HMAC-SHA-256 while owning derived pads and digests in
-/// zeroize-on-drop storage.
-pub fn zeroizing_hmac_sha256(key: &[u8; 32], message_parts: &[&[u8]]) -> [u8; 32] {
+/// Computes the HMAC-SHA-256 operation used by BTLE discovery while retaining
+/// derived pads and digests in zeroize-on-drop storage.
+pub fn btle_discovery_hmac_sha256(key: &[u8; 32], message_parts: &[&[u8]]) -> [u8; 32] {
     let mut pad = Zeroizing::new([0_u8; SHA256_BLOCK_BYTES]);
     pad[..key.len()].copy_from_slice(key);
 
@@ -38,13 +42,13 @@ pub fn zeroizing_hmac_sha256(key: &[u8; 32], message_parts: &[&[u8]]) -> [u8; 32
 
 #[cfg(test)]
 mod tests {
-    use super::zeroizing_hmac_sha256;
+    use super::btle_discovery_hmac_sha256;
 
     #[test]
-    fn matches_independent_sha256_vector_with_split_message() {
+    fn discovery_hmac_matches_independent_sha256_vector_with_split_message() {
         let key = [0x0b; 32];
         assert_eq!(
-            zeroizing_hmac_sha256(&key, &[b"Hi ", b"There"]),
+            btle_discovery_hmac_sha256(&key, &[b"Hi ", b"There"]),
             [
                 0x19, 0x8a, 0x60, 0x7e, 0xb4, 0x4b, 0xfb, 0xc6, 0x99, 0x03, 0xa0, 0xf1, 0xcf, 0x2b,
                 0xbd, 0xc5, 0xba, 0x0a, 0xa3, 0xf3, 0xd9, 0xae, 0x3c, 0x1c, 0x7a, 0x3b, 0x16, 0x96,

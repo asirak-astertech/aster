@@ -1,0 +1,19 @@
+[package]
+name = "aster-crypto"
+description = "Small secret-handling primitives shared by Aster components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+zeroize.workspace = true
+
+# SHA-2 returns HybridArray digests. Enabling its zeroize support lets the
+# wrapper retain those digests in Zeroizing storage without copying through an
+# unprotected intermediate.
+hybrid-array.workspace = true
+
+[lints]
+workspace = true

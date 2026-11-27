@@ -298,7 +298,11 @@ dependencies = [
 name = "aster-ble"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-contact",
  "aster-core",
+ "aster-crypto",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -328,6 +332,7 @@ dependencies = [
 name = "aster-ble-linux"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-ble",
  "aster-ble-l2cap",
  "aster-contact",
  "aster-core",
@@ -338,7 +343,6 @@ dependencies = [
  "getrandom 0.4.3",
  "rustix",
  "sha2 0.11.1",
- "subtle",
  "tokio",
  "zeroize",
 ]
@@ -391,6 +395,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-crypto"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "hybrid-array",
+ "sha2 0.11.1",
+ "zeroize",
+]
+
+[[package]]
 name = "aster-ffi"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -405,6 +418,7 @@ dependencies = [
 name = "aster-host"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-crypto",
  "libc",
  "rustix",
  "sha2 0.11.1",

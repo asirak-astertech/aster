@@ -10,7 +10,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-use crate::zeroizing_hmac_sha256;
+use aster_crypto::btle_discovery_hmac_sha256;
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"ASTRBD02";
 const ONE_ENTRY_BYTES: usize = 109;
@@ -260,7 +260,7 @@ fn read_entry(bytes: &[u8], offset: usize) -> Result<CredentialEntry, DiscoveryC
 }
 
 fn fingerprint(entry: &CredentialEntry, scope: &[u8; 32]) -> [u8; 32] {
-    zeroizing_hmac_sha256(
+    btle_discovery_hmac_sha256(
         &entry.secret,
         &[BINDING_DOMAIN, scope, &entry.generation.to_be_bytes()],
     )

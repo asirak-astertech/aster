@@ -10,7 +10,6 @@ mod controller_probe;
 mod controller_resolver;
 mod controller_selection;
 mod discovery;
-mod discovery_record;
 mod lifecycle;
 mod peer;
 mod platform;
@@ -18,6 +17,11 @@ mod policy;
 mod rostered_lifecycle;
 mod stream;
 
+pub use aster_ble::{
+    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, AsterRosterBeaconV1,
+    DiscoveryCredential, DiscoveryCredentialError, DiscoveryGeneration, DiscoveryRecordError,
+    DiscoverySecret, LeasedDiscoveryCredentialSet,
+};
 pub use config::{
     AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig,
     BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, ContactLimits, ControllerConfig, DriverConfig,
@@ -41,13 +45,8 @@ pub use controller_selection::{
 };
 pub use discovery::{
     AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,
-    ObservationOutcome, ObservationRejection, ScanStartOutcome, ScanState, ScanStopReason,
-    ScanWindowCounters,
-};
-pub use discovery_record::{
-    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, AsterRosterBeaconV1,
-    DiscoveryCredential, DiscoveryCredentialError, DiscoveryGeneration, DiscoveryRecordError,
-    DiscoverySecret, LeasedDiscoveryCredentialSet,
+    InboundAdmission, ObservationOutcome, ObservationRejection, ScanSchedule, ScanStartOutcome,
+    ScanState, ScanStopReason, ScanWindowCounters,
 };
 pub use lifecycle::{LinuxBtleEventSupervisor, SupervisorError, spawn_linux_btle_event_supervisor};
 pub use platform::{

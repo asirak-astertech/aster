@@ -1,13 +1,17 @@
 [package]
 name = "aster-ble"
-description = "BTLE link adapter for the Aster Mesh Protocol"
+description = "Portable BTLE link, discovery authentication, and admission policy for Aster"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aster-contact = { version = "=0.1.0-alpha.1", path = "../aster-contact" }
 aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
+aster-crypto = { version = "=0.1.0-alpha.1", path = "../aster-crypto" }
+subtle.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

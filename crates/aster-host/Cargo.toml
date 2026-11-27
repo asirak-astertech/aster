@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aster-crypto = { version = "=0.1.0-alpha.1", path = "../aster-crypto" }
 libc.workspace = true
 rustix.workspace = true
 sha2.workspace = true

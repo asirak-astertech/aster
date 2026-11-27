@@ -1,8 +1,7 @@
 use super::map_bluer_error;
 use crate::{
-    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, CanonicalLocator,
-    CanonicalLocatorError, DriverError, DriverErrorKind, ValidatedControllerConfig,
-    config::ControllerOperationBinding,
+    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, CanonicalLocator, DriverError,
+    DriverErrorKind, ValidatedControllerConfig, config::ControllerOperationBinding,
 };
 use bluer::{Address, AddressType, Uuid, adv};
 use futures::{Stream, StreamExt, stream, stream::SelectAll};
@@ -52,9 +51,8 @@ impl DiscoveryObservation {
         address_type: AddressType,
         record: &[u8],
     ) -> Result<Self, DiscoveryObservationError> {
-        let locator = CanonicalLocator::new(address, address_type).map_err(
-            |CanonicalLocatorError::NonLeAddress| DiscoveryObservationError::NonLeLocator,
-        )?;
+        let locator = CanonicalLocator::new(address, address_type)
+            .map_err(|_| DiscoveryObservationError::NonLeLocator)?;
         let record = record
             .try_into()
             .map(BoundedRecord::Exact)
